@@ -13,7 +13,7 @@ FRAMERATE = 25
 class LTXVideoPipeline(BasePipeline):
     name = 'ltx-video'
     checkpointable_layers = ['TransformerLayer']
-    adapter_target_modules = ['LTXTransformerBlock']
+    adapter_target_modules = ['LTXTransformerBlock', 'LTXVideoTransformerBlock']
 
     def __init__(self, config):
         self.config = config
