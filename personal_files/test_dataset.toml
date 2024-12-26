@@ -1,0 +1,47 @@
+# Resolutions to train on, given as the side length of a square image. You can have multiple sizes here.
+resolutions = [768]
+# You can give resolutions as (width, height) pairs also. This doesn't do anything different, it's just
+# another way of specifying the area (i.e. total number of pixels) you want to train on.
+# resolutions = [[1280, 720]]
+
+# Enable aspect ratio bucketing. For the different AR buckets, the final size will be such that
+# the areas match the resolutions you configured above.
+enable_ar_bucket = true
+
+# The aspect ratio and frame bucket settings may be specified for each [[directory]] entry as well.
+# Directory-level settings will override top-level settings.
+
+# Min and max aspect ratios, given as width/height ratio.
+min_ar = 0.5
+max_ar = 2.0
+# Total number of aspect ratio buckets, evenly spaced (in log space) between min_ar and max_ar.
+num_ar_buckets = 7
+
+# Can manually specify ar_buckets instead of using the range-style config above.
+# Each entry can be width/height ratio, or (width, height) pair. But you can't mix them, because of TOML.
+# ar_buckets = [[512, 512], [448, 576]]
+# ar_buckets = [1.0, 1.5]
+
+# For video training, you need to configure frame buckets (similar to aspect ratio buckets). There will always
+# be a frame bucket of 1 for images. Videos will be assigned to the first frame bucket that the video is greater than or equal to in length.
+# But videos are never assigned to the image frame bucket (1); if the video is very short it would just be dropped.
+frame_buckets = [1, 33, 65]
+
+
+[[directory]]
+# Path to directory of images/videos, and corresponding caption files. The caption files should match the media file name, but with a .txt extension.
+# A missing caption file will log a warning, but then just train using an empty caption.
+path = '/lv0/yada/tmp_dev/test-HunyuanVideo-anime-stills/video_dataset'
+# The dataset will act like it is duplicated this many times.
+num_repeats = 10
+# Example of overriding some settings, and using ar_buckets to directly specify ARs.
+# ar_buckets = [[448, 576]]
+# resolutions = [[448, 576]]
+# frame_buckets = [1]
+
+
+# You can list multiple directories.
+
+# [[directory]]
+# path = '/home/anon/data/images/something_else'
+# num_repeats = 5

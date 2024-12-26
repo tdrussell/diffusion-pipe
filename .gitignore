@@ -1,3 +1,7 @@
+*.safetensors
+outputs
+outputs_pixel
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

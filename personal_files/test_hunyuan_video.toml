@@ -1,0 +1,112 @@
+# Output path for training runs. Each training run makes a new directory in here.
+output_dir = './outputs'
+
+# Dataset config file.
+dataset = '/lv0/yada/diffusion-pipe/personal_files/test_dataset.toml'
+# You can have separate eval datasets. Give them a name for Tensorboard metrics.
+# eval_datasets = [
+#     {name = 'something', config = 'path/to/eval_dataset.toml'},
+# ]
+
+# training settings
+
+# I usually set this to a really high value because I don't know how long I want to train.
+epochs = 1000
+# Batch size of a single forward/backward pass for one GPU.
+micro_batch_size_per_gpu = 3
+# Pipeline parallelism degree. A single instance of the model is divided across this many GPUs.
+pipeline_stages = 1
+# Number of micro-batches sent through the pipeline for each training step.
+# If pipeline_stages > 1, a higher GAS means better GPU utilization due to smaller pipeline bubbles (where GPUs aren't overlapping computation).
+gradient_accumulation_steps = 4
+# Grad norm clipping.
+gradient_clipping = 1.0
+# Learning rate warmup.
+warmup_steps = 100
+
+# eval settings
+
+eval_every_n_epochs = 1
+eval_before_first_step = true
+# Might want to set these lower for eval so that less images get dropped (eval dataset size is usually much smaller than training set).
+# Each size bucket of images/videos is rounded down to the nearest multiple of the global batch size, so higher global batch size means
+# more dropped images. Usually doesn't matter for training but the eval set is much smaller so it can matter.
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+# misc settings
+
+# Probably want to set this a bit higher if you have a smaller dataset so you don't end up with a million saved models.
+save_every_n_epochs = 2
+# Can checkpoint the training state every n number of epochs or minutes. Set only one of these. You can resume from checkpoints using the --resume_from_checkpoint flag.
+#checkpoint_every_n_epochs = 1
+checkpoint_every_n_minutes = 120
+# Always set to true unless you have a huge amount of VRAM.
+activation_checkpointing = true
+# Controls how Deepspeed decides how to divide layers across GPUs. Probably don't change this.
+partition_method = 'parameters'
+# dtype for saving the LoRA or model, if different from training dtype
+save_dtype = 'bfloat16'
+# Batch size for caching latents and text embeddings. Increasing can lead to higher GPU utilization during caching phase but uses more memory.
+caching_batch_size = 1
+# How often deepspeed logs to console.
+steps_per_print = 1
+# How to extract video clips for training from a single input video file.
+# The video file is first assigned to one of the configured frame buckets, but then we must extract one or more clips of exactly the right
+# number of frames for that bucket.
+# single_beginning: one clip starting at the beginning of the video
+# single_middle: one clip from the middle of the video (cutting off the start and end equally)
+# multiple_overlapping: extract the minimum number of clips to cover the full range of the video. They might overlap some.
+# default is single_middle
+video_clip_mode = 'single_middle'
+
+[model]
+# flux, ltx-video, or hunyuan-video
+type = 'hunyuan-video'
+# Can load Hunyuan Video entirely from the ckpt path set up for the official inference scripts.
+#ckpt_path = '/home/anon/HunyuanVideo/ckpts'
+# Or you can load it by pointing to all the ComfyUI files.
+transformer_path = '/lv0/yada/tmp_dev/hunyuan_weights/hunyuan_video_t2v_720p_bf16.safetensors'
+vae_path = '/lv0/yada/tmp_dev/hunyuanVideoSafetensors_vae.safetensors'
+llm_path = '/lv0/yada/tmp_dev/llava-llama-3-8b-text-encoder-tokenizer'
+clip_path = '/lv0/yada/tmp_dev/clip-vit-large-patch14'
+# Base dtype used for all models.
+dtype = 'bfloat16'
+# Hunyuan Video supports fp8 for the transformer when training LoRA.
+transformer_dtype = 'float8'
+# How to sample timesteps to train on. Can be logit_normal or uniform.
+timestep_sample_method = 'logit_normal'
+
+# flux example
+# [model]
+# type = 'flux'
+# # Path to Huggingface Diffusers directory for Flux
+# diffusers_path = '/data2/imagegen_models/FLUX.1-dev'
+# # You can override the transformer from a BFL format checkpoint.
+# transformer_path = '/data2/imagegen_models/flux-dev-single-files/consolidated_s6700-schnell.safetensors'
+# dtype = 'bfloat16'
+# flux_shift = true
+
+# LTV-Video example
+# [model]
+# type = 'ltx-video'
+# diffusers_path = '/data2/imagegen_models/LTX-Video'
+# dtype = 'bfloat16'
+# timestep_sample_method = 'logit_normal'
+
+[adapter]
+type = 'lora'
+rank = 32
+# Dtype for the LoRA weights you are training.
+dtype = 'bfloat16'
+# You can initialize the lora weights from a previously trained lora.
+#init_from_existing = '/data/diffusion_pipe_training_runs/something/epoch50'
+
+[optimizer]
+# AdamW from the optimi library is a good default since it automatically uses Kahan summation when training bfloat16 weights.
+# Look at train.py for other options. You could also easily edit the file and add your own.
+type = 'adamw_optimi'
+lr = 2e-5
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
