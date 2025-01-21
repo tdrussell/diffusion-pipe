@@ -18,13 +18,13 @@ Currently supports SDXL, Flux, LTX-Video, and HunyuanVideo.
 - Easily add support for new models by implementing a single subclass
 
 ## Recent changes
-- 2024-01-20
+- 2025-01-20
   - Properly support training Flex.1-alpha.
   - Make sure to set ```bypass_guidance_embedding=true``` in the model config. You can look at the example config file.
-- 2024-01-17
+- 2025-01-17
   - For HunyuanVideo VAE when loaded via the ```vae_path``` option, fixed incorrect tiling sample size. The training loss is now moderately lower overall. Quality of trained LoRAs should be improved, but the improvement is likely minor.
   - You should update any cached latents made before this change. Delete the cache directory inside the dataset directories, or run the training script with the ```--regenerate_cache``` command line option.
-- 2024-01-13
+- 2025-01-13
   - Basic SDXL support. LoRA only. Many options present in other training scripts are not implemented. If you want more features added, PRs are welcome.
 
 ## Windows support
