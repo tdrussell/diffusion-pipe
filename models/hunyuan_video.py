@@ -3,7 +3,7 @@ import sys
 import argparse
 import json
 import os.path
-sys.path.insert(0, os.path.abspath('submodules/HunyuanVideo'))
+sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/HunyuanVideo'))
 
 import safetensors
 import torch
