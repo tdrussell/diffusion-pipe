@@ -32,7 +32,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--config', help='Path to TOML configuration file.')
 parser.add_argument('--local_rank', type=int, default=-1,
                     help='local rank passed from distributed launcher')
-parser.add_argument('--resume_from_checkpoint', action='store_true', default=None, help='resume training from the most recent checkpoint')
+parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=None,
+                    help='resume training from checkpoint. If no value is provided, resume from the most recent checkpoint. If a folder name is provided, resume from that specific folder.')
 parser.add_argument('--regenerate_cache', action='store_true', default=None, help='Force regenerate cache. Useful if none of the files have changed but their contents have, e.g. modified captions.')
 parser.add_argument('--cache_only', action='store_true', default=None, help='Cache model inputs then exit.')
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', default=None, help="Skip certain checks and overrides. You may end up using settings that won't work.")
@@ -282,7 +283,14 @@ if __name__ == '__main__':
         shutil.copy(args.config, run_dir)
     # wait for all processes then get the most recent dir (may have just been created)
     dist.barrier()
-    run_dir = get_most_recent_run_dir(config['output_dir'])
+    if resume_from_checkpoint is True:  # No specific folder provided, use most recent
+        run_dir = get_most_recent_run_dir(config['output_dir'])
+    elif isinstance(resume_from_checkpoint, str):  # Specific folder provided
+        run_dir = os.path.join(config['output_dir'], resume_from_checkpoint)
+        if not os.path.exists(run_dir):
+            raise ValueError(f"Checkpoint directory {run_dir} does not exist")
+    else:  # Not resuming, use most recent (newly created) dir
+        run_dir = get_most_recent_run_dir(config['output_dir'])
 
     layers = model.to_layers()
     additional_pipeline_module_kwargs = {}
