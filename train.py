@@ -197,6 +197,10 @@ def setup_interrupt_handler(saver):
         return
         
     def signal_handler(signum, frame):
+        if setup_interrupt_handler.triggered:  # Check if already triggered
+            return
+        setup_interrupt_handler.triggered = True  # Set flag
+            
         print("\nDetected interrupt signal, saving checkpoint...")
         try:
             saver.save_checkpoint(setup_interrupt_handler.current_step)
