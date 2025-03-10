@@ -7,6 +7,8 @@ import time
 import random
 import json
 import inspect
+import signal
+import sys
 
 import toml
 import deepspeed
@@ -173,6 +175,50 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
         torch.manual_seed(seed)
         np.random.seed(seed)
         _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
+
+
+def setup_checkpoint_signal():
+    """Set up signal handler for checkpoint saving"""
+    if not is_main_process():
+        return
+        
+    def trigger_save(signum, frame):
+        print("\nDetected save signal (SIGUSR1), saving checkpoint...")
+        # Set a flag due to signal handler limitations
+        setup_checkpoint_signal.should_save = True
+    
+    signal.signal(signal.SIGUSR1, trigger_save)
+    setup_checkpoint_signal.should_save = False
+
+
+def setup_interrupt_handler(saver):
+    """Set up Ctrl+C interrupt handler"""
+    if not is_main_process():
+        return
+        
+    def signal_handler(signum, frame):
+        if setup_interrupt_handler.triggered:  # Check if already triggered
+            return
+        setup_interrupt_handler.triggered = True  # Set flag
+            
+        print("\nDetected interrupt signal, saving checkpoint...")
+        try:
+            saver.save_checkpoint(setup_interrupt_handler.current_step)
+            print("Checkpoint saved successfully!")
+        except Exception as e:
+            print(f"Error occurred while saving checkpoint: {e}")
+        finally:
+            print("Safely exiting training...")
+            # Notify other processes to exit
+            if dist.is_initialized():
+                dist.barrier()
+            sys.exit(0)
+    
+    # Set up handlers for SIGINT (Ctrl+C) and SIGTERM
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    setup_interrupt_handler.current_step = 0
+    setup_interrupt_handler.triggered = False  # Add flag to prevent duplicate triggers
 
 
 if __name__ == '__main__':
@@ -545,6 +591,10 @@ if __name__ == '__main__':
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
 
+    setup_checkpoint_signal()
+
+    setup_interrupt_handler(saver)
+    
     if config['eval_before_first_step'] and not resume_from_checkpoint:
         evaluate(model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'])
 
@@ -552,12 +602,18 @@ if __name__ == '__main__':
     epoch_loss = 0
     num_steps = 0
     while True:
-        #empty_cuda_cache()
+        setup_interrupt_handler.current_step = step  # Update current step
         model_engine.reset_activation_shape()
         loss = model_engine.train_batch().item()
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
+
+        # Check if checkpoint save is needed
+        if is_main_process() and setup_checkpoint_signal.should_save:
+            saver.save_checkpoint(step)
+            setup_checkpoint_signal.should_save = False
+            print("Checkpoint saved successfully!")
 
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step)
         finished_epoch = True if new_epoch != epoch else False
