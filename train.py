@@ -37,6 +37,7 @@ parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=N
 parser.add_argument('--regenerate_cache', action='store_true', default=None, help='Force regenerate cache. Useful if none of the files have changed but their contents have, e.g. modified captions.')
 parser.add_argument('--cache_only', action='store_true', default=None, help='Cache model inputs then exit.')
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', default=None, help="Skip certain checks and overrides. You may end up using settings that won't work.")
+parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -175,6 +176,19 @@ def evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accu
         _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
 
 
+def distributed_init(args):
+    """Initialize distributed training environment."""
+    world_size = int(os.getenv('WORLD_SIZE', '1'))
+    rank = int(os.getenv('RANK', '0'))
+    local_rank = args.local_rank
+
+    # Set environment variables for distributed training
+    os.environ['MASTER_ADDR'] = os.getenv('MASTER_ADDR', 'localhost')
+    os.environ['MASTER_PORT'] = str(args.master_port)
+
+    return world_size, rank, local_rank
+
+
 if __name__ == '__main__':
     apply_patches()
 
@@ -188,6 +202,12 @@ if __name__ == '__main__':
     set_config_defaults(config)
     common.AUTOCAST_DTYPE = config['model']['dtype']
 
+    # Initialize distributed environment before deepspeed
+    world_size, rank, local_rank = distributed_init(args)
+    
+    # Now initialize deepspeed
+    deepspeed.init_distributed()
+    
     resume_from_checkpoint = (
         args.resume_from_checkpoint if args.resume_from_checkpoint is not None
         else config.get('resume_from_checkpoint', False)
@@ -196,10 +216,6 @@ if __name__ == '__main__':
         args.regenerate_cache if args.regenerate_cache is not None
         else config.get('regenerate_cache', False)
     )
-
-    deepspeed.init_distributed()
-    # needed for broadcasting Queue in dataset.py (because we haven't called deepspeed.initialize() yet?)
-    torch.cuda.set_device(dist.get_rank())
 
     model_type = config['model']['type']
 
