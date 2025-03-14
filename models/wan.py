@@ -22,10 +22,37 @@ from wan.modules.model import (
 )
 from wan.modules.clip import CLIPModel
 from wan import configs as wan_configs
-
+from safetensors.torch import load_file
+from safetensors import safe_open
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head', 'modulation']
 
+
+class WanModelFromSafetensors(WanModel):
+    @classmethod
+    def from_pretrained(
+        cls,
+        weights_file,
+        config_file,
+        torch_dtype=torch.bfloat16
+    ):
+        with open(config_file, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        config.pop("_class_name", None)
+        config.pop("_diffusers_version", None)
+
+        model = cls(**config)
+
+        with safe_open(weights_file, framework="pt") as f:
+            state_dict = {k: f.get_tensor(k).to(torch_dtype) for k in f.keys()}
+ 
+        model.load_state_dict(state_dict)
+        model = model.to(torch_dtype)
+
+        model.eval()
+
+        return model
 
 def vae_encode(tensor, vae):
     return vae.model.encode(tensor, vae.scale)
@@ -111,7 +138,13 @@ class T5EncoderModel:
                 return_tokenizer=False,
                 dtype=dtype,
                 device=device).eval().requires_grad_(False)
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'), assign=True)
+
+        if checkpoint_path.endswith('.safetensors'):
+            state_dict = load_file(checkpoint_path, device='cpu')
+        else:
+            state_dict = torch.load(checkpoint_path, map_location='cpu')
+
+        model.load_state_dict(state_dict, assign=True)
         self.model = model
         if shard_fn is not None:
             self.model = shard_fn(self.model, sync_module_states=False)
@@ -277,12 +310,14 @@ class WanPipeline(BasePipeline):
             raise RuntimeError(f'Could not autodetect model variant. model_dim={model_dim}, i2v={self.i2v}')
 
         # This is the outermost class, which isn't a nn.Module
+        t5_safetensors_model_path = self.model_config['llm_path'] if self.model_config.get('llm_path', None) else os.path.join(ckpt_dir, wan_config.t5_checkpoint)
+        t5_tokenizer_path = self.model_config['llm_tokenizer_path'] if self.model_config.get('llm_tokenizer_path', None) else os.path.join(ckpt_dir, wan_config.t5_tokenizer)
         self.text_encoder = T5EncoderModel(
             text_len=wan_config.text_len,
             dtype=dtype,
             device='cpu',
-            checkpoint_path=os.path.join(ckpt_dir, wan_config.t5_checkpoint),
-            tokenizer_path=os.path.join(ckpt_dir, wan_config.t5_tokenizer),
+            checkpoint_path=t5_safetensors_model_path,
+            tokenizer_path=t5_tokenizer_path,
             shard_fn=None,
         )
 
@@ -309,7 +344,18 @@ class WanPipeline(BasePipeline):
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
         transformer_dtype = self.model_config.get('transformer_dtype', dtype)
-        self.transformer = WanModel.from_pretrained(self.model_config['ckpt_path'], torch_dtype=dtype)
+
+        if self.model_config.get('transformer_path', None):
+            if not self.model_config.get('transformer_config_path', None):
+                raise ValueError("The transformer_path is specified, but the transformer_config_path isn't. Note that specifying transformer_path is used to load the safetensors format model of Wan2.1. You can download the transformer_config file from the official Hugging Face repo, such as the 'config.json' at https://huggingface.co/Wan-AI/Wan2.1-T2V-14B/tree/main.")
+            self.transformer = WanModelFromSafetensors.from_pretrained(
+                self.model_config['transformer_path'],
+                self.model_config['transformer_config_path'],
+                torch_dtype=dtype
+            )
+        else:
+            self.transformer = WanModel.from_pretrained(self.model_config['ckpt_path'], torch_dtype=dtype)
+
         for name, p in self.transformer.named_parameters():
             if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
                 p.data = p.data.to(transformer_dtype)
