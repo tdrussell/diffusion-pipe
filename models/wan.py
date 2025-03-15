@@ -48,9 +48,6 @@ class WanModelFromSafetensors(WanModel):
             model = cls(**config)
 
         state_dict = load_file(weights_file, device='cpu')
-        state_dict = {
-            re.sub(r'^model\.diffusion_model\.', '', k): v for k, v in state_dict.items()
-        }
 
         for name, param in model.named_parameters():
             dtype_to_use = torch_dtype if any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) else transformer_dtype
@@ -61,6 +58,82 @@ class WanModelFromSafetensors(WanModel):
 def vae_encode(tensor, vae):
     return vae.model.encode(tensor, vae.scale)
 
+def umt5_keys_mapping_comfy(state_dict):
+    import re
+    # define key mappings rule
+    def execute_mapping(original_key):
+        # Token embedding mapping
+        if original_key == "shared.weight":
+            return "token_embedding.weight"
+        
+        # Final layer norm mapping
+        if original_key == "encoder.final_layer_norm.weight":
+            return "norm.weight"
+        
+        # Block layer mappings
+        block_match = re.match(r"encoder\.block\.(\d+)\.layer\.(\d+)\.(.+)", original_key)
+        if block_match:
+            block_num = block_match.group(1)
+            layer_type = int(block_match.group(2))
+            rest = block_match.group(3)
+            
+            # self-attn layer（layer.0）
+            if layer_type == 0:
+                if "SelfAttention" in rest:
+                    attn_part = rest.split(".")[1]
+                    if attn_part in ["q", "k", "v", "o"]:
+                        return f"blocks.{block_num}.attn.{attn_part}.weight"
+                    elif attn_part == "relative_attention_bias":
+                        return f"blocks.{block_num}.pos_embedding.embedding.weight"
+                elif rest == "layer_norm.weight":
+                    return f"blocks.{block_num}.norm1.weight"
+            
+            # FFN Layer（layer.1）
+            elif layer_type == 1:
+                if "DenseReluDense" in rest:
+                    parts = rest.split(".")
+                    if parts[1] == "wi_0":
+                        return f"blocks.{block_num}.ffn.gate.0.weight"
+                    elif parts[1] == "wi_1":
+                        return f"blocks.{block_num}.ffn.fc1.weight"
+                    elif parts[1] == "wo":
+                        return f"blocks.{block_num}.ffn.fc2.weight"
+                elif rest == "layer_norm.weight":
+                    return f"blocks.{block_num}.norm2.weight"
+        
+        return None
+
+    new_state_dict = {}
+    unmapped_keys = []
+    
+    for key, value in state_dict.items():
+        new_key = execute_mapping(key)
+        if new_key:
+            new_state_dict[new_key] = value
+        else:
+            unmapped_keys.append(key)
+    
+    print(f"Unmapped keys (usually safe to ignore): {unmapped_keys}")
+    del state_dict
+    return new_state_dict
+ 
+
+def umt5_keys_mapping_kijai(state_dict):
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        new_key = key.replace("attention.", "attn.")
+        new_key = new_key.replace("final_norm.weight", "norm.weight")
+        new_state_dict[new_key] = value
+    del state_dict
+    return new_state_dict
+
+def umt5_keys_mapping(state_dict):
+    if 'blocks.0.attn.k.weight' in state_dict:
+        print("loading kijai warpper umt5 safetensors model...")
+        return umt5_keys_mapping_kijai(state_dict)  
+    else:
+        print("loading comfyui repacked umt5 safetensors model...")
+        return umt5_keys_mapping_comfy(state_dict)  
 
 # We can load T5 a lot faster by copying some code so we can construct the model
 # inside an init_empty_weights() context.
@@ -145,6 +218,7 @@ class T5EncoderModel:
 
         if checkpoint_path.endswith('.safetensors'):
             state_dict = load_file(checkpoint_path, device='cpu')
+            state_dict = umt5_keys_mapping(state_dict)
         else:
             state_dict = torch.load(checkpoint_path, map_location='cpu')
 

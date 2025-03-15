@@ -169,7 +169,7 @@ dtype = 'bfloat16'
 #transformer_dtype = 'float8'
 timestep_sample_method = 'logit_normal'
 ```
-You still need ckpt_path, it's just that it can be missing the transformer files and/or UMT5. The transformer can be loaded from the native ComfyUI repackaged file, or the file for Kijai's wrapper extension. The UMT5 text encoder can be loaded **ONLY** from the Kijai wrapper repackaged file (the keys are completely different in the native ComfyUI file and it would be difficult to support).
+You still need ckpt_path, it's just that it can be missing the transformer files and/or UMT5. The transformer/UMT5 can be loaded from the native ComfyUI repackaged file, or the file for Kijai's wrapper extension. Additionally, you can mix and match components, for example, using the transformer from the ComfyUI repackaged repository alongside the UMT5 safetensors from Kijai's wrapper repository for training or other combinations.
 
 For i2v training, you **MUST** train on a dataset of only videos. The training script will crash with an error otherwise. The first frame of each video clip is used as the image conditioning, and the model is trained to predict the rest of the video. Please pay attention to the video_clip_mode setting. It defaults to 'single_beginning' if unset, which is reasonable for i2v training, but if you set it to something else during t2v training it may not be what you want for i2v. Only the 14B model has an i2v variant, and it requires training on videos, so VRAM requirements are high. Use block swapping as needed if you don't have enough VRAM.
 
