@@ -1,6 +1,7 @@
 import sys
 import json
 import math
+import re
 import os.path
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/Wan2_1'))
 
@@ -9,6 +10,7 @@ from torch import nn
 import torch.nn.functional as F
 import safetensors
 from accelerate import init_empty_weights
+from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
@@ -22,14 +24,116 @@ from wan.modules.model import (
 )
 from wan.modules.clip import CLIPModel
 from wan import configs as wan_configs
-
+from safetensors.torch import load_file
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head', 'modulation']
 
 
+class WanModelFromSafetensors(WanModel):
+    @classmethod
+    def from_pretrained(
+        cls,
+        weights_file,
+        config_file,
+        torch_dtype=torch.bfloat16,
+        transformer_dtype=torch.bfloat16,
+    ):
+        with open(config_file, "r", encoding="utf-8") as f:
+            config = json.load(f)
+
+        config.pop("_class_name", None)
+        config.pop("_diffusers_version", None)
+
+        with init_empty_weights():
+            model = cls(**config)
+
+        state_dict = load_file(weights_file, device='cpu')
+
+        for name, param in model.named_parameters():
+            dtype_to_use = torch_dtype if any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) else transformer_dtype
+            set_module_tensor_to_device(model, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+
+        return model
+
 def vae_encode(tensor, vae):
     return vae.model.encode(tensor, vae.scale)
 
+def umt5_keys_mapping_comfy(state_dict):
+    import re
+    # define key mappings rule
+    def execute_mapping(original_key):
+        # Token embedding mapping
+        if original_key == "shared.weight":
+            return "token_embedding.weight"
+        
+        # Final layer norm mapping
+        if original_key == "encoder.final_layer_norm.weight":
+            return "norm.weight"
+        
+        # Block layer mappings
+        block_match = re.match(r"encoder\.block\.(\d+)\.layer\.(\d+)\.(.+)", original_key)
+        if block_match:
+            block_num = block_match.group(1)
+            layer_type = int(block_match.group(2))
+            rest = block_match.group(3)
+            
+            # self-attn layer（layer.0）
+            if layer_type == 0:
+                if "SelfAttention" in rest:
+                    attn_part = rest.split(".")[1]
+                    if attn_part in ["q", "k", "v", "o"]:
+                        return f"blocks.{block_num}.attn.{attn_part}.weight"
+                    elif attn_part == "relative_attention_bias":
+                        return f"blocks.{block_num}.pos_embedding.embedding.weight"
+                elif rest == "layer_norm.weight":
+                    return f"blocks.{block_num}.norm1.weight"
+            
+            # FFN Layer（layer.1）
+            elif layer_type == 1:
+                if "DenseReluDense" in rest:
+                    parts = rest.split(".")
+                    if parts[1] == "wi_0":
+                        return f"blocks.{block_num}.ffn.gate.0.weight"
+                    elif parts[1] == "wi_1":
+                        return f"blocks.{block_num}.ffn.fc1.weight"
+                    elif parts[1] == "wo":
+                        return f"blocks.{block_num}.ffn.fc2.weight"
+                elif rest == "layer_norm.weight":
+                    return f"blocks.{block_num}.norm2.weight"
+        
+        return None
+
+    new_state_dict = {}
+    unmapped_keys = []
+    
+    for key, value in state_dict.items():
+        new_key = execute_mapping(key)
+        if new_key:
+            new_state_dict[new_key] = value
+        else:
+            unmapped_keys.append(key)
+    
+    print(f"Unmapped keys (usually safe to ignore): {unmapped_keys}")
+    del state_dict
+    return new_state_dict
+ 
+
+def umt5_keys_mapping_kijai(state_dict):
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        new_key = key.replace("attention.", "attn.")
+        new_key = new_key.replace("final_norm.weight", "norm.weight")
+        new_state_dict[new_key] = value
+    del state_dict
+    return new_state_dict
+
+def umt5_keys_mapping(state_dict):
+    if 'blocks.0.attn.k.weight' in state_dict:
+        print("loading kijai warpper umt5 safetensors model...")
+        return umt5_keys_mapping_kijai(state_dict)  
+    else:
+        print("loading comfyui repacked umt5 safetensors model...")
+        return umt5_keys_mapping_comfy(state_dict)  
 
 # We can load T5 a lot faster by copying some code so we can construct the model
 # inside an init_empty_weights() context.
@@ -111,7 +215,14 @@ class T5EncoderModel:
                 return_tokenizer=False,
                 dtype=dtype,
                 device=device).eval().requires_grad_(False)
-        model.load_state_dict(torch.load(checkpoint_path, map_location='cpu'), assign=True)
+
+        if checkpoint_path.endswith('.safetensors'):
+            state_dict = load_file(checkpoint_path, device='cpu')
+            state_dict = umt5_keys_mapping(state_dict)
+        else:
+            state_dict = torch.load(checkpoint_path, map_location='cpu')
+
+        model.load_state_dict(state_dict, assign=True)
         self.model = model
         if shard_fn is not None:
             self.model = shard_fn(self.model, sync_module_states=False)
@@ -263,7 +374,8 @@ class WanPipeline(BasePipeline):
         ckpt_dir = self.model_config['ckpt_path']
         dtype = self.model_config['dtype']
 
-        with open(os.path.join(ckpt_dir, 'config.json')) as f:
+        self.original_model_config_path = os.path.join(ckpt_dir, 'config.json')
+        with open(self.original_model_config_path) as f:
             json_config = json.load(f)
         self.i2v = (json_config['model_type'] == 'i2v')
         model_dim = json_config['dim']
@@ -277,11 +389,12 @@ class WanPipeline(BasePipeline):
             raise RuntimeError(f'Could not autodetect model variant. model_dim={model_dim}, i2v={self.i2v}')
 
         # This is the outermost class, which isn't a nn.Module
+        t5_model_path = self.model_config['llm_path'] if self.model_config.get('llm_path', None) else os.path.join(ckpt_dir, wan_config.t5_checkpoint)
         self.text_encoder = T5EncoderModel(
             text_len=wan_config.text_len,
             dtype=dtype,
             device='cpu',
-            checkpoint_path=os.path.join(ckpt_dir, wan_config.t5_checkpoint),
+            checkpoint_path=t5_model_path,
             tokenizer_path=os.path.join(ckpt_dir, wan_config.t5_tokenizer),
             shard_fn=None,
         )
@@ -309,10 +422,19 @@ class WanPipeline(BasePipeline):
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
         transformer_dtype = self.model_config.get('transformer_dtype', dtype)
-        self.transformer = WanModel.from_pretrained(self.model_config['ckpt_path'], torch_dtype=dtype)
-        for name, p in self.transformer.named_parameters():
-            if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
-                p.data = p.data.to(transformer_dtype)
+
+        if transformer_path := self.model_config.get('transformer_path', None):
+            self.transformer = WanModelFromSafetensors.from_pretrained(
+                transformer_path,
+                self.original_model_config_path,
+                torch_dtype=dtype,
+                transformer_dtype=transformer_dtype,
+            )
+        else:
+            self.transformer = WanModel.from_pretrained(self.model_config['ckpt_path'], torch_dtype=dtype)
+            for name, p in self.transformer.named_parameters():
+                if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
+                    p.data = p.data.to(transformer_dtype)
 
         self.transformer.train()
         # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,
