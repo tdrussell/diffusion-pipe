@@ -1,6 +1,7 @@
 import sys
 import json
 import math
+import re
 import os.path
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/Wan2_1'))
 
@@ -9,6 +10,7 @@ from torch import nn
 import torch.nn.functional as F
 import safetensors
 from accelerate import init_empty_weights
+from accelerate.utils import set_module_tensor_to_device
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE
@@ -23,7 +25,6 @@ from wan.modules.model import (
 from wan.modules.clip import CLIPModel
 from wan import configs as wan_configs
 from safetensors.torch import load_file
-from safetensors import safe_open
 
 KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'patch_embedding', 'text_embedding', 'time_embedding', 'time_projection', 'head', 'modulation']
 
@@ -34,7 +35,8 @@ class WanModelFromSafetensors(WanModel):
         cls,
         weights_file,
         config_file,
-        torch_dtype=torch.bfloat16
+        torch_dtype=torch.bfloat16,
+        transformer_dtype=torch.bfloat16,
     ):
         with open(config_file, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -42,15 +44,17 @@ class WanModelFromSafetensors(WanModel):
         config.pop("_class_name", None)
         config.pop("_diffusers_version", None)
 
-        model = cls(**config)
+        with init_empty_weights():
+            model = cls(**config)
 
-        with safe_open(weights_file, framework="pt") as f:
-            state_dict = {k: f.get_tensor(k).to(torch_dtype) for k in f.keys()}
- 
-        model.load_state_dict(state_dict)
-        model = model.to(torch_dtype)
+        state_dict = load_file(weights_file, device='cpu')
+        state_dict = {
+            re.sub(r'^model\.diffusion_model\.', '', k): v for k, v in state_dict.items()
+        }
 
-        model.eval()
+        for name, param in model.named_parameters():
+            dtype_to_use = torch_dtype if any(keyword in name for keyword in KEEP_IN_HIGH_PRECISION) else transformer_dtype
+            set_module_tensor_to_device(model, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
 
         return model
 
@@ -296,7 +300,8 @@ class WanPipeline(BasePipeline):
         ckpt_dir = self.model_config['ckpt_path']
         dtype = self.model_config['dtype']
 
-        with open(os.path.join(ckpt_dir, 'config.json')) as f:
+        self.original_model_config_path = os.path.join(ckpt_dir, 'config.json')
+        with open(self.original_model_config_path) as f:
             json_config = json.load(f)
         self.i2v = (json_config['model_type'] == 'i2v')
         model_dim = json_config['dim']
@@ -310,14 +315,13 @@ class WanPipeline(BasePipeline):
             raise RuntimeError(f'Could not autodetect model variant. model_dim={model_dim}, i2v={self.i2v}')
 
         # This is the outermost class, which isn't a nn.Module
-        t5_safetensors_model_path = self.model_config['llm_path'] if self.model_config.get('llm_path', None) else os.path.join(ckpt_dir, wan_config.t5_checkpoint)
-        t5_tokenizer_path = self.model_config['llm_tokenizer_path'] if self.model_config.get('llm_tokenizer_path', None) else os.path.join(ckpt_dir, wan_config.t5_tokenizer)
+        t5_model_path = self.model_config['llm_path'] if self.model_config.get('llm_path', None) else os.path.join(ckpt_dir, wan_config.t5_checkpoint)
         self.text_encoder = T5EncoderModel(
             text_len=wan_config.text_len,
             dtype=dtype,
             device='cpu',
-            checkpoint_path=t5_safetensors_model_path,
-            tokenizer_path=t5_tokenizer_path,
+            checkpoint_path=t5_model_path,
+            tokenizer_path=os.path.join(ckpt_dir, wan_config.t5_tokenizer),
             shard_fn=None,
         )
 
@@ -345,20 +349,18 @@ class WanPipeline(BasePipeline):
         dtype = self.model_config['dtype']
         transformer_dtype = self.model_config.get('transformer_dtype', dtype)
 
-        if self.model_config.get('transformer_path', None):
-            if not self.model_config.get('transformer_config_path', None):
-                raise ValueError("The transformer_path is specified, but the transformer_config_path isn't. Note that specifying transformer_path is used to load the safetensors format model of Wan2.1. You can download the transformer_config file from the official Hugging Face repo, such as the 'config.json' at https://huggingface.co/Wan-AI/Wan2.1-T2V-14B/tree/main.")
+        if transformer_path := self.model_config.get('transformer_path', None):
             self.transformer = WanModelFromSafetensors.from_pretrained(
-                self.model_config['transformer_path'],
-                self.model_config['transformer_config_path'],
-                torch_dtype=dtype
+                transformer_path,
+                self.original_model_config_path,
+                torch_dtype=dtype,
+                transformer_dtype=transformer_dtype,
             )
         else:
             self.transformer = WanModel.from_pretrained(self.model_config['ckpt_path'], torch_dtype=dtype)
-
-        for name, p in self.transformer.named_parameters():
-            if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
-                p.data = p.data.to(transformer_dtype)
+            for name, p in self.transformer.named_parameters():
+                if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
+                    p.data = p.data.to(transformer_dtype)
 
         self.transformer.train()
         # We'll need the original parameter name for saving, and the name changes once we wrap modules for pipeline parallelism,

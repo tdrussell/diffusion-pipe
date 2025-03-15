@@ -148,9 +148,30 @@ dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'
 ```
 
-Both t2v and i2v Wan2.1 variants are supported. Set ckpt_path to the original model checkpoint directory, e.g. [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B). The 1.3B is tested and confirmed working.
+Both t2v and i2v Wan2.1 variants are supported. Set ckpt_path to the original model checkpoint directory, e.g. [Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B).
 
-For i2v training, you **MUST** train on a dataset of only videos. The training script will crash with an error otherwise. The first frame of each video clip is used as the image conditioning, and the model is trained to predict the rest of the video. Please pay attention to the video_clip_mode setting, and understand that if not set it will default to 'single_middle'. This may not be what you want if you are expecting the very first frame of the source video to be the conditioning. Only the 14B model has an i2v variant, and it requires training on videos, so VRAM requirements are high. You will need 48GB even for fairly short frame lengths.
+(Optional) You may skip downloading the transformer and UMT5 text encoder from the original checkpoint, and instead pass in paths to the ComfyUI safetensors files instead.
+
+Download checkpoint but skip the transformer and UMT5:
+```
+huggingface-cli download Wan-AI/Wan2.1-T2V-1.3B --local-dir Wan2.1-T2V-1.3B --exclude "diffusion_pytorch_model*" "*umt5*"
+```
+
+Then use this config:
+```
+[model]
+type = 'wan'
+ckpt_path = '/data2/imagegen_models/Wan2.1-T2V-1.3B'
+transformer_path = '/data2/imagegen_models/wan_comfyui/wan2.1_t2v_1.3B_bf16.safetensors'
+llm_path = '/data2/imagegen_models/wan_comfyui/wrapper/umt5-xxl-enc-bf16.safetensors'
+dtype = 'bfloat16'
+# You can use fp8 for the transformer when training LoRA.
+#transformer_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+```
+You still need ckpt_path, it's just that it can be missing the transformer files and/or UMT5. The transformer can be loaded from the native ComfyUI repackaged file, or the file for Kijai's wrapper extension. The UMT5 text encoder can be loaded **ONLY** from the Kijai wrapper repackaged file (the keys are completely different in the native ComfyUI file and it would be difficult to support).
+
+For i2v training, you **MUST** train on a dataset of only videos. The training script will crash with an error otherwise. The first frame of each video clip is used as the image conditioning, and the model is trained to predict the rest of the video. Please pay attention to the video_clip_mode setting. It defaults to 'single_beginning' if unset, which is reasonable for i2v training, but if you set it to something else during t2v training it may not be what you want for i2v. Only the 14B model has an i2v variant, and it requires training on videos, so VRAM requirements are high. Use block swapping as needed if you don't have enough VRAM.
 
 Wan2.1 LoRAs are saved in ComfyUI format.
 
