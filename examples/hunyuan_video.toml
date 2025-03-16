@@ -50,6 +50,8 @@ checkpoint_every_n_minutes = 120
 # Always set to true unless you have a huge amount of VRAM.
 activation_checkpointing = true
 # Controls how Deepspeed decides how to divide layers across GPUs. Probably don't change this.
+# Alternatively you can use 'manual' in combination with partition_split
+#partition_split = [N] # model layers from 0 to N will be loaded to GPU 0 and N to the end will be loaded onto GPU 1
 partition_method = 'parameters'
 # dtype for saving the LoRA or model, if different from training dtype
 save_dtype = 'bfloat16'
