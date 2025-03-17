@@ -507,8 +507,9 @@ class WanPipeline(BasePipeline):
             ids = ids.to(p.device)
             mask = mask.to(p.device)
             seq_lens = mask.gt(0).sum(dim=1).long()
-            text_embeddings = text_encoder(ids, mask)
-            return {'text_embeddings': text_embeddings, 'seq_lens': seq_lens}
+            with torch.autocast(device_type=p.device.type, dtype=p.dtype):
+                text_embeddings = text_encoder(ids, mask)
+                return {'text_embeddings': text_embeddings, 'seq_lens': seq_lens}
         return fn
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
