@@ -39,6 +39,9 @@ eval_before_first_step = true
 # more dropped images. Usually doesn't matter for training but the eval set is much smaller so it can matter.
 eval_micro_batch_size_per_gpu = 1
 eval_gradient_accumulation_steps = 1
+# If using block swap, you can disable it for eval. Eval uses less memory, so depending on block swapping amount you can maybe get away with
+# doing this, and then eval is much faster.
+#disable_block_swap_for_eval = true
 
 # misc settings
 
@@ -48,6 +51,7 @@ save_every_n_epochs = 2
 #checkpoint_every_n_epochs = 1
 checkpoint_every_n_minutes = 120
 # Always set to true unless you have a huge amount of VRAM.
+# This can also be 'unsloth' to reduce VRAM even more, with a slight performance hit.
 activation_checkpointing = true
 # Controls how Deepspeed decides how to divide layers across GPUs. Probably don't change this.
 # Alternatively you can use 'manual' in combination with partition_split
