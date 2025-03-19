@@ -53,10 +53,15 @@ checkpoint_every_n_minutes = 120
 # Always set to true unless you have a huge amount of VRAM.
 # This can also be 'unsloth' to reduce VRAM even more, with a slight performance hit.
 activation_checkpointing = true
+
 # Controls how Deepspeed decides how to divide layers across GPUs. Probably don't change this.
-# Alternatively you can use 'manual' in combination with partition_split
-#partition_split = [N] # model layers from 0 to N will be loaded to GPU 0 and N to the end will be loaded onto GPU 1
 partition_method = 'parameters'
+# Alternatively you can use 'manual' in combination with partition_split, which specifies the split points for dividing
+# layers between GPUs. For example, with two GPUs, partition_split=[10] puts layers 0-9 on GPU 0, and the rest on GPU 1.
+# With three GPUs, partition_split=[10, 20] puts layers 0-9 on GPU 0, layers 10-19 on GPU 1, and the rest on GPU 2.
+# Length of partition_split must be pipeline_stages-1.
+#partition_split = [N]
+
 # dtype for saving the LoRA or model, if different from training dtype
 save_dtype = 'bfloat16'
 # Batch size for caching latents and text embeddings. Increasing can lead to higher GPU utilization during caching phase but uses more memory.

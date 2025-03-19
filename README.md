@@ -17,6 +17,7 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Ima
 ## Recent changes
 - 2025-03-18
   - Add unsloth activation checkpointing. Reduces VRAM for a small performance hit.
+  - Add partition_split option for manually controlling how layers are divided across multiple GPUs. Thanks @arczewski for the PR!
 - 2025-03-16
   - Support loading any optimizer from the pytorch-optimizer library.
   - Wan transformer and UMT5 can now be loaded from ComfyUI files. Thanks to @qiwang1996 for the PR!
