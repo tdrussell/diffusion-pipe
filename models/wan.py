@@ -386,6 +386,14 @@ class WanPipeline(BasePipeline):
         model_dim = json_config['dim']
         if not self.i2v and model_dim == 1536:
             wan_config = wan_configs.t2v_1_3B
+        elif self.i2v and model_dim == 1536: # There is no official i2v 1.3b model, but there is https://huggingface.co/alibaba-pai/Wan2.1-Fun-1.3B-InP
+            # This is a hack, 
+            wan_config = wan_configs.t2v_1_3B
+            # The following lines are taken from https://github.com/Wan-Video/Wan2.1/blob/main/wan/configs/wan_i2v_14B.py
+            wan_config.clip_model = 'clip_xlm_roberta_vit_h_14'
+            wan_config.clip_dtype = torch.float16
+            wan_config.clip_checkpoint = 'models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth'
+            wan_config.clip_tokenizer = 'xlm-roberta-large'
         elif self.i2v and model_dim == 5120:
             wan_config = wan_configs.i2v_14B
         elif not self.i2v and model_dim == 5120:
