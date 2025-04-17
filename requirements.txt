@@ -27,3 +27,4 @@ hydra-core
 easydict
 ftfy
 pytorch-optimizer
+wandb

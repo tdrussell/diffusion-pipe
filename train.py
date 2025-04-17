@@ -449,7 +449,6 @@ if __name__ == '__main__':
         run_dir = get_most_recent_run_dir(config['output_dir'])
 
     # WandB logging
-    global wandb_enable
     wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)
     if wandb_enable:
         wandb_api_key     = config['monitoring']['wandb_api_key']
