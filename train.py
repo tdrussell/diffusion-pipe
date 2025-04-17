@@ -1,5 +1,6 @@
 import argparse
 import os
+import wandb
 from datetime import datetime, timezone
 import shutil
 import glob
@@ -29,6 +30,8 @@ from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+
+wandb_enable = False
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -188,13 +191,19 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
             losses.append(loss)
             if is_main_process():
                 tb_writer.add_scalar(f'{name}/loss_quantile_{quantile:.2f}', loss, step)
+                if wandb_enable:
+                    wandb.log({f'{name}/loss_quantile_{quantile:.2f}': loss, 'step': step})                
         avg_loss = sum(losses) / len(losses)
         if is_main_process():
             tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
+            if wandb_enable:
+                wandb.log({f'{name}/loss': avg_loss, 'step': step})            
 
     duration = time.time() - start
     if is_main_process():
         tb_writer.add_scalar('eval/eval_time_sec', duration, step)
+        if wandb_enable:
+            wandb.log({'eval/eval_time_sec': duration, 'step': step})
         pbar.close()
 
 
@@ -439,6 +448,22 @@ if __name__ == '__main__':
     else:  # Not resuming, use most recent (newly created) dir
         run_dir = get_most_recent_run_dir(config['output_dir'])
 
+    # WandB logging
+    global wandb_enable
+    wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)
+    if wandb_enable:
+        wandb_api_key     = config['monitoring']['wandb_api_key']
+        wandb_tracker     = config['monitoring']['wandb_tracker_name']
+        wandb_run_name    = config['monitoring']['wandb_run_name']
+        logging_dir       = run_dir
+        wandb.login(key=wandb_api_key)
+        wandb.init(
+            project=wandb_tracker,
+            name=wandb_run_name,
+            config=config,
+            dir=logging_dir
+        )
+
     # Block swapping
     if blocks_to_swap := config.get('blocks_to_swap', 0):
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
@@ -682,6 +707,8 @@ if __name__ == '__main__':
 
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss, step)
+            if wandb_enable:
+                wandb.log({'train/loss': loss, 'step': step})
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, step)
@@ -692,6 +719,8 @@ if __name__ == '__main__':
         if finished_epoch:
             if is_main_process():
                 tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
+                if wandb_enable:
+                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch}) 
             epoch_loss = 0
             num_steps = 0
             epoch = new_epoch
