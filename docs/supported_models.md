@@ -200,6 +200,8 @@ llama3_path = '/data2/models/Meta-Llama-3.1-8B-Instruct'
 llama3_4bit = true
 dtype = 'bfloat16'
 transformer_dtype = 'float8'
+# Can use nf4 quantization for even more VRAM saving.
+#transformer_dtype = 'nf4'
 max_llama3_sequence_length = 128
 # Can use a resolution-dependent timestep shift, like Flux. Unsure if results are better.
 #flux_shift = true
@@ -213,6 +215,6 @@ The official inference code uses a max sequence length of 128 for all text encod
 
 Due to how the Llama3 text embeddings are computed, the Llama3 text encoder must be kept loaded and its embeddings computed during training, rather than being pre-cached. Otherwise the cache would use an enormous amount of space on disk. This increases memory use, but you can have Llama3 in 4bit with essentially 0 measurable effect on validation loss.
 
-Without block swapping, you will need 48GB VRAM, or 2x24GB with pipeline parallelism. Block swapping may allow training on a single 24GB GPU but is not tested.
+Without block swapping, you will need 48GB VRAM, or 2x24GB with pipeline parallelism. With enough block swapping you can train on a single 24GB GPU. Using nf4 quantization also allows training with 24GB, but there may be some quality decrease.
 
 HiDream LoRAs are saved in ComfyUI format.

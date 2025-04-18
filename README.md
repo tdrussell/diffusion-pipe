@@ -15,6 +15,9 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Ima
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2025-04-18
+  - Fix block swapping for HiDream. With ```blocks_to_swap = 24``` you can train rank 32 LoRA on a single 4090.
+  - Support nf4 quantization for HiDream. With nf4 transformer, you can train LoRA on a single 4090 even without block swapping. See supported models doc for how to enable.
 - 2025-04-15
   - Support HiDream.
 - 2025-03-18
@@ -36,9 +39,6 @@ Currently supports SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Ima
 - 2025-03-03
   - Added masked training support. See the comment in the example dataset config for explanation. This feature required some refactoring, I tested that each supported model is able to train, but if something suddenly breaks for you this change is the likely cause. Like most brand-new features, masked training is experimental.
   - Added Wan i2v training. It seems to work but is barely tested. See the supported models doc for details.
-- 2025-02-25
-  - Support LoRA training on Wan2.1 t2v variants.
-  - SDXL: debiased estimation loss, init from existing lora, and arbitrary caption length.
 
 ## Windows support
 It will be difficult or impossible to make training work on native Windows. This is because Deepspeed only has [partial Windows support](https://github.com/microsoft/DeepSpeed/blob/master/blogs/windows/08-2024/README.md). Deepspeed is a hard requirement because the entire training script is built around Deepspeed pipeline parallelism. However, it will work on Windows Subsystem for Linux, specifically WSL 2. If you must use Windows I recommend trying WSL 2.

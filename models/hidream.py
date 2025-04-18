@@ -11,6 +11,7 @@ from safetensors.torch import save_file
 import transformers
 from transformers import LlamaForCausalLM, PreTrainedTokenizerFast
 from einops import repeat
+import diffusers
 
 from models.base import BasePipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, empty_cuda_cache
@@ -92,14 +93,25 @@ class HiDreamPipeline(BasePipeline):
         empty_cuda_cache()
         self.diffusers_pipeline.text_encoder_4 = text_encoder_4
 
+        if transformer_dtype == 'nf4':
+            quantization_config = diffusers.BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type='nf4',
+                bnb_4bit_compute_dtype=dtype,
+                llm_int8_skip_modules=KEEP_IN_HIGH_PRECISION,
+            )
+        else:
+            quantization_config = None
         self.diffusers_pipeline.transformer = HiDreamImageTransformer2DModel.from_pretrained(
             self.model_config['diffusers_path'],
             subfolder='transformer',
-            torch_dtype=dtype
+            torch_dtype=dtype,
+            quantization_config=quantization_config,
         )
-        for name, p in self.transformer.named_parameters():
-            if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
-                p.data = p.data.to(transformer_dtype)
+        if transformer_dtype != 'nf4':
+            for name, p in self.transformer.named_parameters():
+                if not (any(x in name for x in KEEP_IN_HIGH_PRECISION)):
+                    p.data = p.data.to(transformer_dtype)
 
         self.transformer.train()
         for name, p in self.transformer.named_parameters():
@@ -285,6 +297,7 @@ class HiDreamPipeline(BasePipeline):
         transformer.double_stream_blocks = None
         transformer.single_stream_blocks = None
         transformer.to('cuda')
+        self.text_encoder_4.to('cuda')
         transformer.double_stream_blocks = double_blocks
         transformer.single_stream_blocks = single_blocks
         self.prepare_block_swap_training()
@@ -388,6 +401,12 @@ class InitialLayer(nn.Module):
 
         initial_encoder_hidden_states = torch.cat([encoder_hidden_states[-1], encoder_hidden_states[-2]], dim=1)
         llama_encoder_hidden_states = torch.stack(encoder_hidden_states[:-1], dim=0)
+
+        # With nf4 quantization, tensors can end up float32, which breaks flash attention later, so we cast it here.
+        hidden_states = hidden_states.to(AUTOCAST_DTYPE)
+        initial_encoder_hidden_states = initial_encoder_hidden_states.to(AUTOCAST_DTYPE)
+        llama_encoder_hidden_states = llama_encoder_hidden_states.to(AUTOCAST_DTYPE)
+        adaln_input = adaln_input.to(AUTOCAST_DTYPE)
 
         return make_contiguous(hidden_states, initial_encoder_hidden_states, llama_encoder_hidden_states, adaln_input, rope)
 
