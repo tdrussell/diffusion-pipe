@@ -381,13 +381,16 @@ class WanPipeline(BasePipeline):
         with open(self.original_model_config_path) as f:
             json_config = json.load(f)
         self.i2v = (json_config['model_type'] == 'i2v')
+        self.flf2v = (json_config['model_type'] == 'flf2v')
         if self.i2v:
             self.name = 'wan_i2v'
+        if self.flf2v:
+            self.name = 'wan_flf2v'
         model_dim = json_config['dim']
         if not self.i2v and model_dim == 1536:
             wan_config = wan_configs.t2v_1_3B
         elif self.i2v and model_dim == 1536: # There is no official i2v 1.3b model, but there is https://huggingface.co/alibaba-pai/Wan2.1-Fun-1.3B-InP
-            # This is a hack, 
+            # This is a hack,
             wan_config = wan_configs.t2v_1_3B
             # The following lines are taken from https://github.com/Wan-Video/Wan2.1/blob/main/wan/configs/wan_i2v_14B.py
             wan_config.clip_model = 'clip_xlm_roberta_vit_h_14'
@@ -396,10 +399,12 @@ class WanPipeline(BasePipeline):
             wan_config.clip_tokenizer = 'xlm-roberta-large'
         elif self.i2v and model_dim == 5120:
             wan_config = wan_configs.i2v_14B
+        elif self.flf2v and model_dim == 5120:
+            wan_config = wan_configs.flf2v_14B
         elif not self.i2v and model_dim == 5120:
             wan_config = wan_configs.t2v_14B
         else:
-            raise RuntimeError(f'Could not autodetect model variant. model_dim={model_dim}, i2v={self.i2v}')
+            raise RuntimeError(f'Could not autodetect model variant. model_dim={model_dim}, i2v={self.i2v}, flf2v={self.flf2v}')
 
         # This is the outermost class, which isn't a nn.Module
         t5_model_path = self.model_config['llm_path'] if self.model_config.get('llm_path', None) else os.path.join(ckpt_dir, wan_config.t5_checkpoint)
@@ -423,7 +428,7 @@ class WanPipeline(BasePipeline):
         self.vae.std = self.vae.std.to('cuda')
         self.vae.scale = [self.vae.mean, 1.0 / self.vae.std]
 
-        if self.i2v:
+        if self.i2v or self.flf2v:
             self.clip = CLIPModel(
                 dtype=dtype,
                 device='cpu',
@@ -495,9 +500,15 @@ class WanPipeline(BasePipeline):
             ret = {'latents': latents}
             clip = vae_and_clip.clip
             if clip is not None:
-                assert tensor.ndim == 5, f'i2v must train on videos, got tensor with shape {tensor.shape}'
+                assert tensor.ndim == 5, f'i2v/flf2v must train on videos, got tensor with shape {tensor.shape}'
                 first_frame = tensor[:, :, 0:1, ...].clone()
                 tensor[:, :, 1:, ...] = 0
+
+                if self.flf2v:
+                    last_frame = tensor[:, :, -2:-1, ...].clone()
+                    first_frame = torch.cat([first_frame, last_frame])
+                    tensor[:, :, :-2, ...] = 0
+
                 # Image conditioning. Same shame as latents, first frame is unchanged, rest is 0.
                 # NOTE: encoding 0s with the VAE doesn't give you 0s in the latents, I tested this. So we need to
                 # encode the whole thing here, we can't just extract the first frame from the latents later and make
@@ -528,8 +539,8 @@ class WanPipeline(BasePipeline):
         text_embeddings = inputs['text_embeddings']
         seq_lens = inputs['seq_lens']
         mask = inputs['mask']
-        y = inputs['y'] if self.i2v else None
-        clip_context = inputs['clip_context'] if self.i2v else None
+        y = inputs['y'] if self.i2v or self.flf2v else None
+        clip_context = inputs['clip_context'] if self.i2v or self.flf2v else None
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -618,7 +629,8 @@ class InitialLayer(nn.Module):
         self.text_embedding = model.text_embedding
         self.time_projection = model.time_projection
         self.i2v = (model.model_type == 'i2v')
-        if self.i2v:
+        self.flf2v = (model.model_type == 'flf2v')
+        if self.i2v or self.flf2v:
             self.img_emb = model.img_emb
         self.model = [model]
 
@@ -641,9 +653,11 @@ class InitialLayer(nn.Module):
         if self.freqs.device != device:
             self.freqs = self.freqs.to(device)
 
-        if self.i2v:
+        if self.i2v or self.flf2v:
             mask = torch.zeros((bs, 4, f, h, w), device=x.device, dtype=x.dtype)
             mask[:, :, 0, ...] = 1
+            if self.flf2v:
+                mask[:, :, -1, ...] = 1
             y = torch.cat([mask, y], dim=1)
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
@@ -672,7 +686,7 @@ class InitialLayer(nn.Module):
                 for u in context
             ]))
 
-        if self.i2v:
+        if self.i2v or self.flf2v:
             assert clip_fea is not None
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
