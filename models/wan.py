@@ -465,7 +465,7 @@ class WanPipeline(BasePipeline):
 
     def get_vae(self):
         vae = self.vae.model
-        clip = self.clip.model if self.i2v else None
+        clip = self.clip.model if self.i2v or self.flf2v else None
         return VaeAndClip(vae, clip)
 
     def get_text_encoders(self):
