@@ -502,11 +502,13 @@ class WanPipeline(BasePipeline):
             if clip is not None:
                 assert tensor.ndim == 5, f'i2v/flf2v must train on videos, got tensor with shape {tensor.shape}'
                 first_frame = tensor[:, :, 0:1, ...].clone()
+                clip_context = self.clip.visual(first_frame.to(p.device, p.dtype))
                 tensor[:, :, 1:, ...] = 0
 
                 if self.flf2v:
                     last_frame = tensor[:, :, -2:-1, ...].clone()
-                    first_frame = torch.cat([first_frame, last_frame])
+                    # NOTE: dim=1 is a hack to pass clip_context without microbatching breaking the zeroth dim
+                    clip_context = torch.cat([clip_context, self.clip.visual(last_frame.to(p.device, p.dtype))], dim=1)
                     tensor[:, :, :-2, ...] = 0
 
                 # Image conditioning. Same shame as latents, first frame is unchanged, rest is 0.
@@ -514,7 +516,6 @@ class WanPipeline(BasePipeline):
                 # encode the whole thing here, we can't just extract the first frame from the latents later and make
                 # the rest 0. But what happens if you do that? Probably things get fried, but might be worth testing.
                 y = vae_encode(tensor, self.vae)
-                clip_context = self.clip.visual(first_frame.to(p.device, p.dtype))
                 ret['y'] = y
                 ret['clip_context'] = clip_context
             return ret
@@ -688,7 +689,10 @@ class InitialLayer(nn.Module):
 
         if self.i2v or self.flf2v:
             assert clip_fea is not None
-            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            if self.flf2v:
+                self.img_emb.emb_pos.data = self.img_emb.emb_pos.data.to(clip_fea.device, torch.float32)
+                clip_fea = clip_fea.view(-1, 257, 1280)
+            context_clip = self.img_emb(clip_fea)  # bs x 257 (x2) x dim
             context = torch.concat([context_clip, context], dim=1)
 
         # pipeline parallelism needs everything on the GPU
