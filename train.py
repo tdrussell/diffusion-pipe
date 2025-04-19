@@ -192,12 +192,12 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
             if is_main_process():
                 tb_writer.add_scalar(f'{name}/loss_quantile_{quantile:.2f}', loss, step)
                 if wandb_enable:
-                    wandb.log({f'{name}/loss_quantile_{quantile:.2f}': loss, 'step': step})                
+                    wandb.log({f'{name}/loss_quantile_{quantile:.2f}': loss, 'step': step})
         avg_loss = sum(losses) / len(losses)
         if is_main_process():
             tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
             if wandb_enable:
-                wandb.log({f'{name}/loss': avg_loss, 'step': step})            
+                wandb.log({f'{name}/loss': avg_loss, 'step': step})
 
     duration = time.time() - start
     if is_main_process():
@@ -719,7 +719,7 @@ if __name__ == '__main__':
             if is_main_process():
                 tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
                 if wandb_enable:
-                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch}) 
+                    wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch})
             epoch_loss = 0
             num_steps = 0
             epoch = new_epoch
