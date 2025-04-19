@@ -131,3 +131,10 @@ eps = 1e-8
 # lr = 1
 # betas = [0.9, 0.99]
 # weight_decay = 0.01
+
+[monitoring]
+# Set to true and fill in these fields to enable wandb
+enable_wandb = false
+wandb_api_key = ''
+wandb_tracker_name = ''
+wandb_run_name = ''
