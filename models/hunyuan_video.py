@@ -6,6 +6,7 @@ import os.path
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/HunyuanVideo'))
 
 import safetensors
+import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -27,10 +28,24 @@ from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline as OriginalHunyuanVideoPipeline
 from hyvideo.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
 
+# Framepack
+from transformers import SiglipImageProcessor, SiglipVisionModel
+import einops
+import gc
 
 # In diffusion-pipe, we already converted the dtype to an object. But Hunyuan scripts want the string version in a lot of places.
 TYPE_TO_PRECISION = {v: k for k, v in PRECISION_TO_TYPE.items()}
 
+# TODO: replace with comfy-compatible!
+def hf_clip_vision_encode(image, feature_extractor, image_encoder):
+    assert isinstance(image, np.ndarray)
+    assert image.ndim == 3 and image.shape[2] == 3
+    assert image.dtype == np.uint8
+
+    preprocessed = feature_extractor.preprocess(images=image, return_tensors="pt").to(device=image_encoder.device, dtype=image_encoder.dtype)
+    image_encoder_output = image_encoder(**preprocessed)
+
+    return image_encoder_output
 
 def get_rotary_pos_embed(transformer, video_length, height, width):
     target_ndim = 3
@@ -186,6 +201,41 @@ def vae_encode(tensor, vae):
     latents = vae.encode(tensor).latent_dist.sample()
     return latents * vae.config.scaling_factor
 
+class ClipVisionProjection(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.up = nn.Linear(in_channels, out_channels * 3)
+        self.down = nn.Linear(out_channels * 3, out_channels)
+
+    def forward(self, x):
+        projected_x = self.down(nn.functional.silu(self.up(x)))
+        return projected_x
+
+class HunyuanVideoPatchEmbedForCleanLatents(nn.Module):
+    def __init__(self, inner_dim):
+        super().__init__()
+        self.proj = nn.Conv3d(16, inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
+        self.proj_2x = nn.Conv3d(16, inner_dim, kernel_size=(2, 4, 4), stride=(2, 4, 4))
+        self.proj_4x = nn.Conv3d(16, inner_dim, kernel_size=(4, 8, 8), stride=(4, 8, 8))
+
+    @torch.no_grad()
+    def initialize_weight_from_another_conv3d(self, another_layer):
+        weight = another_layer.weight.detach().clone()
+        bias = another_layer.bias.detach().clone()
+
+        sd = {
+            'proj.weight': weight.clone(),
+            'proj.bias': bias.clone(),
+            'proj_2x.weight': einops.repeat(weight, 'b c t h w -> b c (t tk) (h hk) (w wk)', tk=2, hk=2, wk=2) / 8.0,
+            'proj_2x.bias': bias.clone(),
+            'proj_4x.weight': einops.repeat(weight, 'b c t h w -> b c (t tk) (h hk) (w wk)', tk=4, hk=4, wk=4) / 64.0,
+            'proj_4x.bias': bias.clone(),
+        }
+
+        sd = {k: v.clone() for k, v in sd.items()}
+
+        self.load_state_dict(sd)
+        return
 
 class HunyuanVideoPipeline(BasePipeline):
     name = 'hunyuan-video'
@@ -298,6 +348,48 @@ class HunyuanVideoPipeline(BasePipeline):
             args=args,
         )
 
+        self.framepack = config['model']['framepack']
+
+        if self.framepack:
+            self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
+            self.image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16)
+            self.load_encoders_from_diffusion_model()
+
+        self.image_projection = None
+        self.clean_x_embedder = None
+
+    def load_encoders_from_diffusion_model(self):
+        inner_dim = self.model_config['num_attention_heads'] * self.model_config['attention_head_dim']
+        factor_kwargs = self.model_config.get('transformer_dtype', self.model_config['dtype'])
+        in_channels = self.args.latent_channels
+        out_channels = self.args.latent_channels
+        with init_empty_weights():
+            transformer = load_model(
+                self.args,
+                in_channels=in_channels,
+                out_channels=out_channels,
+                factor_kwargs=factor_kwargs,
+            )
+            transformer.image_projection = ClipVisionProjection(3, inner_dim)
+            transformer.clean_x_embedder = HunyuanVideoPatchEmbedForCleanLatents(inner_dim)
+        if transformer_path := self.model_config.get('transformer_path', None):
+            state_dict = load_safetensors(transformer_path)
+            state_dict = _convert_state_dict_keys(transformer.state_dict(), state_dict)
+        else:
+            state_dict = load_state_dict(self.args, self.args.model_base)
+        params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
+        base_dtype = self.model_config['dtype']
+        for name, param in transformer.named_parameters():
+            dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else transformer_dtype
+            set_module_tensor_to_device(transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
+
+        self.image_projection = transformer.image_projection.clone()
+        self.clean_x_embedder = transformer.clean_x_embedder.clone()
+
+        del transformer
+        gc.collect()
+        torch.cuda.empty_cache()
+
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
         transformer_dtype = self.model_config.get('transformer_dtype', self.model_config['dtype'])
@@ -313,6 +405,11 @@ class HunyuanVideoPipeline(BasePipeline):
                 out_channels=out_channels,
                 factor_kwargs=factor_kwargs,
             )
+            if self.framepack:
+                # to not have orphan weight when loading sd, maybe not nessesary
+                inner_dim = self.model_config['num_attention_heads'] * self.model_config['attention_head_dim']
+                transformer.image_projection = ClipVisionProjection(3, inner_dim)
+                transformer.clean_x_embedder = HunyuanVideoPatchEmbedForCleanLatents(inner_dim)
         if transformer_path := self.model_config.get('transformer_path', None):
             state_dict = load_safetensors(transformer_path)
             state_dict = _convert_state_dict_keys(transformer.state_dict(), state_dict)
@@ -361,7 +458,12 @@ class HunyuanVideoPipeline(BasePipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):
-            return {'latents': vae_encode(tensor.to(vae.device, vae.dtype), vae)}
+            ret =  {'latents': vae_encode(tensor.to(vae.device, vae.dtype), vae)}
+
+            if self.framepack:
+                image_encoder_output = hf_clip_vision_encode(tensor[:, :, 0:1, ...].clone(), self.siglip_feature_extractor, self.image_encoder)
+                ret['image_encoder_output'] = image_encoder_output.last_hidden_state
+            return ret
         return fn
 
     def get_call_text_encoder_fn(self, text_encoder):
@@ -417,6 +519,17 @@ class HunyuanVideoPipeline(BasePipeline):
         prompt_attention_mask_1 = inputs['prompt_attention_mask_1']
         prompt_embeds_2 = inputs['prompt_embeds_2']
         mask = inputs['mask']
+
+        if self.image_projection is not None:
+
+            image_encoder_last_hidden_state = inputs['image_encoder_output']
+
+            extra_encoder_hidden_states = self.image_projection(image_encoder_last_hidden_state)
+            extra_attention_mask = torch.ones((latents.shape[0], extra_encoder_hidden_states.shape[1]), dtype=prompt_attention_mask_1.dtype, device=prompt_attention_mask_1.device)
+
+            # must cat before (not after) encoder_hidden_states, due to attn masking
+            prompt_embeds_1 = torch.cat([extra_encoder_hidden_states, prompt_embeds_1], dim=1)
+            prompt_attention_mask_1 = torch.cat([extra_attention_mask, prompt_attention_mask_1], dim=1)
 
         bs, channels, num_frames, h, w = latents.shape
 
