@@ -445,6 +445,10 @@ class HunyuanVideoPipeline(BasePipeline):
             state_dict = load_state_dict(self.args, self.args.model_base)
         params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
         base_dtype = self.model_config['dtype']
+
+        print("transformer.named_parameters()", str(list(transformer.named_parameters())))
+        print("state_dict.keys()", str(list(state_dict.keys())))
+
         for name, param in transformer.named_parameters():
             dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else transformer_dtype
             set_module_tensor_to_device(transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
@@ -487,62 +491,60 @@ class HunyuanVideoPipeline(BasePipeline):
             round_frames=4,
         )
 
+    # this function should be called dynamically and not preloaded
+    # to have greater variety on small datasets
+    def random_timecrop_framepack(self, latents):
+        total_frames = latents.shape[2]
+        ret = {}
+
+        assert (self.framepack_window_size + 3) % 4 == 0
+        num_frames_framepack = (self.framepack_window_size + 3) // 4
+
+        # fp_compression_hardcode = 1 + 2 + 16 = 19
+        assert total_frames > num_frames_framepack + 19 # with the compressible part
+        shift = np.random.randint(1, total_frames - num_frames_framepack)
+
+        # train on stage 1 (full last section ctx)
+        if shift > total_frames - num_frames_framepack - 19:
+            fragment = latents[:, :, -num_frames_framepack:, ...]
+            ret['latents'] = fragment
+        else:
+            # train on the stages with compression
+            fragment = latents[:, :, shift:shift+num_frames_framepack, ...]
+            first_frame = latents[:, :, 0:1, :, :]
+            the_rest = latents[:, :, shift+num_frames_framepack:, ...]
+            # The line above is from the sampler. Does it mean we are adding only 1+19 latent frames to compressed context instead of the whole video, or I'm missing something? --kabachuha
+            clean_latents_post, clean_latents_2x, clean_latents_4x = the_rest[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+            clean_latents = torch.cat([first_frame, clean_latents_post], dim=2)
+
+            ret['latents'] = fragment
+            ret['clean_latents'] = clean_latents
+            ret['clean_latents_2x'] = clean_latents_2x
+            ret['clean_latents_4x'] = clean_latents_4x
+
+            # getting the frame indices
+            indices = torch.arange(0, sum([1, shift, num_frames_framepack, 1, 2, 16])).unsqueeze(0)
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, shift, num_frames_framepack, 1, 2, 16], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+
+            ret['latent_indices'] = latent_indices
+            ret['clean_latent_indices'] = clean_latent_indices
+            ret['clean_latent_2x_indices'] = clean_latent_2x_indices
+            ret['clean_latent_4x_indices'] = clean_latent_4x_indices
+
+        return ret
+
     def get_call_vae_fn(self, vae_and_clip):
         def fn(tensor):
             ret = {}
 
             if self.framepack:
-
                 vae = vae_and_clip.vae
                 image_encoder = vae_and_clip.clip
 
                 image_encoder_output = hf_clip_vision_encode((tensor[:, :, 0, ...].clone().squeeze(0).permute(1, 2, 0).numpy()*255.).astype(np.uint8), self.siglip_feature_extractor, image_encoder)
                 ret['image_encoder_output'] = image_encoder_output.last_hidden_state.to(image_encoder.device, image_encoder.dtype)
-
-                # Subsample the window
-                latents = vae_encode(tensor.to(vae.device, vae.dtype), vae)
-                total_frames = latents.shape[2]
-
-                assert (self.framepack_window_size + 3) % 4 == 0
-                num_frames_framepack = (self.framepack_window_size + 3) // 4
-
-                # fp_compression_hardcode = 1 + 2 + 16 = 19
-                assert total_frames > num_frames_framepack + 19 # with the compressible part
-                shift = np.random.randint(1, total_frames - num_frames_framepack)
-
-                # train on stage 1 (full last section ctx)
-                if shift > total_frames - num_frames_framepack - 19:
-                    fragment = latents[:, :, -num_frames_framepack:, ...]
-                    ret['latents'] = fragment
-                else:
-                    # train on the stages with compression
-                    fragment = latents[:, :, shift:shift+num_frames_framepack, ...]
-                    first_frame = latents[:, :, 0:1, :, :]
-                    the_rest = latents[:, :, shift+num_frames_framepack:, ...]
-                    # The line above is from the sampler. Does it mean we are adding only 1+19 latent frames to compressed context instead of the whole video, or I'm missing something? --kabachuha
-                    clean_latents_post, clean_latents_2x, clean_latents_4x = the_rest[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-                    clean_latents = torch.cat([first_frame, clean_latents_post], dim=2)
-
-                    ret['latents'] = fragment
-                    ret['clean_latents'] = clean_latents
-                    ret['clean_latents_2x'] = clean_latents_2x
-                    ret['clean_latents_4x'] = clean_latents_4x
-
-                    # getting the frame indices
-                    indices = torch.arange(0, sum([1, shift, num_frames_framepack, 1, 2, 16])).unsqueeze(0)
-                    clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, shift, num_frames_framepack, 1, 2, 16], dim=1)
-                    clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
-
-                    ret['latent_indices'] = latent_indices
-                    ret['clean_latent_indices'] = clean_latent_indices
-                    ret['clean_latent_2x_indices'] = clean_latent_2x_indices
-                    ret['clean_latent_4x_indices'] = clean_latent_4x_indices
-
-                print('Framepack encoded:')
-                print(ret.keys())
-                print(f"shift={shift}, num_fr={num_frames_framepack}")
-                print("ret['latents'].shape", ret['latents'].shape)
-                raise 'debug'
+                ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
             else:
                 vae = vae_and_clip
                 ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
@@ -604,6 +606,7 @@ class HunyuanVideoPipeline(BasePipeline):
         mask = inputs['mask']
 
         if self.transformer.image_projection is not None:
+            raise 'Found!'
 
             image_encoder_last_hidden_state = inputs['image_encoder_output']
 
@@ -613,6 +616,8 @@ class HunyuanVideoPipeline(BasePipeline):
             # must cat before (not after) encoder_hidden_states, due to attn masking
             prompt_embeds_1 = torch.cat([extra_encoder_hidden_states, prompt_embeds_1], dim=1)
             prompt_attention_mask_1 = torch.cat([extra_attention_mask, prompt_attention_mask_1], dim=1)
+        else:
+            raise 'Not found!'
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -667,14 +672,17 @@ class HunyuanVideoPipeline(BasePipeline):
         freqs_sin = freqs_sin.expand(bs, -1, -1)
 
         if self.framepack and 'clean_latents' in inputs:
-            clean_latents = inputs['clean_latents'].float()
-            clean_latents_2x = inputs['clean_latents_2x'].float()
-            clean_latents_4x = inputs['clean_latents_4x'].float()
 
-            latent_indices = inputs['latent_indices']
-            clean_latent_indices = inputs['clean_latent_indices']
-            clean_latent_2x_indices = inputs['clean_latent_2x_indices']
-            clean_latent_4x_indices = inputs['clean_latent_4x_indices']
+            rtf = self.random_timecrop_framepack(latents)
+
+            clean_latents = rtf['clean_latents']
+            clean_latents_2x = rtf['clean_latents_2x']
+            clean_latents_4x = rtf['clean_latents_4x']
+
+            latent_indices = rtf['latent_indices']
+            clean_latent_indices = rtf['clean_latent_indices']
+            clean_latent_2x_indices = rtf['clean_latent_2x_indices']
+            clean_latent_4x_indices = rtf['clean_latent_4x_indices']
         else:
             # dummy clean latents for microbatch splitting
             clean_latents = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
