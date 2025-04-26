@@ -415,47 +415,9 @@ class HunyuanVideoPipeline(BasePipeline):
             siglip_path = config['model'].get('siglip_path', "lllyasviel/flux_redux_bfl")
             self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained(siglip_path, subfolder='feature_extractor')
             image_encoder = SiglipVisionModel.from_pretrained(siglip_path, subfolder='image_encoder', torch_dtype=dtype).eval()
-            self.load_encoders_from_diffusion_model()
 
             self.rope = HunyuanVideoRotaryPosEmbed(3, 256)
-
             self.vae_and_clip = VaeAndClip(vae, image_encoder).eval()
-
-        self.image_projection = None
-        self.clean_x_embedder = None
-
-    def load_encoders_from_diffusion_model(self):
-        inner_dim = 3072 # constant
-        transformer_dtype = self.model_config.get('transformer_dtype', self.model_config['dtype'])
-        factor_kwargs = {"device": 'cuda', "dtype": transformer_dtype}
-        in_channels = self.args.latent_channels
-        out_channels = self.args.latent_channels
-        with init_empty_weights():
-            transformer = load_model(
-                self.args,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                factor_kwargs=factor_kwargs,
-            )
-            transformer.image_projection = ClipVisionProjection(3, inner_dim)
-            transformer.clean_x_embedder = HunyuanVideoPatchEmbedForCleanLatents(inner_dim)
-        if transformer_path := self.model_config.get('transformer_path', None):
-            state_dict = load_safetensors(transformer_path)
-            state_dict = _convert_state_dict_keys(transformer.state_dict(), state_dict)
-        else:
-            state_dict = load_state_dict(self.args, self.args.model_base)
-        params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
-        base_dtype = self.model_config['dtype']
-        for name, param in transformer.named_parameters():
-            dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else transformer_dtype
-            set_module_tensor_to_device(transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
-
-        self.image_projection = transformer.image_projection.clone()
-        self.clean_x_embedder = transformer.clean_x_embedder.clone()
-
-        del transformer
-        gc.collect()
-        torch.cuda.empty_cache()
 
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
@@ -473,7 +435,6 @@ class HunyuanVideoPipeline(BasePipeline):
                 factor_kwargs=factor_kwargs,
             )
             if self.framepack:
-                # to not have orphan weight when loading sd, maybe not nessesary
                 inner_dim = 3072 # constant
                 transformer.image_projection = ClipVisionProjection(3, inner_dim)
                 transformer.clean_x_embedder = HunyuanVideoPatchEmbedForCleanLatents(inner_dim)
@@ -633,11 +594,11 @@ class HunyuanVideoPipeline(BasePipeline):
         prompt_embeds_2 = inputs['prompt_embeds_2']
         mask = inputs['mask']
 
-        if self.image_projection is not None:
+        if self.transformer.image_projection is not None:
 
             image_encoder_last_hidden_state = inputs['image_encoder_output']
 
-            extra_encoder_hidden_states = self.image_projection(image_encoder_last_hidden_state)
+            extra_encoder_hidden_states = self.transformer.image_projection(image_encoder_last_hidden_state)
             extra_attention_mask = torch.ones((latents.shape[0], extra_encoder_hidden_states.shape[1]), dtype=prompt_attention_mask_1.dtype, device=prompt_attention_mask_1.device)
 
             # must cat before (not after) encoder_hidden_states, due to attn masking
