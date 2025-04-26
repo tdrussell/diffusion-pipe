@@ -95,6 +95,59 @@ def get_rotary_pos_embed(transformer, video_length, height, width):
     )
     return freqs_cos, freqs_sin
 
+class HunyuanVideoRotaryPosEmbed(nn.Module):
+    def __init__(self, rope_dim, theta):
+        super().__init__()
+        self.DT, self.DY, self.DX = rope_dim
+        self.theta = theta
+
+    @torch.no_grad()
+    def get_frequency(self, dim, pos):
+        T, H, W = pos.shape
+        freqs = 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device)[: (dim // 2)] / dim))
+        freqs = torch.outer(freqs, pos.reshape(-1)).unflatten(-1, (T, H, W)).repeat_interleave(2, dim=0)
+        return freqs.cos(), freqs.sin()
+
+    @torch.no_grad()
+    def forward_inner(self, frame_indices, height, width, device):
+        GT, GY, GX = torch.meshgrid(
+            frame_indices.to(device=device, dtype=torch.float32),
+            torch.arange(0, height, device=device, dtype=torch.float32),
+            torch.arange(0, width, device=device, dtype=torch.float32),
+            indexing="ij"
+        )
+
+        FCT, FST = self.get_frequency(self.DT, GT)
+        FCY, FSY = self.get_frequency(self.DY, GY)
+        FCX, FSX = self.get_frequency(self.DX, GX)
+
+        result = torch.cat([FCT, FCY, FCX, FST, FSY, FSX], dim=0)
+
+        return result.to(device)
+
+    @torch.no_grad()
+    def forward(self, frame_indices, height, width, device):
+        frame_indices = frame_indices.unbind(0)
+        results = [self.forward_inner(f, height, width, device) for f in frame_indices]
+        results = torch.stack(results, dim=0)
+        return results
+
+def pad_for_3d_conv(x, kernel_size):
+    b, c, t, h, w = x.shape
+    pt, ph, pw = kernel_size
+    pad_t = (pt - (t % pt)) % pt
+    pad_h = (ph - (h % ph)) % ph
+    pad_w = (pw - (w % pw)) % pw
+    return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h, 0, pad_t), mode='replicate')
+
+
+def center_down_sample_3d(x, kernel_size):
+    # pt, ph, pw = kernel_size
+    # cp = (pt * ph * pw) // 2
+    # xp = einops.rearrange(x, 'b c (t pt) (h ph) (w pw) -> (pt ph pw) b c t h w', pt=pt, ph=ph, pw=pw)
+    # xc = xp[cp]
+    # return xc
+    return torch.nn.functional.avg_pool3d(x, kernel_size, stride=kernel_size)
 
 def load_state_dict(args, pretrained_model_path):
     load_key = args.load_key
@@ -348,12 +401,15 @@ class HunyuanVideoPipeline(BasePipeline):
             args=args,
         )
 
-        self.framepack = config['model']['framepack']
+        self.framepack = config['model'].get('framepack', False)
+        self.framepack_window_size = config['model'].get('framepack_window_size', 30)
 
         if self.framepack:
             self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
             self.image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16)
             self.load_encoders_from_diffusion_model()
+
+            self.rope = HunyuanVideoRotaryPosEmbed(3, 256)
 
         self.image_projection = None
         self.clean_x_embedder = None
@@ -458,11 +514,41 @@ class HunyuanVideoPipeline(BasePipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(tensor):
-            ret =  {'latents': vae_encode(tensor.to(vae.device, vae.dtype), vae)}
+            ret = {}
 
             if self.framepack:
+
                 image_encoder_output = hf_clip_vision_encode(tensor[:, :, 0:1, ...].clone(), self.siglip_feature_extractor, self.image_encoder)
-                ret['image_encoder_output'] = image_encoder_output.last_hidden_state
+                ret['image_encoder_output'] = image_encoder_output.last_hidden_state.to(self.image_encoder.device, self.image_encoder.dtype)
+
+                # Subsample the window
+                latents = vae_encode(tensor.to(vae.device, vae.dtype), vae)
+                total_frames = latents.shape[2]
+                num_frames_framepack = self.framepack_window_size
+                shift = np.random.randint(1, total_frames - num_frames_framepack - 1 - 19)
+                fragment = latents[:, :, shift:shift+num_frames_framepack, ...]
+                first_frame = latents[:, :, 0:1, :, :].unsqueeze(2)
+                the_rest = latents[:, :, shift+num_frames_framepack:, ...]
+                # The line above is from the sampler. Does it mean we are adding only 1+19 frames to compressed context instead of the whole video, or I'm missing something? --kabachuha
+                clean_latents_post, clean_latents_2x, clean_latents_4x = the_rest[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+                clean_latents = torch.cat([first_frame, clean_latents_post], dim=2)
+
+                ret['latents'] = fragment
+                ret['clean_latents'] = clean_latents
+                ret['clean_latents_2x'] = clean_latents_2x
+                ret['clean_latents_4x'] = clean_latents_4x
+
+                # getting the frame indices
+                indices = torch.arange(0, sum([1, shift, num_frames_framepack, 1, 2, 16])).unsqueeze(0)
+                clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, shift, num_frames_framepack, 1, 2, 16], dim=1)
+                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+
+                ret['latent_indices'] = latent_indices
+                ret['clean_latent_indices'] = clean_latent_indices
+                ret['clean_latent_2x_indices'] = clean_latent_2x_indices
+                ret['clean_latent_4x_indices'] = clean_latent_4x_indices
+            else:
+                ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
             return ret
         return fn
 
@@ -571,6 +657,9 @@ class HunyuanVideoPipeline(BasePipeline):
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
         target = x_0 - x_1
 
+        # timestep input to model needs to be in range [0, 1000]
+        t = t * 1000
+
         video_length = (num_frames - 1) * 4 + 1
         video_height = h * 8
         video_width = w * 8
@@ -580,8 +669,25 @@ class HunyuanVideoPipeline(BasePipeline):
         freqs_cos = freqs_cos.expand(bs, -1, -1)
         freqs_sin = freqs_sin.expand(bs, -1, -1)
 
-        # timestep input to model needs to be in range [0, 1000]
-        t = t * 1000
+        if self.framepack:
+            clean_latents = inputs['clean_latents'].float()
+            clean_latents_2x = inputs['clean_latents_2x'].float()
+            clean_latents_4x = inputs['clean_latents_4x'].float()
+
+            latent_indices = inputs['latent_indices']
+            clean_latent_indices = inputs['clean_latent_indices']
+            clean_latent_2x_indices = inputs['clean_latent_2x_indices']
+            clean_latent_4x_indices = inputs['clean_latent_4x_indices']
+        else:
+            # dummy clean latents for microbatch splitting
+            clean_latents = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
+            clean_latents_2x = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
+            clean_latents_4x = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
+
+            latent_indices = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
+            clean_latent_indices = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
+            clean_latent_2x_indices = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
+            clean_latent_4x_indices = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
 
         return (
             x_t,
@@ -592,6 +698,13 @@ class HunyuanVideoPipeline(BasePipeline):
             freqs_cos,
             freqs_sin,
             guidance_expand,
+            clean_latents,
+            clean_latents_2x,
+            clean_latents_4x,
+            latent_indices,
+            clean_latent_indices,
+            clean_latent_2x_indices,
+            clean_latent_4x_indices
         ), (target, mask)
 
     def to_layers(self):
@@ -675,7 +788,7 @@ class InitialLayer(nn.Module):
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
 
-        x, t, text_states, text_mask, text_states_2, freqs_cos, freqs_sin, guidance = inputs
+        x, t, text_states, text_mask, text_states_2, freqs_cos, freqs_sin, guidance, clean_latents, clean_latents_2x, clean_latents_4x, latent_indices, clean_latent_indices, clean_latent_2x_indices, clean_latent_4x_indices = inputs
 
         _, _, ot, oh, ow = x.shape
         tt, th, tw = (
@@ -709,7 +822,61 @@ class InitialLayer(nn.Module):
             vec = vec + self.guidance_in(guidance)
 
         # Embed image and text.
-        img = self.img_in(img)
+        hidden_states = self.img_in(img)
+
+        # Framepack handling of latents
+        if self.framepack:
+            B, C, T, H, W = hidden_states.shape
+
+            if latent_indices is None:
+                latent_indices = torch.arange(0, T).unsqueeze(0).expand(B, -1)
+
+            hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+            rope_freqs = self.rope(frame_indices=latent_indices, height=H, width=W, device=hidden_states.device)
+            rope_freqs = rope_freqs.flatten(2).transpose(1, 2)
+
+            if clean_latents is not None and clean_latent_indices is not None:
+                clean_latents = clean_latents.to(hidden_states)
+                clean_latents = self.clean_x_embedder.proj(clean_latents)
+                clean_latents = clean_latents.flatten(2).transpose(1, 2)
+
+                clean_latent_rope_freqs = self.rope(frame_indices=clean_latent_indices, height=H, width=W, device=clean_latents.device)
+                clean_latent_rope_freqs = clean_latent_rope_freqs.flatten(2).transpose(1, 2)
+
+                hidden_states = torch.cat([clean_latents, hidden_states], dim=1)
+                rope_freqs = torch.cat([clean_latent_rope_freqs, rope_freqs], dim=1)
+
+            if clean_latents_2x is not None and clean_latent_2x_indices is not None:
+                clean_latents_2x = clean_latents_2x.to(hidden_states)
+                clean_latents_2x = pad_for_3d_conv(clean_latents_2x, (2, 4, 4))
+                clean_latents_2x = self.clean_x_embedder.proj_2x(clean_latents_2x)
+                clean_latents_2x = clean_latents_2x.flatten(2).transpose(1, 2)
+
+                clean_latent_2x_rope_freqs = self.rope(frame_indices=clean_latent_2x_indices, height=H, width=W, device=clean_latents_2x.device)
+                clean_latent_2x_rope_freqs = pad_for_3d_conv(clean_latent_2x_rope_freqs, (2, 2, 2))
+                clean_latent_2x_rope_freqs = center_down_sample_3d(clean_latent_2x_rope_freqs, (2, 2, 2))
+                clean_latent_2x_rope_freqs = clean_latent_2x_rope_freqs.flatten(2).transpose(1, 2)
+
+                hidden_states = torch.cat([clean_latents_2x, hidden_states], dim=1)
+                rope_freqs = torch.cat([clean_latent_2x_rope_freqs, rope_freqs], dim=1)
+
+            if clean_latents_4x is not None and clean_latent_4x_indices is not None:
+                clean_latents_4x = clean_latents_4x.to(hidden_states)
+                clean_latents_4x = pad_for_3d_conv(clean_latents_4x, (4, 8, 8))
+                clean_latents_4x = self.clean_x_embedder.proj_4x(clean_latents_4x)
+                clean_latents_4x = clean_latents_4x.flatten(2).transpose(1, 2)
+
+                clean_latent_4x_rope_freqs = self.rope(frame_indices=clean_latent_4x_indices, height=H, width=W, device=clean_latents_4x.device)
+                clean_latent_4x_rope_freqs = pad_for_3d_conv(clean_latent_4x_rope_freqs, (4, 4, 4))
+                clean_latent_4x_rope_freqs = center_down_sample_3d(clean_latent_4x_rope_freqs, (4, 4, 4))
+                clean_latent_4x_rope_freqs = clean_latent_4x_rope_freqs.flatten(2).transpose(1, 2)
+
+                hidden_states = torch.cat([clean_latents_4x, hidden_states], dim=1)
+                rope_freqs = torch.cat([clean_latent_4x_rope_freqs, rope_freqs], dim=1)
+
+        img = hidden_states
+
         if self.text_projection == "linear":
             txt = self.txt_in(txt)
         elif self.text_projection == "single_refiner":
