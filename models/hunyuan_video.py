@@ -298,7 +298,7 @@ class HunyuanVideoPatchEmbedForCleanLatents(nn.Module):
 
 class HunyuanVideoPipeline(BasePipeline):
     name = 'hunyuan-video'
-    framerate = 24
+    framerate = 30
     checkpointable_layers = ['DoubleBlock', 'SingleBlock']
     adapter_target_modules = ['MMDoubleStreamBlock', 'MMSingleStreamBlock']
 
@@ -416,7 +416,7 @@ class HunyuanVideoPipeline(BasePipeline):
             self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained(siglip_path, subfolder='feature_extractor')
             image_encoder = SiglipVisionModel.from_pretrained(siglip_path, subfolder='image_encoder', torch_dtype=dtype).eval()
 
-            self.rope = HunyuanVideoRotaryPosEmbed(3, 256)
+            self.rope = HunyuanVideoRotaryPosEmbed((16, 56, 56), 256.0)
             self.vae_and_clip = VaeAndClip(vae, image_encoder).eval()
 
     # delay loading transformer to save RAM
@@ -496,13 +496,16 @@ class HunyuanVideoPipeline(BasePipeline):
                 vae = vae_and_clip.vae
                 image_encoder = vae_and_clip.clip
 
-                image_encoder_output = hf_clip_vision_encode(tensor[:, :, 0:1, ...].clone(), self.siglip_feature_extractor, image_encoder)
+                image_encoder_output = hf_clip_vision_encode((tensor[:, :, 0, ...].clone().squeeze(0).permute(1, 2, 0).numpy()*255.).astype(np.uint8), self.siglip_feature_extractor, image_encoder)
                 ret['image_encoder_output'] = image_encoder_output.last_hidden_state.to(image_encoder.device, image_encoder.dtype)
 
                 # Subsample the window
                 latents = vae_encode(tensor.to(vae.device, vae.dtype), vae)
                 total_frames = latents.shape[2]
-                num_frames_framepack = self.framepack_window_size
+
+                assert (self.framepack_window_size + 3) % 4 == 0
+                num_frames_framepack = (self.framepack_window_size + 3) // 4
+
                 # fp_compression_hardcode = 1 + 2 + 16 = 19
                 assert total_frames > num_frames_framepack + 19 # with the compressible part
                 shift = np.random.randint(1, total_frames - num_frames_framepack)
@@ -514,9 +517,9 @@ class HunyuanVideoPipeline(BasePipeline):
                 else:
                     # train on the stages with compression
                     fragment = latents[:, :, shift:shift+num_frames_framepack, ...]
-                    first_frame = latents[:, :, 0:1, :, :].unsqueeze(2)
+                    first_frame = latents[:, :, 0:1, :, :]
                     the_rest = latents[:, :, shift+num_frames_framepack:, ...]
-                    # The line above is from the sampler. Does it mean we are adding only 1+19 frames to compressed context instead of the whole video, or I'm missing something? --kabachuha
+                    # The line above is from the sampler. Does it mean we are adding only 1+19 latent frames to compressed context instead of the whole video, or I'm missing something? --kabachuha
                     clean_latents_post, clean_latents_2x, clean_latents_4x = the_rest[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
                     clean_latents = torch.cat([first_frame, clean_latents_post], dim=2)
 
@@ -534,6 +537,12 @@ class HunyuanVideoPipeline(BasePipeline):
                     ret['clean_latent_indices'] = clean_latent_indices
                     ret['clean_latent_2x_indices'] = clean_latent_2x_indices
                     ret['clean_latent_4x_indices'] = clean_latent_4x_indices
+
+                print('Framepack encoded:')
+                print(ret.keys())
+                print(f"shift={shift}, num_fr={num_frames_framepack}")
+                print("ret['latents'].shape", ret['latents'].shape)
+                raise 'debug'
             else:
                 vae = vae_and_clip
                 ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
