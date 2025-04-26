@@ -36,7 +36,6 @@ import gc
 # In diffusion-pipe, we already converted the dtype to an object. But Hunyuan scripts want the string version in a lot of places.
 TYPE_TO_PRECISION = {v: k for k, v in PRECISION_TO_TYPE.items()}
 
-# TODO: replace with comfy-compatible!
 def hf_clip_vision_encode(image, feature_extractor, image_encoder):
     assert isinstance(image, np.ndarray)
     assert image.ndim == 3 and image.shape[2] == 3
@@ -121,9 +120,10 @@ class HunyuanVideoRotaryPosEmbed(nn.Module):
         FCY, FSY = self.get_frequency(self.DY, GY)
         FCX, FSX = self.get_frequency(self.DX, GX)
 
-        result = torch.cat([FCT, FCY, FCX, FST, FSY, FSX], dim=0)
+        result_cos = torch.cat([FCT, FCY, FCX], dim=0)
+        result_sin = torch.cat([FST, FSY, FSX], dim=0)
 
-        return result.to(device)
+        return result_cos.to(device), result_sin.to(device)
 
     @torch.no_grad()
     def forward(self, frame_indices, height, width, device):
@@ -131,6 +131,12 @@ class HunyuanVideoRotaryPosEmbed(nn.Module):
         results = [self.forward_inner(f, height, width, device) for f in frame_indices]
         results = torch.stack(results, dim=0)
         return results
+
+class VaeAndClip(nn.Module):
+    def __init__(self, vae, clip):
+        super().__init__()
+        self.vae = vae
+        self.clip = clip
 
 def pad_for_3d_conv(x, kernel_size):
     b, c, t, h, w = x.shape
@@ -405,18 +411,23 @@ class HunyuanVideoPipeline(BasePipeline):
         self.framepack_window_size = config['model'].get('framepack_window_size', 30)
 
         if self.framepack:
-            self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='feature_extractor')
-            self.image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder='image_encoder', torch_dtype=torch.float16)
+            print("Loading framepack specific modules")
+            siglip_path = config['model'].get('siglip_path', "lllyasviel/flux_redux_bfl")
+            self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained(siglip_path, subfolder='feature_extractor')
+            image_encoder = SiglipVisionModel.from_pretrained(siglip_path, subfolder='image_encoder', torch_dtype=dtype).eval()
             self.load_encoders_from_diffusion_model()
 
             self.rope = HunyuanVideoRotaryPosEmbed(3, 256)
+
+            self.vae_and_clip = VaeAndClip(vae, image_encoder).eval()
 
         self.image_projection = None
         self.clean_x_embedder = None
 
     def load_encoders_from_diffusion_model(self):
-        inner_dim = self.model_config['num_attention_heads'] * self.model_config['attention_head_dim']
-        factor_kwargs = self.model_config.get('transformer_dtype', self.model_config['dtype'])
+        inner_dim = 3072 # constant
+        transformer_dtype = self.model_config.get('transformer_dtype', self.model_config['dtype'])
+        factor_kwargs = {"device": 'cuda', "dtype": transformer_dtype}
         in_channels = self.args.latent_channels
         out_channels = self.args.latent_channels
         with init_empty_weights():
@@ -463,7 +474,7 @@ class HunyuanVideoPipeline(BasePipeline):
             )
             if self.framepack:
                 # to not have orphan weight when loading sd, maybe not nessesary
-                inner_dim = self.model_config['num_attention_heads'] * self.model_config['attention_head_dim']
+                inner_dim = 3072 # constant
                 transformer.image_projection = ClipVisionProjection(3, inner_dim)
                 transformer.clean_x_embedder = HunyuanVideoPatchEmbedForCleanLatents(inner_dim)
         if transformer_path := self.model_config.get('transformer_path', None):
@@ -485,7 +496,10 @@ class HunyuanVideoPipeline(BasePipeline):
             p.original_name = name
 
     def __getattr__(self, name):
-        return getattr(self.diffusers_pipeline, name)
+        if name == "vae" and self.framepack:
+            return self.vae_and_clip
+        else:
+            return getattr(self.diffusers_pipeline, name)
 
     def get_vae(self):
         return self.vae
@@ -512,19 +526,24 @@ class HunyuanVideoPipeline(BasePipeline):
             round_frames=4,
         )
 
-    def get_call_vae_fn(self, vae):
+    def get_call_vae_fn(self, vae_and_clip):
         def fn(tensor):
             ret = {}
 
             if self.framepack:
 
-                image_encoder_output = hf_clip_vision_encode(tensor[:, :, 0:1, ...].clone(), self.siglip_feature_extractor, self.image_encoder)
-                ret['image_encoder_output'] = image_encoder_output.last_hidden_state.to(self.image_encoder.device, self.image_encoder.dtype)
+                vae = vae_and_clip.vae
+                image_encoder = vae_and_clip.clip
+
+                image_encoder_output = hf_clip_vision_encode(tensor[:, :, 0:1, ...].clone(), self.siglip_feature_extractor, image_encoder)
+                ret['image_encoder_output'] = image_encoder_output.last_hidden_state.to(image_encoder.device, image_encoder.dtype)
 
                 # Subsample the window
                 latents = vae_encode(tensor.to(vae.device, vae.dtype), vae)
                 total_frames = latents.shape[2]
                 num_frames_framepack = self.framepack_window_size
+                # fp_compression_hardcode = 1 + 2 + 16 = 19
+                assert total_frames > num_frames_framepack + 19 # with the compressible part
                 shift = np.random.randint(1, total_frames - num_frames_framepack - 1 - 19)
                 fragment = latents[:, :, shift:shift+num_frames_framepack, ...]
                 first_frame = latents[:, :, 0:1, :, :].unsqueeze(2)
@@ -548,6 +567,7 @@ class HunyuanVideoPipeline(BasePipeline):
                 ret['clean_latent_2x_indices'] = clean_latent_2x_indices
                 ret['clean_latent_4x_indices'] = clean_latent_4x_indices
             else:
+                vae = vae_and_clip
                 ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
             return ret
         return fn
@@ -833,19 +853,23 @@ class InitialLayer(nn.Module):
 
             hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-            rope_freqs = self.rope(frame_indices=latent_indices, height=H, width=W, device=hidden_states.device)
-            rope_freqs = rope_freqs.flatten(2).transpose(1, 2)
+            # NOTE: we have cos and sin separately because we're working with the original HY code
+            rope_freqs_cos, rope_freqs_sin = self.rope(frame_indices=latent_indices, height=H, width=W, device=hidden_states.device)
+            rope_freqs_cos = rope_freqs_cos.flatten(2).transpose(1, 2)
+            rope_freqs_sin = rope_freqs_sin.flatten(2).transpose(1, 2)
 
             if clean_latents is not None and clean_latent_indices is not None:
                 clean_latents = clean_latents.to(hidden_states)
                 clean_latents = self.clean_x_embedder.proj(clean_latents)
                 clean_latents = clean_latents.flatten(2).transpose(1, 2)
 
-                clean_latent_rope_freqs = self.rope(frame_indices=clean_latent_indices, height=H, width=W, device=clean_latents.device)
-                clean_latent_rope_freqs = clean_latent_rope_freqs.flatten(2).transpose(1, 2)
+                clean_latent_rope_freqs_cos, clean_latent_rope_freqs_sin = self.rope(frame_indices=clean_latent_indices, height=H, width=W, device=clean_latents.device)
+                clean_latent_rope_freqs_cos = clean_latent_rope_freqs_cos.flatten(2).transpose(1, 2)
+                clean_latent_rope_freqs_sin = clean_latent_rope_freqs_sin.flatten(2).transpose(1, 2)
 
                 hidden_states = torch.cat([clean_latents, hidden_states], dim=1)
-                rope_freqs = torch.cat([clean_latent_rope_freqs, rope_freqs], dim=1)
+                rope_freqs_cos = torch.cat([clean_latent_rope_freqs_cos, rope_freqs_cos], dim=1)
+                rope_freqs_sin = torch.cat([clean_latent_rope_freqs_sin, rope_freqs_sin], dim=1)
 
             if clean_latents_2x is not None and clean_latent_2x_indices is not None:
                 clean_latents_2x = clean_latents_2x.to(hidden_states)
@@ -853,13 +877,17 @@ class InitialLayer(nn.Module):
                 clean_latents_2x = self.clean_x_embedder.proj_2x(clean_latents_2x)
                 clean_latents_2x = clean_latents_2x.flatten(2).transpose(1, 2)
 
-                clean_latent_2x_rope_freqs = self.rope(frame_indices=clean_latent_2x_indices, height=H, width=W, device=clean_latents_2x.device)
-                clean_latent_2x_rope_freqs = pad_for_3d_conv(clean_latent_2x_rope_freqs, (2, 2, 2))
-                clean_latent_2x_rope_freqs = center_down_sample_3d(clean_latent_2x_rope_freqs, (2, 2, 2))
-                clean_latent_2x_rope_freqs = clean_latent_2x_rope_freqs.flatten(2).transpose(1, 2)
+                clean_latent_2x_rope_freqs_cos, clean_latent_2x_rope_freqs_sin = self.rope(frame_indices=clean_latent_2x_indices, height=H, width=W, device=clean_latents_2x.device)
+                clean_latent_2x_rope_freqs_cos = pad_for_3d_conv(clean_latent_2x_rope_freqs_cos, (2, 2, 2))
+                clean_latent_2x_rope_freqs_cos = center_down_sample_3d(clean_latent_2x_rope_freqs_cos, (2, 2, 2))
+                clean_latent_2x_rope_freqs_cos = clean_latent_2x_rope_freqs_cos.flatten(2).transpose(1, 2)
+                clean_latent_2x_rope_freqs_sin = pad_for_3d_conv(clean_latent_2x_rope_freqs_sin, (2, 2, 2))
+                clean_latent_2x_rope_freqs_sin = center_down_sample_3d(clean_latent_2x_rope_freqs_sin, (2, 2, 2))
+                clean_latent_2x_rope_freqs_sin = clean_latent_2x_rope_freqs_sin.flatten(2).transpose(1, 2)
 
                 hidden_states = torch.cat([clean_latents_2x, hidden_states], dim=1)
-                rope_freqs = torch.cat([clean_latent_2x_rope_freqs, rope_freqs], dim=1)
+                rope_freqs_cos = torch.cat([clean_latent_2x_rope_freqs_cos, rope_freqs_cos], dim=1)
+                rope_freqs_sin = torch.cat([clean_latent_2x_rope_freqs_sin, rope_freqs_sin], dim=1)
 
             if clean_latents_4x is not None and clean_latent_4x_indices is not None:
                 clean_latents_4x = clean_latents_4x.to(hidden_states)
