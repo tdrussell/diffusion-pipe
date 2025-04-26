@@ -810,17 +810,13 @@ class InitialLayer(nn.Module):
 
         x, t, text_states, text_mask, text_states_2, freqs_cos, freqs_sin, guidance, clean_latents, clean_latents_2x, clean_latents_4x, latent_indices, clean_latent_indices, clean_latent_2x_indices, clean_latent_4x_indices = inputs
 
-        _, _, ot, oh, ow = x.shape
+        B, _, T, H, W = x.shape
         tt, th, tw = (
-            ot // self.transformer[0].patch_size[0],
-            oh // self.transformer[0].patch_size[1],
-            ow // self.transformer[0].patch_size[2],
+            T // self.transformer[0].patch_size[0],
+            H // self.transformer[0].patch_size[1],
+            W // self.transformer[0].patch_size[2],
         )
         unpatchify_args = torch.tensor([tt, th, tw], device=x.device)
-
-        # diffusion-pipe makes all input tensors have a batch dimension, but Hunyuan code wants these to not have batch dim
-        assert freqs_cos.ndim == 3
-        freqs_cos, freqs_sin = freqs_cos[0], freqs_sin[0]
 
         img = x
         txt = text_states
@@ -846,17 +842,14 @@ class InitialLayer(nn.Module):
 
         # Framepack handling of latents
         if self.framepack:
-            B, C, T, H, W = hidden_states.shape
 
             if latent_indices is None:
                 latent_indices = torch.arange(0, T).unsqueeze(0).expand(B, -1)
 
-            hidden_states = hidden_states.flatten(2).transpose(1, 2)
-
             # NOTE: we have cos and sin separately because we're working with the original HY code
-            rope_freqs_cos, rope_freqs_sin = self.rope(frame_indices=latent_indices, height=H, width=W, device=hidden_states.device)
-            rope_freqs_cos = rope_freqs_cos.flatten(2).transpose(1, 2)
-            rope_freqs_sin = rope_freqs_sin.flatten(2).transpose(1, 2)
+            freqs_cos, freqs_sin = self.rope(frame_indices=latent_indices, height=H, width=W, device=hidden_states.device)
+            freqs_cos = freqs_cos.flatten(2).transpose(1, 2)
+            freqs_sin = freqs_sin.flatten(2).transpose(1, 2)
 
             if clean_latents is not None and clean_latent_indices is not None:
                 clean_latents = clean_latents.to(hidden_states)
@@ -868,8 +861,8 @@ class InitialLayer(nn.Module):
                 clean_latent_rope_freqs_sin = clean_latent_rope_freqs_sin.flatten(2).transpose(1, 2)
 
                 hidden_states = torch.cat([clean_latents, hidden_states], dim=1)
-                rope_freqs_cos = torch.cat([clean_latent_rope_freqs_cos, rope_freqs_cos], dim=1)
-                rope_freqs_sin = torch.cat([clean_latent_rope_freqs_sin, rope_freqs_sin], dim=1)
+                freqs_cos = torch.cat([clean_latent_rope_freqs_cos, freqs_cos], dim=1)
+                freqs_sin = torch.cat([clean_latent_rope_freqs_sin, freqs_sin], dim=1)
 
             if clean_latents_2x is not None and clean_latent_2x_indices is not None:
                 clean_latents_2x = clean_latents_2x.to(hidden_states)
@@ -886,8 +879,8 @@ class InitialLayer(nn.Module):
                 clean_latent_2x_rope_freqs_sin = clean_latent_2x_rope_freqs_sin.flatten(2).transpose(1, 2)
 
                 hidden_states = torch.cat([clean_latents_2x, hidden_states], dim=1)
-                rope_freqs_cos = torch.cat([clean_latent_2x_rope_freqs_cos, rope_freqs_cos], dim=1)
-                rope_freqs_sin = torch.cat([clean_latent_2x_rope_freqs_sin, rope_freqs_sin], dim=1)
+                freqs_cos = torch.cat([clean_latent_2x_rope_freqs_cos, freqs_cos], dim=1)
+                freqs_sin = torch.cat([clean_latent_2x_rope_freqs_sin, freqs_sin], dim=1)
 
             if clean_latents_4x is not None and clean_latent_4x_indices is not None:
                 clean_latents_4x = clean_latents_4x.to(hidden_states)
@@ -895,13 +888,21 @@ class InitialLayer(nn.Module):
                 clean_latents_4x = self.clean_x_embedder.proj_4x(clean_latents_4x)
                 clean_latents_4x = clean_latents_4x.flatten(2).transpose(1, 2)
 
-                clean_latent_4x_rope_freqs = self.rope(frame_indices=clean_latent_4x_indices, height=H, width=W, device=clean_latents_4x.device)
-                clean_latent_4x_rope_freqs = pad_for_3d_conv(clean_latent_4x_rope_freqs, (4, 4, 4))
-                clean_latent_4x_rope_freqs = center_down_sample_3d(clean_latent_4x_rope_freqs, (4, 4, 4))
-                clean_latent_4x_rope_freqs = clean_latent_4x_rope_freqs.flatten(2).transpose(1, 2)
+                clean_latent_4x_rope_freqs_cos, clean_latent_4x_rope_freqs_sin = self.rope(frame_indices=clean_latent_4x_indices, height=H, width=W, device=clean_latents_4x.device)
+                clean_latent_4x_rope_freqs_cos = pad_for_3d_conv(clean_latent_4x_rope_freqs_cos, (4, 4, 4))
+                clean_latent_4x_rope_freqs_cos = center_down_sample_3d(clean_latent_4x_rope_freqs_cos, (4, 4, 4))
+                clean_latent_4x_rope_freqs_cos = clean_latent_4x_rope_freqs_cos.flatten(2).transpose(1, 2)
+                clean_latent_4x_rope_freqs_sin = pad_for_3d_conv(clean_latent_4x_rope_freqs_sin, (4, 4, 4))
+                clean_latent_4x_rope_freqs_sin = center_down_sample_3d(clean_latent_4x_rope_freqs_sin, (4, 4, 4))
+                clean_latent_4x_rope_freqs_sin = clean_latent_4x_rope_freqs_sin.flatten(2).transpose(1, 2)
 
                 hidden_states = torch.cat([clean_latents_4x, hidden_states], dim=1)
-                rope_freqs = torch.cat([clean_latent_4x_rope_freqs, rope_freqs], dim=1)
+                freqs_cos = torch.cat([clean_latent_4x_rope_freqs_cos, freqs_cos], dim=1)
+                freqs_sin = torch.cat([clean_latent_4x_rope_freqs_sin, freqs_sin], dim=1)
+
+        # diffusion-pipe makes all input tensors have a batch dimension, but Hunyuan code wants these to not have batch dim
+        assert freqs_cos.ndim == 3
+        freqs_cos, freqs_sin = freqs_cos[0], freqs_sin[0]
 
         img = hidden_states
 
@@ -982,8 +983,11 @@ class OutputLayer(nn.Module):
         x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args = inputs
         img = x[:, :img_seq_len.item(), ...]
 
+        tt, th, tw = (arg.item() for arg in unpatchify_args)
+        # trimming if framepack
+        img = img[:, -tt*th*tw:, :]
+
         # ---------------------------- Final layer ------------------------------
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
 
-        tt, th, tw = (arg.item() for arg in unpatchify_args)
         return self.transformer[0].unpatchify(img, tt, th, tw)
