@@ -544,28 +544,35 @@ class HunyuanVideoPipeline(BasePipeline):
                 num_frames_framepack = self.framepack_window_size
                 # fp_compression_hardcode = 1 + 2 + 16 = 19
                 assert total_frames > num_frames_framepack + 19 # with the compressible part
-                shift = np.random.randint(1, total_frames - num_frames_framepack - 1 - 19)
-                fragment = latents[:, :, shift:shift+num_frames_framepack, ...]
-                first_frame = latents[:, :, 0:1, :, :].unsqueeze(2)
-                the_rest = latents[:, :, shift+num_frames_framepack:, ...]
-                # The line above is from the sampler. Does it mean we are adding only 1+19 frames to compressed context instead of the whole video, or I'm missing something? --kabachuha
-                clean_latents_post, clean_latents_2x, clean_latents_4x = the_rest[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-                clean_latents = torch.cat([first_frame, clean_latents_post], dim=2)
+                shift = np.random.randint(1, total_frames - num_frames_framepack)
 
-                ret['latents'] = fragment
-                ret['clean_latents'] = clean_latents
-                ret['clean_latents_2x'] = clean_latents_2x
-                ret['clean_latents_4x'] = clean_latents_4x
+                # train on stage 1 (full last section ctx)
+                if shift > total_frames - num_frames_framepack - 19:
+                    fragment = latents[:, :, -num_frames_framepack:, ...]
+                    ret['latents'] = fragment
+                else:
+                    # train on the stages with compression
+                    fragment = latents[:, :, shift:shift+num_frames_framepack, ...]
+                    first_frame = latents[:, :, 0:1, :, :].unsqueeze(2)
+                    the_rest = latents[:, :, shift+num_frames_framepack:, ...]
+                    # The line above is from the sampler. Does it mean we are adding only 1+19 frames to compressed context instead of the whole video, or I'm missing something? --kabachuha
+                    clean_latents_post, clean_latents_2x, clean_latents_4x = the_rest[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
+                    clean_latents = torch.cat([first_frame, clean_latents_post], dim=2)
 
-                # getting the frame indices
-                indices = torch.arange(0, sum([1, shift, num_frames_framepack, 1, 2, 16])).unsqueeze(0)
-                clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, shift, num_frames_framepack, 1, 2, 16], dim=1)
-                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+                    ret['latents'] = fragment
+                    ret['clean_latents'] = clean_latents
+                    ret['clean_latents_2x'] = clean_latents_2x
+                    ret['clean_latents_4x'] = clean_latents_4x
 
-                ret['latent_indices'] = latent_indices
-                ret['clean_latent_indices'] = clean_latent_indices
-                ret['clean_latent_2x_indices'] = clean_latent_2x_indices
-                ret['clean_latent_4x_indices'] = clean_latent_4x_indices
+                    # getting the frame indices
+                    indices = torch.arange(0, sum([1, shift, num_frames_framepack, 1, 2, 16])).unsqueeze(0)
+                    clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, shift, num_frames_framepack, 1, 2, 16], dim=1)
+                    clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+
+                    ret['latent_indices'] = latent_indices
+                    ret['clean_latent_indices'] = clean_latent_indices
+                    ret['clean_latent_2x_indices'] = clean_latent_2x_indices
+                    ret['clean_latent_4x_indices'] = clean_latent_4x_indices
             else:
                 vae = vae_and_clip
                 ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
@@ -689,7 +696,7 @@ class HunyuanVideoPipeline(BasePipeline):
         freqs_cos = freqs_cos.expand(bs, -1, -1)
         freqs_sin = freqs_sin.expand(bs, -1, -1)
 
-        if self.framepack:
+        if self.framepack and 'clean_latents' in inputs:
             clean_latents = inputs['clean_latents'].float()
             clean_latents_2x = inputs['clean_latents_2x'].float()
             clean_latents_4x = inputs['clean_latents_4x'].float()
@@ -851,7 +858,7 @@ class InitialLayer(nn.Module):
             freqs_cos = freqs_cos.flatten(2).transpose(1, 2)
             freqs_sin = freqs_sin.flatten(2).transpose(1, 2)
 
-            if clean_latents is not None and clean_latent_indices is not None:
+            if clean_latents is not None and clean_latent_indices is not None and len(clean_latents.shape) > 1:
                 clean_latents = clean_latents.to(hidden_states)
                 clean_latents = self.clean_x_embedder.proj(clean_latents)
                 clean_latents = clean_latents.flatten(2).transpose(1, 2)
@@ -864,7 +871,7 @@ class InitialLayer(nn.Module):
                 freqs_cos = torch.cat([clean_latent_rope_freqs_cos, freqs_cos], dim=1)
                 freqs_sin = torch.cat([clean_latent_rope_freqs_sin, freqs_sin], dim=1)
 
-            if clean_latents_2x is not None and clean_latent_2x_indices is not None:
+            if clean_latents_2x is not None and clean_latent_2x_indices is not None and len(clean_latent_2x_indices.shape) > 1:
                 clean_latents_2x = clean_latents_2x.to(hidden_states)
                 clean_latents_2x = pad_for_3d_conv(clean_latents_2x, (2, 4, 4))
                 clean_latents_2x = self.clean_x_embedder.proj_2x(clean_latents_2x)
@@ -882,7 +889,7 @@ class InitialLayer(nn.Module):
                 freqs_cos = torch.cat([clean_latent_2x_rope_freqs_cos, freqs_cos], dim=1)
                 freqs_sin = torch.cat([clean_latent_2x_rope_freqs_sin, freqs_sin], dim=1)
 
-            if clean_latents_4x is not None and clean_latent_4x_indices is not None:
+            if clean_latents_4x is not None and clean_latent_4x_indices is not None and len(clean_latent_4x_indices.shape) > 1:
                 clean_latents_4x = clean_latents_4x.to(hidden_states)
                 clean_latents_4x = pad_for_3d_conv(clean_latents_4x, (4, 8, 8))
                 clean_latents_4x = self.clean_x_embedder.proj_4x(clean_latents_4x)
