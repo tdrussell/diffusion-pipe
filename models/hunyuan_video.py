@@ -33,6 +33,8 @@ from transformers import SiglipImageProcessor, SiglipVisionModel
 import einops
 import gc
 
+from typing import Dict, Any
+
 # In diffusion-pipe, we already converted the dtype to an object. But Hunyuan scripts want the string version in a lot of places.
 TYPE_TO_PRECISION = {v: k for k, v in PRECISION_TO_TYPE.items()}
 
@@ -446,8 +448,19 @@ class HunyuanVideoPipeline(BasePipeline):
         params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
         base_dtype = self.model_config['dtype']
 
-        print("transformer.named_parameters()", str(list(transformer.named_parameters())))
-        print("state_dict.keys()", str(list(state_dict.keys())))
+        nameparams_set = set([p[0] for p in list(transformer.named_parameters())])
+        print("transformer.named_parameters()", str(list(nameparams_set)))
+        state_dict_set = set(list(state_dict.keys()))
+        print("state_dict.keys()", str(list(state_dict_set)))
+
+        converted_sd = convert_back_transformer(state_dict)
+        test_conversion(converted_sd)
+
+        set_intersect = nameparams_set & set(list(converted_sd.keys()))
+        print("Common params: ", set_intersect)
+
+        print("Missing params:", list(nameparams_set - set(list(converted_sd.keys()))))
+        print("Extra params:", list(set(list(converted_sd.keys())) - nameparams_set))
 
         for name, param in transformer.named_parameters():
             dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else transformer_dtype
@@ -976,3 +989,253 @@ class OutputLayer(nn.Module):
         img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
 
         return self.transformer[0].unpatchify(img, tt, th, tw)
+
+
+# Converting from diffusers-esque kijai's framepack to the original hunyuan format
+
+def reverse_remap_single_transformer_blocks(state_dict):
+    single_block_keys = [key for key in state_dict.keys() if 'single_transformer_blocks' in key]
+
+    block_data = {}
+    for key in single_block_keys:
+        parts = key.split('.')
+        block_idx = parts[1]
+        param_type = parts[-1]
+        component = parts[2] if len(parts) > 2 else None
+
+        if 'attn.to_q' in key or 'attn.to_k' in key or 'attn.to_v' in key:
+            attn_part = parts[4]
+            param = (block_idx, attn_part, param_type)
+            if param not in block_data:
+                block_data[param] = {}
+            block_data[param][attn_part] = key
+        elif 'proj_mlp' in key:
+            param = (block_idx, 'proj_mlp', param_type)
+            if param not in block_data:
+                block_data[param] = {}
+            block_data[param]['proj_mlp'] = key
+        elif 'proj_out' in key:
+            param = (block_idx, 'proj_out', param_type)
+            if param not in block_data:
+                block_data[param] = {}
+            block_data[param]['proj_out'] = key
+        elif 'norm.linear' in key:
+            new_key = key.replace('norm.linear', 'modulation.linear')
+            state_dict[new_key] = state_dict.pop(key)
+        elif 'norm.norm' in key:
+            new_key = key.replace('norm.norm', 'pre_norm')
+            state_dict[new_key] = state_dict.pop(key)
+
+    for (block_idx, part, param_type), components in block_data.items():
+        if part in ['to_q', 'to_k', 'to_v']:
+            q_key = components.get('to_q')
+            k_key = components.get('to_k')
+            v_key = components.get('to_v')
+            mlp_param = (block_idx, 'proj_mlp', param_type)
+            mlp_key = block_data.get(mlp_param, {}).get('proj_mlp')
+
+            if q_key and k_key and v_key and mlp_key:
+                q = state_dict.pop(q_key)
+                k = state_dict.pop(k_key)
+                v = state_dict.pop(v_key)
+                mlp = state_dict.pop(mlp_key)
+                combined = torch.cat([q, k, v, mlp], dim=0)
+                new_key = f'single_blocks.{block_idx}.linear1.{param_type}'
+                state_dict[new_key] = combined
+
+                proj_out_param = (block_idx, 'proj_out', param_type)
+                proj_out_key = block_data.get(proj_out_param, {}).get('proj_out')
+                if proj_out_key:
+                    proj_out = state_dict.pop(proj_out_key)
+                    new_linear2_key = f'single_blocks.{block_idx}.linear2.{param_type}'
+                    state_dict[new_linear2_key] = proj_out
+
+    for key in list(state_dict.keys()):
+        if 'single_transformer_blocks' in key:
+            new_key = key.replace('single_transformer_blocks', 'single_blocks')
+            new_key = new_key.replace('proj_out', 'linear2')
+            state_dict[new_key] = state_dict.pop(key)
+
+    return state_dict
+
+def reverse_remap_img_attn_qkv(state_dict):
+    img_attn_keys = [key for key in state_dict.keys() if 'attn.to_q' in key or 'attn.to_k' in key or 'attn.to_v' in key]
+
+    blocks = {}
+    for key in img_attn_keys:
+        parts = key.split('.')
+        if 'transformer_blocks' not in parts:
+            continue
+        block_idx = parts[parts.index('transformer_blocks') + 1]
+        param_type = parts[-1]
+        component = parts[-2]
+
+        block_key = (block_idx, param_type)
+        if block_key not in blocks:
+            blocks[block_key] = {'to_q': None, 'to_k': None, 'to_v': None}
+        blocks[block_key][component] = key
+
+    for (block_idx, param_type), components in blocks.items():
+        q_key = components.get('to_q')
+        k_key = components.get('to_k')
+        v_key = components.get('to_v')
+
+        if q_key and k_key and v_key:
+            q = state_dict.pop(q_key)
+            k = state_dict.pop(k_key)
+            v = state_dict.pop(v_key)
+            combined = torch.cat([q, k, v], dim=0)
+            new_key = f'transformer_blocks.{block_idx}.img_attn_qkv.{param_type}'
+            state_dict[new_key] = combined
+
+    return state_dict
+
+def reverse_remap_txt_attn_qkv(state_dict):
+    txt_attn_keys = [key for key in state_dict.keys() if 'attn.add_q_proj' in key or 'attn.add_k_proj' in key or 'attn.add_v_proj' in key]
+
+    blocks = {}
+    for key in txt_attn_keys:
+        parts = key.split('.')
+        if 'transformer_blocks' not in parts:
+            continue
+        block_idx = parts[parts.index('transformer_blocks') + 1]
+        param_type = parts[-1]
+        component = parts[-2].split('_')[1]
+
+        block_key = (block_idx, param_type)
+        if block_key not in blocks:
+            blocks[block_key] = {'q': None, 'k': None, 'v': None}
+        blocks[block_key][component] = key
+
+    for (block_idx, param_type), components in blocks.items():
+        q_key = components.get('q')
+        k_key = components.get('k')
+        v_key = components.get('v')
+
+        if q_key and k_key and v_key:
+            q = state_dict.pop(q_key)
+            k = state_dict.pop(k_key)
+            v = state_dict.pop(v_key)
+            combined = torch.cat([q, k, v], dim=0)
+            new_key = f'transformer_blocks.{block_idx}.txt_attn_qkv.{param_type}'
+            state_dict[new_key] = combined
+
+    return state_dict
+
+def reverse_remap_norm_scale_shift(state_dict):
+    keys = [key for key in state_dict.keys() if 'norm_out.linear' in key]
+    for key in keys:
+        weight = state_dict.pop(key)
+        scale, shift = weight.chunk(2, dim=0)
+        combined = torch.cat([shift, scale], dim=0)
+        new_key = key.replace('norm_out.linear', 'final_layer.adaLN_modulation.1')
+        state_dict[new_key] = combined
+    return state_dict
+
+def reverse_remap_txt_in(state_dict):
+    token_refiner_keys = [key for key in state_dict.keys() if 'token_refiner.refiner_blocks' in key and 'attn.to_' in key]
+
+    blocks = {}
+    for key in token_refiner_keys:
+        parts = key.split('.')
+        block_idx = parts[3]
+        component = parts[-2]
+        param_type = parts[-1]
+
+        block_key = (block_idx, param_type)
+        if block_key not in blocks:
+            blocks[block_key] = {'to_q': None, 'to_k': None, 'to_v': None}
+        blocks[block_key][component] = key
+
+    for (block_idx, param_type), components in blocks.items():
+        q_key = components.get('to_q')
+        k_key = components.get('to_k')
+        v_key = components.get('to_v')
+
+        if q_key and k_key and v_key:
+            q = state_dict.pop(q_key)
+            k = state_dict.pop(k_key)
+            v = state_dict.pop(v_key)
+            combined = torch.cat([q, k, v], dim=0)
+            new_key = f'individual_token_refiner.blocks.{block_idx}.self_attn_qkv.{param_type}'
+            state_dict[new_key] = combined
+
+    keys_to_rename = list(state_dict.keys())
+    for key in keys_to_rename:
+        new_key = key
+        new_key = new_key.replace('context_embedder', 'txt_in')
+        new_key = new_key.replace('token_refiner.refiner_blocks', 'individual_token_refiner.blocks')
+        new_key = new_key.replace('time_text_embed.timestep_embedder.linear_1', 't_embedder.mlp.0')
+        new_key = new_key.replace('time_text_embed.timestep_embedder.linear_2', 't_embedder.mlp.2')
+        new_key = new_key.replace('time_text_embed.text_embedder', 'c_embedder')
+        new_key = new_key.replace('ff', 'mlp')
+        new_key = new_key.replace('norm_out.linear', 'adaLN_modulation.1')
+        if new_key != key:
+            state_dict[new_key] = state_dict.pop(key)
+
+    return state_dict
+
+REVERSE_TRANSFORMER_KEYS_RENAME_DICT = {
+    "x_embedder": "img_in",
+    "time_text_embed.timestep_embedder.linear_1": "time_in.mlp.0",
+    "time_text_embed.timestep_embedder.linear_2": "time_in.mlp.2",
+    "time_text_embed.guidance_embedder.linear_1": "guidance_in.mlp.0",
+    "time_text_embed.guidance_embedder.linear_2": "guidance_in.mlp.2",
+    "time_text_embed.text_embedder.linear_1": "vector_in.in_layer",
+    "time_text_embed.text_embedder.linear_2": "vector_in.out_layer",
+    "transformer_blocks": "double_blocks",
+    "attn.norm_q": "img_attn_q_norm",
+    "attn.norm_k": "img_attn_k_norm",
+    "attn.to_out.0": "img_attn_proj",
+    "attn.norm_added_q": "txt_attn_q_norm",
+    "attn.norm_added_k": "txt_attn_k_norm",
+    "attn.to_add_out": "txt_attn_proj",
+    "norm1.linear": "img_mod.linear",
+    "norm2": "img_norm2",
+    "ff": "img_mlp",
+    "norm1_context.linear": "txt_mod.linear",
+    "norm2_context": "txt_norm2",
+    "ff_context": "txt_mlp",
+    "norm.linear": "modulation.linear",
+    "norm.norm": "pre_norm",
+    "norm_out.norm": "final_layer.norm_final",
+    "proj_out": "final_layer.linear",
+    "net.0.proj": "fc1",
+    "net.2": "fc2",
+    "proj_in": "input_embedder",
+}
+
+def convert_back_transformer(state_dict):
+    state_dict = reverse_remap_single_transformer_blocks(state_dict.copy())
+    state_dict = reverse_remap_img_attn_qkv(state_dict)
+    state_dict = reverse_remap_txt_attn_qkv(state_dict)
+    state_dict = reverse_remap_norm_scale_shift(state_dict)
+    state_dict = reverse_remap_txt_in(state_dict)
+
+    keys_to_rename = list(state_dict.keys())
+    for key in keys_to_rename:
+        for old, new in REVERSE_TRANSFORMER_KEYS_RENAME_DICT.items():
+            if old in key and "clean_x_embedder" not in key:
+                new_key = key.replace(old, new)
+                state_dict[new_key] = state_dict.pop(key)
+                break
+
+    return state_dict
+
+def test_conversion(converted_state_dict):
+    single_blocks_present = any('single_blocks' in key for key in converted_state_dict)
+    double_blocks_present = any('double_blocks' in key for key in converted_state_dict)
+    img_attn_qkv_restored = any('img_attn_qkv' in key for key in converted_state_dict)
+    txt_attn_qkv_restored = any('txt_attn_qkv' in key for key in converted_state_dict)
+    txt_in_restored = any('txt_in' in key for key in converted_state_dict)
+    individual_token_refiner_present = any('individual_token_refiner' in key for key in converted_state_dict)
+
+    assert single_blocks_present, "single_blocks not found in converted state dict"
+    assert double_blocks_present, "double_blocks not found"
+    assert img_attn_qkv_restored, "img_attn_qkv not restored"
+    assert txt_attn_qkv_restored, "txt_attn_qkv not restored"
+    assert txt_in_restored, "txt_in not restored"
+    assert individual_token_refiner_present, "individual_token_refiner not present"
+
+    print("All sanity checks passed!")
+
