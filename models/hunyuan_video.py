@@ -37,54 +37,6 @@ import gc
 # In diffusion-pipe, we already converted the dtype to an object. But Hunyuan scripts want the string version in a lot of places.
 TYPE_TO_PRECISION = {v: k for k, v in PRECISION_TO_TYPE.items()}
 
-def get_rotary_pos_embed(transformer, video_length, height, width):
-    target_ndim = 3
-    ndim = 5 - 2
-    rope_theta = 256
-    patch_size = transformer.patch_size
-    rope_dim_list = transformer.rope_dim_list
-    hidden_size = transformer.hidden_size
-    heads_num = transformer.heads_num
-    head_dim = hidden_size // heads_num
-
-    # 884
-    latents_size = [(video_length - 1) // 4 + 1, height // 8, width // 8]
-
-    if isinstance(patch_size, int):
-        assert all(s % patch_size == 0 for s in latents_size), (
-            f"Latent size(last {ndim} dimensions) should be divisible by patch size({patch_size}), "
-            f"but got {latents_size}."
-        )
-        rope_sizes = [s // patch_size for s in latents_size]
-    elif isinstance(patch_size, list):
-        assert all(
-            s % patch_size[idx] == 0
-            for idx, s in enumerate(latents_size)
-        ), (
-            f"Latent size(last {ndim} dimensions) should be divisible by patch size({patch_size}), "
-            f"but got {latents_size}."
-        )
-        rope_sizes = [
-            s // patch_size[idx] for idx, s in enumerate(latents_size)
-        ]
-
-    if len(rope_sizes) != target_ndim:
-        rope_sizes = [1] * (target_ndim - len(rope_sizes)) + rope_sizes  # time axis
-
-    if rope_dim_list is None:
-        rope_dim_list = [head_dim // target_ndim for _ in range(target_ndim)]
-    assert (
-        sum(rope_dim_list) == head_dim
-    ), "sum(rope_dim_list) should equal to head_dim of attention layer"
-    freqs_cos, freqs_sin = get_nd_rotary_pos_embed(
-        rope_dim_list,
-        rope_sizes,
-        theta=rope_theta,
-        use_real=True,
-        theta_rescale_factor=1,
-    )
-    return freqs_cos, freqs_sin
-
 class VaeAndClip(nn.Module):
     def __init__(self, vae, clip):
         super().__init__()
@@ -311,12 +263,12 @@ class HunyuanVideoPipeline(BasePipeline):
         self.framepack = config['model'].get('framepack', False)
         self.framepack_window_size = config['model'].get('framepack_window_size', 30)
 
-        if self.framepack:
-            print("Loading framepack specific modules")
-            siglip_path = config['model'].get('siglip_path', "lllyasviel/flux_redux_bfl")
-            self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained(siglip_path, subfolder='feature_extractor')
-            image_encoder = SiglipVisionModel.from_pretrained(siglip_path, subfolder='image_encoder', torch_dtype=dtype).eval()
-            self.vae_and_clip = VaeAndClip(vae, image_encoder).eval()
+        assert self.framepack
+        print("Loading framepack specific modules")
+        siglip_path = config['model'].get('siglip_path', "lllyasviel/flux_redux_bfl")
+        self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained(siglip_path, subfolder='feature_extractor')
+        image_encoder = SiglipVisionModel.from_pretrained(siglip_path, subfolder='image_encoder', torch_dtype=dtype).eval()
+        self.vae_and_clip = VaeAndClip(vae, image_encoder).eval()
 
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
@@ -334,7 +286,7 @@ class HunyuanVideoPipeline(BasePipeline):
                         "mlp_ratio": 4.0, "num_attention_heads": 24, "num_layers": 20, "num_refiner_layers": 2, "num_single_layers": 40, "out_channels": 16,
                         "patch_size": 2, "patch_size_t": 1, "pooled_projection_dim": 768, "qk_norm": "rms_norm",
                         "rope_axes_dim": [16, 56, 56], "rope_theta": 256.0, "text_embed_dim": 4096 }
-                transformer = HunyuanVideoTransformer3DModelPacked(**cfg).to(device=factor_kwargs['device'], dtype=factor_kwargs['dtype'])
+                transformer = HunyuanVideoTransformer3DModelPacked(**cfg)
             else:
                 transformer = load_model(
                     self.args,
@@ -507,17 +459,31 @@ class HunyuanVideoPipeline(BasePipeline):
         prompt_attention_mask_1 = inputs['prompt_attention_mask_1']
         prompt_embeds_2 = inputs['prompt_embeds_2']
         mask = inputs['mask']
+        image_embeddings = inputs['image_encoder_output']
 
-        if 'image_encoder_output' in inputs:
+        assert self.framepack
+        rtf = self.random_timecrop_framepack(latents)
+        latents = rtf['latents']
 
-            image_encoder_last_hidden_state = inputs['image_encoder_output']
+        if 'clean_latents' not in rtf:
+            # dummy clean latents for microbatch splitting
+            clean_latents = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
+            clean_latents_2x = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
+            clean_latents_4x = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
 
-            extra_encoder_hidden_states = self.transformer.image_projection(image_encoder_last_hidden_state)
-            extra_attention_mask = torch.ones((latents.shape[0], extra_encoder_hidden_states.shape[1]), dtype=prompt_attention_mask_1.dtype, device=prompt_attention_mask_1.device)
+            latent_indices = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
+            clean_latent_indices = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
+            clean_latent_2x_indices = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
+            clean_latent_4x_indices = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
+        else:
+            clean_latents = rtf['clean_latents']
+            clean_latents_2x = rtf['clean_latents_2x']
+            clean_latents_4x = rtf['clean_latents_4x']
 
-            # must cat before (not after) encoder_hidden_states, due to attn masking
-            prompt_embeds_1 = torch.cat([extra_encoder_hidden_states, prompt_embeds_1], dim=1)
-            prompt_attention_mask_1 = torch.cat([extra_attention_mask, prompt_attention_mask_1], dim=1)
+            latent_indices = rtf['latent_indices']
+            clean_latent_indices = rtf['clean_latent_indices']
+            clean_latent_2x_indices = rtf['clean_latent_2x_indices']
+            clean_latent_4x_indices = rtf['clean_latent_4x_indices']
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -562,33 +528,11 @@ class HunyuanVideoPipeline(BasePipeline):
         # timestep input to model needs to be in range [0, 1000]
         t = t * 1000
 
-        if self.framepack and 'clean_latents' in inputs:
-
-            rtf = self.random_timecrop_framepack(latents)
-
-            clean_latents = rtf['clean_latents']
-            clean_latents_2x = rtf['clean_latents_2x']
-            clean_latents_4x = rtf['clean_latents_4x']
-
-            latent_indices = rtf['latent_indices']
-            clean_latent_indices = rtf['clean_latent_indices']
-            clean_latent_2x_indices = rtf['clean_latent_2x_indices']
-            clean_latent_4x_indices = rtf['clean_latent_4x_indices']
-        else:
-            # dummy clean latents for microbatch splitting
-            clean_latents = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
-            clean_latents_2x = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
-            clean_latents_4x = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
-
-            latent_indices = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
-            clean_latent_indices = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
-            clean_latent_2x_indices = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
-            clean_latent_4x_indices = torch.zeros((x_t.shape[0],), device=x_t.device, dtype=x_t.dtype)
-
         return (
             x_t,
             t,
             prompt_embeds_1,
+            image_embeddings,
             prompt_attention_mask_1,
             prompt_embeds_2,
             guidance_expand,
@@ -613,8 +557,8 @@ class HunyuanVideoPipeline(BasePipeline):
 
     def enable_block_swap(self, blocks_to_swap):
         transformer = self.transformer
-        double_blocks = transformer.double_blocks
-        single_blocks = transformer.single_blocks
+        double_blocks = transformer.transformer_blocks
+        single_blocks = transformer.single_transformer_blocks
         num_double_blocks = len(double_blocks)
         num_single_blocks = len(single_blocks)
         double_blocks_to_swap = blocks_to_swap // 2
@@ -633,11 +577,11 @@ class HunyuanVideoPipeline(BasePipeline):
         self.offloader_single = ModelOffloader(
             'SingleBlock', single_blocks, num_single_blocks, single_blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
         )
-        transformer.double_blocks = None
-        transformer.single_blocks = None
+        transformer.transformer_blocks = None
+        transformer.single_transformer_blocks = None
         transformer.to('cuda')
-        transformer.double_blocks = double_blocks
-        transformer.single_blocks = single_blocks
+        transformer.transformer_blocks = double_blocks
+        transformer.single_transformer_blocks = single_blocks
         self.prepare_block_swap_training()
         print(
             f'Block swap enabled. Swapping {blocks_to_swap} blocks, double blocks: {double_blocks_to_swap}, single blocks: {single_blocks_to_swap}.'
@@ -675,6 +619,7 @@ class InitialLayer(nn.Module):
         self.context_embedder = self.transformer[0].context_embedder
 
         self.image_projection = self.transformer[0].image_projection
+        self.config = self.transformer[0].config
 
 
     def process_input_hidden_states(
@@ -742,141 +687,55 @@ class InitialLayer(nn.Module):
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
 
-        x, t, text_states, text_mask, text_states_2, freqs_cos, freqs_sin, guidance, clean_latents, clean_latents_2x, clean_latents_4x, latent_indices, clean_latent_indices, clean_latent_2x_indices, clean_latent_4x_indices = inputs
+        hidden_states, timestep, encoder_hidden_states, image_embeddings, encoder_attention_mask, pooled_projections, guidance, clean_latents, clean_latents_2x, clean_latents_4x, latent_indices, clean_latent_indices, clean_latent_2x_indices, clean_latent_4x_indices = inputs
 
-        B, _, T, H, W = x.shape
-        tt, th, tw = (
-            T // self.transformer[0].patch_size[0],
-            H // self.transformer[0].patch_size[1],
-            W // self.transformer[0].patch_size[2],
-        )
-        unpatchify_args = torch.tensor([tt, th, tw], device=x.device)
+        if len(clean_latents.shape) < 2:
+            clean_latents = clean_latents_2x = clean_latents_4x = clean_latent_indices = latent_indices = clean_latent_2x_indices = clean_latent_4x_indices = None
 
-        img = x
-        txt = text_states
+        batch_size, num_channels, num_frames, height, width = hidden_states.shape
+        p, p_t = self.config['patch_size'], self.config['patch_size_t']
+        post_patch_num_frames = num_frames // p_t
+        post_patch_height = height // p
+        post_patch_width = width // p
+        original_context_length = post_patch_num_frames * post_patch_height * post_patch_width
 
-        # Prepare modulation vectors.
-        vec = self.time_in(t)
+        unpatchify_args = torch.tensor([post_patch_num_frames, post_patch_height, post_patch_width], device=hidden_states.device)
 
-        # text modulation
-        vec = vec + self.vector_in(text_states_2)
+        hidden_states, rope_freqs = self.process_input_hidden_states(hidden_states, latent_indices, clean_latents, clean_latent_indices, clean_latents_2x, clean_latent_2x_indices, clean_latents_4x, clean_latent_4x_indices)
 
-        # guidance modulation
-        if self.guidance_embed:
-            if guidance is None:
-                raise ValueError(
-                    "Didn't get guidance strength for guidance distilled model."
-                )
+        temb = self.time_text_embed(timestep, guidance, pooled_projections)
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states, timestep, encoder_attention_mask)
 
-            # our timestep_embedding is merged into guidance_in(TimestepEmbedder)
-            vec = vec + self.guidance_in(guidance)
+        assert self.image_projection is not None
+        assert image_embeddings is not None, 'You must use image embeddings!'
+        extra_encoder_hidden_states = self.image_projection(image_embeddings)
+        extra_attention_mask = torch.ones((batch_size, extra_encoder_hidden_states.shape[1]), dtype=encoder_attention_mask.dtype, device=encoder_attention_mask.device)
 
-        # Embed image and text.
-        hidden_states = self.img_in(img)
+        # must cat before (not after) encoder_hidden_states, due to attn masking
+        encoder_hidden_states = torch.cat([extra_encoder_hidden_states, encoder_hidden_states], dim=1)
+        encoder_attention_mask = torch.cat([extra_attention_mask, encoder_attention_mask], dim=1)
 
-        # Framepack handling of latents
-        if self.framepack:
-
-            if latent_indices is None:
-                latent_indices = torch.arange(0, T).unsqueeze(0).expand(B, -1)
-
-            # NOTE: we have cos and sin separately because we're working with the original HY code
-            freqs_cos, freqs_sin = self.rope(frame_indices=latent_indices, height=H, width=W, device=hidden_states.device)
-            freqs_cos = freqs_cos.flatten(2).transpose(1, 2)
-            freqs_sin = freqs_sin.flatten(2).transpose(1, 2)
-
-            if clean_latents is not None and clean_latent_indices is not None and len(clean_latents.shape) > 1:
-                clean_latents = clean_latents.to(hidden_states)
-                clean_latents = self.clean_x_embedder.proj(clean_latents)
-                clean_latents = clean_latents.flatten(2).transpose(1, 2)
-
-                clean_latent_rope_freqs_cos, clean_latent_rope_freqs_sin = self.rope(frame_indices=clean_latent_indices, height=H, width=W, device=clean_latents.device)
-                clean_latent_rope_freqs_cos = clean_latent_rope_freqs_cos.flatten(2).transpose(1, 2)
-                clean_latent_rope_freqs_sin = clean_latent_rope_freqs_sin.flatten(2).transpose(1, 2)
-
-                hidden_states = torch.cat([clean_latents, hidden_states], dim=1)
-                freqs_cos = torch.cat([clean_latent_rope_freqs_cos, freqs_cos], dim=1)
-                freqs_sin = torch.cat([clean_latent_rope_freqs_sin, freqs_sin], dim=1)
-
-            if clean_latents_2x is not None and clean_latent_2x_indices is not None and len(clean_latent_2x_indices.shape) > 1:
-                clean_latents_2x = clean_latents_2x.to(hidden_states)
-                clean_latents_2x = pad_for_3d_conv(clean_latents_2x, (2, 4, 4))
-                clean_latents_2x = self.clean_x_embedder.proj_2x(clean_latents_2x)
-                clean_latents_2x = clean_latents_2x.flatten(2).transpose(1, 2)
-
-                clean_latent_2x_rope_freqs_cos, clean_latent_2x_rope_freqs_sin = self.rope(frame_indices=clean_latent_2x_indices, height=H, width=W, device=clean_latents_2x.device)
-                clean_latent_2x_rope_freqs_cos = pad_for_3d_conv(clean_latent_2x_rope_freqs_cos, (2, 2, 2))
-                clean_latent_2x_rope_freqs_cos = center_down_sample_3d(clean_latent_2x_rope_freqs_cos, (2, 2, 2))
-                clean_latent_2x_rope_freqs_cos = clean_latent_2x_rope_freqs_cos.flatten(2).transpose(1, 2)
-                clean_latent_2x_rope_freqs_sin = pad_for_3d_conv(clean_latent_2x_rope_freqs_sin, (2, 2, 2))
-                clean_latent_2x_rope_freqs_sin = center_down_sample_3d(clean_latent_2x_rope_freqs_sin, (2, 2, 2))
-                clean_latent_2x_rope_freqs_sin = clean_latent_2x_rope_freqs_sin.flatten(2).transpose(1, 2)
-
-                hidden_states = torch.cat([clean_latents_2x, hidden_states], dim=1)
-                freqs_cos = torch.cat([clean_latent_2x_rope_freqs_cos, freqs_cos], dim=1)
-                freqs_sin = torch.cat([clean_latent_2x_rope_freqs_sin, freqs_sin], dim=1)
-
-            if clean_latents_4x is not None and clean_latent_4x_indices is not None and len(clean_latent_4x_indices.shape) > 1:
-                clean_latents_4x = clean_latents_4x.to(hidden_states)
-                clean_latents_4x = pad_for_3d_conv(clean_latents_4x, (4, 8, 8))
-                clean_latents_4x = self.clean_x_embedder.proj_4x(clean_latents_4x)
-                clean_latents_4x = clean_latents_4x.flatten(2).transpose(1, 2)
-
-                clean_latent_4x_rope_freqs_cos, clean_latent_4x_rope_freqs_sin = self.rope(frame_indices=clean_latent_4x_indices, height=H, width=W, device=clean_latents_4x.device)
-                clean_latent_4x_rope_freqs_cos = pad_for_3d_conv(clean_latent_4x_rope_freqs_cos, (4, 4, 4))
-                clean_latent_4x_rope_freqs_cos = center_down_sample_3d(clean_latent_4x_rope_freqs_cos, (4, 4, 4))
-                clean_latent_4x_rope_freqs_cos = clean_latent_4x_rope_freqs_cos.flatten(2).transpose(1, 2)
-                clean_latent_4x_rope_freqs_sin = pad_for_3d_conv(clean_latent_4x_rope_freqs_sin, (4, 4, 4))
-                clean_latent_4x_rope_freqs_sin = center_down_sample_3d(clean_latent_4x_rope_freqs_sin, (4, 4, 4))
-                clean_latent_4x_rope_freqs_sin = clean_latent_4x_rope_freqs_sin.flatten(2).transpose(1, 2)
-
-                hidden_states = torch.cat([clean_latents_4x, hidden_states], dim=1)
-                freqs_cos = torch.cat([clean_latent_4x_rope_freqs_cos, freqs_cos], dim=1)
-                freqs_sin = torch.cat([clean_latent_4x_rope_freqs_sin, freqs_sin], dim=1)
-
-        # diffusion-pipe makes all input tensors have a batch dimension, but Hunyuan code wants these to not have batch dim
-        assert freqs_cos.ndim == 3
-        freqs_cos, freqs_sin = freqs_cos[0], freqs_sin[0]
-
-        img = hidden_states
-
-        if self.text_projection == "linear":
-            txt = self.txt_in(txt)
-        elif self.text_projection == "single_refiner":
-            txt = self.txt_in(txt, t, text_mask if self.transformer[0].use_attention_mask else None)
-        else:
-            raise NotImplementedError(
-                f"Unsupported text_projection: {self.text_projection}"
-            )
-
-        txt_seq_len = txt.shape[1]
-        img_seq_len = img.shape[1]
-
-        # Compute cu_squlens and max_seqlen for flash attention
         with torch.no_grad():
-            if B == 1:
+            # Mask getting from off Framepack, with all its flaws
+            if batch_size == 1:
                 # When batch size is 1, we do not need any masks or var-len funcs since cropping is mathematically same to what we want
                 # If they are not same, then their impls are wrong. Ours are always the correct one.
-                text_len = text_mask.sum().item()
-                encoder_hidden_states = text_states[:, :text_len]
-                attention_mask = None, None, None, None
+                text_len = encoder_attention_mask.sum().item()
+                encoder_hidden_states = encoder_hidden_states[:, :text_len]
+                # attention_mask = None, None, None, None
+                cu_seqlens_q = cu_seqlens_kv = max_seqlen_q = max_seqlen_kv = torch.tensor([0], device=hidden_states.device) # Dummy value
             else:
                 img_seq_len = hidden_states.shape[1]
-                txt_seq_len = text_states.shape[1]
+                txt_seq_len = encoder_hidden_states.shape[1]
 
-                cu_seqlens_q = get_cu_seqlens(text_mask, img_seq_len)
+                cu_seqlens_q = get_cu_seqlens(encoder_attention_mask, img_seq_len)
                 cu_seqlens_kv = cu_seqlens_q
-                max_seqlen_q = img_seq_len + txt_seq_len
-                max_seqlen_kv = max_seqlen_q
+                max_seqlen_q = torch.tensor([img_seq_len + txt_seq_len], device=hidden_states.device)
+                max_seqlen_kv = torch.tensor([max_seqlen_q], device=hidden_states.device)
 
-                attention_mask = cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
+                # attention_mask = cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
 
-        # Everything passed between layers needs to be a CUDA tensor for Deepspeed pipeline parallelism.
-        txt_seq_len = torch.tensor(txt_seq_len, device=img.device)
-        img_seq_len = torch.tensor(img_seq_len, device=img.device)
-        max_seqlen = img_seq_len + txt_seq_len
-
-        return make_contiguous(img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args)
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, rope_freqs, unpatchify_args)
 
 
 class DoubleBlock(nn.Module):
@@ -888,13 +747,14 @@ class DoubleBlock(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args = inputs
+        hidden_states, encoder_hidden_states, temb, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, rope_freqs, unpatchify_args = inputs
+        attention_mask = (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q.item(), max_seqlen_kv.item()) if hidden_states.shape[0] != 1 else (None, None, None, None)
 
         self.offloader.wait_for_block(self.block_idx)
         hidden_states, encoder_hidden_states = self.block(hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args)
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, rope_freqs, unpatchify_args)
 
 
 class SingleBlock(nn.Module):
@@ -906,13 +766,14 @@ class SingleBlock(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args = inputs
+        hidden_states, encoder_hidden_states, temb, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, rope_freqs, unpatchify_args = inputs
+        attention_mask = (cu_seqlens_q, cu_seqlens_kv, max_seqlen_q.item(), max_seqlen_kv.item()) if hidden_states.shape[0] != 1 else (None, None, None, None)
 
         self.offloader.wait_for_block(self.block_idx)
         hidden_states, encoder_hidden_states = self.block(hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args)
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, rope_freqs, unpatchify_args)
 
 class OutputLayer(nn.Module):
     def __init__(self, transformer):
@@ -920,15 +781,18 @@ class OutputLayer(nn.Module):
         # Prevent registering the whole Transformer.
         self.transformer = [transformer]
         # Explicitly register these modules.
+        self.norm_out = self.transformer[0].norm_out
         self.proj_out = self.transformer[0].proj_out
         self.pt = transformer.config['patch_size_t']
         self.p = transformer.config['patch_size']
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args = inputs
+        hidden_states, encoder_hidden_states, temb, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv, rope_freqs, unpatchify_args = inputs
         tt, th, tw = (arg.item() for arg in unpatchify_args)
         original_context_length = tt*th*tw
+
+        hidden_states = self.norm_out(hidden_states, temb)
         hidden_states = hidden_states[:, -original_context_length:, :]
 
         # ---------------------------- Final layer ------------------------------
