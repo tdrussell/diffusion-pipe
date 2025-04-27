@@ -27,7 +27,7 @@ from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline as OriginalHunyuanVideoPipeline
 from hyvideo.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
-from .hy_framepack_transformer_blocks import HunyuanVideoTransformer3DModelPacked, pad_for_3d_conv, center_down_sample_3d, hf_clip_vision_encode
+from .hy_framepack_transformer_blocks import HunyuanVideoTransformer3DModelPacked, pad_for_3d_conv, center_down_sample_3d, hf_clip_vision_encode, get_cu_seqlens
 
 # Framepack
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -196,11 +196,12 @@ def vae_encode(tensor, vae):
     return latents * vae.config.scaling_factor
 
 
+# Warning: starting the conversion to full framepack
 class HunyuanVideoPipeline(BasePipeline):
     name = 'hunyuan-video'
     framerate = 30
     checkpointable_layers = ['DoubleBlock', 'SingleBlock']
-    adapter_target_modules = ['MMDoubleStreamBlock', 'MMSingleStreamBlock']
+    adapter_target_modules = ['HunyuanVideoTransformerBlock', 'HunyuanVideoSingleTransformerBlock']
 
     def __init__(self, config):
         self.config = config
@@ -376,7 +377,8 @@ class HunyuanVideoPipeline(BasePipeline):
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)
         # Diffusers LoRA convention.
-        peft_state_dict = {'transformer.'+k: v for k, v in peft_state_dict.items()}
+        if not self.frameppack:
+            peft_state_dict = {'transformer.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def save_model(self, save_dir, diffusers_sd):
@@ -506,8 +508,7 @@ class HunyuanVideoPipeline(BasePipeline):
         prompt_embeds_2 = inputs['prompt_embeds_2']
         mask = inputs['mask']
 
-        if self.transformer.image_projection is not None:
-            raise 'Found!'
+        if 'image_encoder_output' in inputs:
 
             image_encoder_last_hidden_state = inputs['image_encoder_output']
 
@@ -517,8 +518,6 @@ class HunyuanVideoPipeline(BasePipeline):
             # must cat before (not after) encoder_hidden_states, due to attn masking
             prompt_embeds_1 = torch.cat([extra_encoder_hidden_states, prompt_embeds_1], dim=1)
             prompt_attention_mask_1 = torch.cat([extra_attention_mask, prompt_attention_mask_1], dim=1)
-        else:
-            raise 'Not found!'
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -563,15 +562,6 @@ class HunyuanVideoPipeline(BasePipeline):
         # timestep input to model needs to be in range [0, 1000]
         t = t * 1000
 
-        video_length = (num_frames - 1) * 4 + 1
-        video_height = h * 8
-        video_width = w * 8
-        freqs_cos, freqs_sin = get_rotary_pos_embed(
-            self.transformer, video_length, video_height, video_width
-        )
-        freqs_cos = freqs_cos.expand(bs, -1, -1)
-        freqs_sin = freqs_sin.expand(bs, -1, -1)
-
         if self.framepack and 'clean_latents' in inputs:
 
             rtf = self.random_timecrop_framepack(latents)
@@ -601,8 +591,6 @@ class HunyuanVideoPipeline(BasePipeline):
             prompt_embeds_1,
             prompt_attention_mask_1,
             prompt_embeds_2,
-            freqs_cos,
-            freqs_sin,
             guidance_expand,
             clean_latents,
             clean_latents_2x,
@@ -616,10 +604,9 @@ class HunyuanVideoPipeline(BasePipeline):
     def to_layers(self):
         transformer = self.transformer
         layers = [InitialLayer(transformer)]
-        for i, block in enumerate(transformer.double_blocks):
+        for i, block in enumerate(transformer.transformer_blocks):
             layers.append(DoubleBlock(block, i, self.offloader_double))
-        layers.append(concatenate_hidden_states)
-        for i, block in enumerate(transformer.single_blocks):
+        for i, block in enumerate(transformer.single_transformer_blocks):
             layers.append(SingleBlock(block, i, self.offloader_single))
         layers.append(OutputLayer(transformer))
         return layers
@@ -673,20 +660,81 @@ class HunyuanVideoPipeline(BasePipeline):
         self.offloader_single.set_forward_only(True)
         self.offloader_single.prepare_block_devices_before_forward()
 
-
 class InitialLayer(nn.Module):
     def __init__(self, transformer):
         super().__init__()
         # Prevent registering the whole Transformer.
         self.transformer = [transformer]
+
         # Explicitly register these modules.
-        self.time_in = self.transformer[0].time_in
-        self.vector_in = self.transformer[0].vector_in
-        self.guidance_embed = self.transformer[0].guidance_embed
-        self.guidance_in = self.transformer[0].guidance_in
-        self.img_in = self.transformer[0].img_in
-        self.text_projection = self.transformer[0].text_projection
-        self.txt_in = self.transformer[0].txt_in
+        self.x_embedder = self.transformer[0].x_embedder
+        self.rope = self.transformer[0].rope
+        self.clean_x_embedder = self.transformer[0].clean_x_embedder
+
+        self.time_text_embed = self.transformer[0].time_text_embed
+        self.context_embedder = self.transformer[0].context_embedder
+
+        self.image_projection = self.transformer[0].image_projection
+
+
+    def process_input_hidden_states(
+        self,
+        latents, latent_indices=None,
+        clean_latents=None, clean_latent_indices=None,
+        clean_latents_2x=None, clean_latent_2x_indices=None,
+        clean_latents_4x=None, clean_latent_4x_indices=None
+    ):
+        hidden_states = self.x_embedder.proj(latents)
+        B, C, T, H, W = hidden_states.shape
+
+        if latent_indices is None:
+            latent_indices = torch.arange(0, T).unsqueeze(0).expand(B, -1)
+
+        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+
+        rope_freqs = self.rope(frame_indices=latent_indices, height=H, width=W, device=hidden_states.device)
+        rope_freqs = rope_freqs.flatten(2).transpose(1, 2)
+
+        if clean_latents is not None and clean_latent_indices is not None:
+            clean_latents = clean_latents.to(hidden_states)
+            clean_latents = self.clean_x_embedder.proj(clean_latents)
+            clean_latents = clean_latents.flatten(2).transpose(1, 2)
+
+            clean_latent_rope_freqs = self.rope(frame_indices=clean_latent_indices, height=H, width=W, device=clean_latents.device)
+            clean_latent_rope_freqs = clean_latent_rope_freqs.flatten(2).transpose(1, 2)
+
+            hidden_states = torch.cat([clean_latents, hidden_states], dim=1)
+            rope_freqs = torch.cat([clean_latent_rope_freqs, rope_freqs], dim=1)
+
+        if clean_latents_2x is not None and clean_latent_2x_indices is not None:
+            clean_latents_2x = clean_latents_2x.to(hidden_states)
+            clean_latents_2x = pad_for_3d_conv(clean_latents_2x, (2, 4, 4))
+            clean_latents_2x = self.clean_x_embedder.proj_2x(clean_latents_2x)
+            clean_latents_2x = clean_latents_2x.flatten(2).transpose(1, 2)
+
+            clean_latent_2x_rope_freqs = self.rope(frame_indices=clean_latent_2x_indices, height=H, width=W, device=clean_latents_2x.device)
+            clean_latent_2x_rope_freqs = pad_for_3d_conv(clean_latent_2x_rope_freqs, (2, 2, 2))
+            clean_latent_2x_rope_freqs = center_down_sample_3d(clean_latent_2x_rope_freqs, (2, 2, 2))
+            clean_latent_2x_rope_freqs = clean_latent_2x_rope_freqs.flatten(2).transpose(1, 2)
+
+            hidden_states = torch.cat([clean_latents_2x, hidden_states], dim=1)
+            rope_freqs = torch.cat([clean_latent_2x_rope_freqs, rope_freqs], dim=1)
+
+        if clean_latents_4x is not None and clean_latent_4x_indices is not None:
+            clean_latents_4x = clean_latents_4x.to(hidden_states)
+            clean_latents_4x = pad_for_3d_conv(clean_latents_4x, (4, 8, 8))
+            clean_latents_4x = self.clean_x_embedder.proj_4x(clean_latents_4x)
+            clean_latents_4x = clean_latents_4x.flatten(2).transpose(1, 2)
+
+            clean_latent_4x_rope_freqs = self.rope(frame_indices=clean_latent_4x_indices, height=H, width=W, device=clean_latents_4x.device)
+            clean_latent_4x_rope_freqs = pad_for_3d_conv(clean_latent_4x_rope_freqs, (4, 4, 4))
+            clean_latent_4x_rope_freqs = center_down_sample_3d(clean_latent_4x_rope_freqs, (4, 4, 4))
+            clean_latent_4x_rope_freqs = clean_latent_4x_rope_freqs.flatten(2).transpose(1, 2)
+
+            hidden_states = torch.cat([clean_latents_4x, hidden_states], dim=1)
+            rope_freqs = torch.cat([clean_latent_4x_rope_freqs, rope_freqs], dim=1)
+
+        return hidden_states, rope_freqs
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
@@ -805,7 +853,23 @@ class InitialLayer(nn.Module):
         img_seq_len = img.shape[1]
 
         # Compute cu_squlens and max_seqlen for flash attention
-        cu_seqlens = get_cu_seqlens(text_mask, img_seq_len)
+        with torch.no_grad():
+            if B == 1:
+                # When batch size is 1, we do not need any masks or var-len funcs since cropping is mathematically same to what we want
+                # If they are not same, then their impls are wrong. Ours are always the correct one.
+                text_len = text_mask.sum().item()
+                encoder_hidden_states = text_states[:, :text_len]
+                attention_mask = None, None, None, None
+            else:
+                img_seq_len = hidden_states.shape[1]
+                txt_seq_len = text_states.shape[1]
+
+                cu_seqlens_q = get_cu_seqlens(text_mask, img_seq_len)
+                cu_seqlens_kv = cu_seqlens_q
+                max_seqlen_q = img_seq_len + txt_seq_len
+                max_seqlen_kv = max_seqlen_q
+
+                attention_mask = cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv
 
         # Everything passed between layers needs to be a CUDA tensor for Deepspeed pipeline parallelism.
         txt_seq_len = torch.tensor(txt_seq_len, device=img.device)
@@ -824,19 +888,13 @@ class DoubleBlock(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args = inputs
+        hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args = inputs
 
         self.offloader.wait_for_block(self.block_idx)
-        img, txt = self.block(img, txt, vec, cu_seqlens, cu_seqlens, max_seqlen.item(), max_seqlen.item(), (freqs_cos, freqs_sin))
+        hidden_states, encoder_hidden_states = self.block(hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args)
-
-
-def concatenate_hidden_states(inputs):
-    img, txt, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args = inputs
-    x = torch.cat((img, txt), 1)
-    return x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args)
 
 
 class SingleBlock(nn.Module):
@@ -848,13 +906,13 @@ class SingleBlock(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args = inputs
+        hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args = inputs
 
         self.offloader.wait_for_block(self.block_idx)
-        x = self.block(x, vec, txt_seq_len.item(), cu_seqlens, cu_seqlens, max_seqlen.item(), max_seqlen.item(), (freqs_cos, freqs_sin))
+        hidden_states, encoder_hidden_states = self.block(hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args)
+        return make_contiguous(hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args)
 
 class OutputLayer(nn.Module):
     def __init__(self, transformer):
@@ -862,18 +920,22 @@ class OutputLayer(nn.Module):
         # Prevent registering the whole Transformer.
         self.transformer = [transformer]
         # Explicitly register these modules.
-        self.final_layer = self.transformer[0].final_layer
+        self.proj_out = self.transformer[0].proj_out
+        self.pt = transformer.config['patch_size_t']
+        self.p = transformer.config['patch_size']
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        x, vec, cu_seqlens, max_seqlen, freqs_cos, freqs_sin, txt_seq_len, img_seq_len, unpatchify_args = inputs
-        img = x[:, :img_seq_len.item(), ...]
-
+        hidden_states, encoder_hidden_states, temb, attention_mask, rope_freqs, unpatchify_args = inputs
         tt, th, tw = (arg.item() for arg in unpatchify_args)
-        # trimming if framepack
-        img = img[:, -tt*th*tw:, :]
+        original_context_length = tt*th*tw
+        hidden_states = hidden_states[:, -original_context_length:, :]
 
         # ---------------------------- Final layer ------------------------------
-        img = self.final_layer(img, vec)  # (N, T, patch_size ** 2 * out_channels)
+        hidden_states = self.proj_out(hidden_states)
 
-        return self.transformer[0].unpatchify(img, tt, th, tw)
+        hidden_states = einops.rearrange(hidden_states, 'b (t h w) (c pt ph pw) -> b c (t pt) (h ph) (w pw)',
+                                         t=tt, h=th, w=tw,
+                                         pt=self.pt, ph=self.p, pw=self.p)
+
+        return hidden_states
