@@ -27,6 +27,7 @@ from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline as OriginalHunyuanVideoPipeline
 from hyvideo.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
+from .hy_framepack_transformer_blocks import HunyuanVideoTransformer3DModelPacked, pad_for_3d_conv, center_down_sample_3d, hf_clip_vision_encode
 
 # Framepack
 from transformers import SiglipImageProcessor, SiglipVisionModel
@@ -35,16 +36,6 @@ import gc
 
 # In diffusion-pipe, we already converted the dtype to an object. But Hunyuan scripts want the string version in a lot of places.
 TYPE_TO_PRECISION = {v: k for k, v in PRECISION_TO_TYPE.items()}
-
-def hf_clip_vision_encode(image, feature_extractor, image_encoder):
-    assert isinstance(image, np.ndarray)
-    assert image.ndim == 3 and image.shape[2] == 3
-    assert image.dtype == np.uint8
-
-    preprocessed = feature_extractor.preprocess(images=image, return_tensors="pt").to(device=image_encoder.device, dtype=image_encoder.dtype)
-    image_encoder_output = image_encoder(**preprocessed)
-
-    return image_encoder_output
 
 def get_rotary_pos_embed(transformer, video_length, height, width):
     target_ndim = 3
@@ -94,66 +85,11 @@ def get_rotary_pos_embed(transformer, video_length, height, width):
     )
     return freqs_cos, freqs_sin
 
-class HunyuanVideoRotaryPosEmbed(nn.Module):
-    def __init__(self, rope_dim, theta):
-        super().__init__()
-        self.DT, self.DY, self.DX = rope_dim
-        self.theta = theta
-
-    @torch.no_grad()
-    def get_frequency(self, dim, pos):
-        T, H, W = pos.shape
-        freqs = 1.0 / (self.theta ** (torch.arange(0, dim, 2, dtype=torch.float32, device=pos.device)[: (dim // 2)] / dim))
-        freqs = torch.outer(freqs, pos.reshape(-1)).unflatten(-1, (T, H, W)).repeat_interleave(2, dim=0)
-        return freqs.cos(), freqs.sin()
-
-    @torch.no_grad()
-    def forward_inner(self, frame_indices, height, width, device):
-        GT, GY, GX = torch.meshgrid(
-            frame_indices.to(device=device, dtype=torch.float32),
-            torch.arange(0, height, device=device, dtype=torch.float32),
-            torch.arange(0, width, device=device, dtype=torch.float32),
-            indexing="ij"
-        )
-
-        FCT, FST = self.get_frequency(self.DT, GT)
-        FCY, FSY = self.get_frequency(self.DY, GY)
-        FCX, FSX = self.get_frequency(self.DX, GX)
-
-        result_cos = torch.cat([FCT, FCY, FCX], dim=0)
-        result_sin = torch.cat([FST, FSY, FSX], dim=0)
-
-        return result_cos.to(device), result_sin.to(device)
-
-    @torch.no_grad()
-    def forward(self, frame_indices, height, width, device):
-        frame_indices = frame_indices.unbind(0)
-        results = [self.forward_inner(f, height, width, device) for f in frame_indices]
-        results = torch.stack(results, dim=0)
-        return results
-
 class VaeAndClip(nn.Module):
     def __init__(self, vae, clip):
         super().__init__()
         self.vae = vae
         self.clip = clip
-
-def pad_for_3d_conv(x, kernel_size):
-    b, c, t, h, w = x.shape
-    pt, ph, pw = kernel_size
-    pad_t = (pt - (t % pt)) % pt
-    pad_h = (ph - (h % ph)) % ph
-    pad_w = (pw - (w % pw)) % pw
-    return torch.nn.functional.pad(x, (0, pad_w, 0, pad_h, 0, pad_t), mode='replicate')
-
-
-def center_down_sample_3d(x, kernel_size):
-    # pt, ph, pw = kernel_size
-    # cp = (pt * ph * pw) // 2
-    # xp = einops.rearrange(x, 'b c (t pt) (h ph) (w pw) -> (pt ph pw) b c t h w', pt=pt, ph=ph, pw=pw)
-    # xc = xp[cp]
-    # return xc
-    return torch.nn.functional.avg_pool3d(x, kernel_size, stride=kernel_size)
 
 def load_state_dict(args, pretrained_model_path):
     load_key = args.load_key
@@ -254,47 +190,11 @@ def _convert_state_dict_keys(model_state_dict, loaded_state_dict):
     else:
         return loaded_state_dict
 
-
 def vae_encode(tensor, vae):
     # tensor values already in range [-1, 1] here
     latents = vae.encode(tensor).latent_dist.sample()
     return latents * vae.config.scaling_factor
 
-class ClipVisionProjection(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.up = nn.Linear(in_channels, out_channels * 3)
-        self.down = nn.Linear(out_channels * 3, out_channels)
-
-    def forward(self, x):
-        projected_x = self.down(nn.functional.silu(self.up(x)))
-        return projected_x
-
-class HunyuanVideoPatchEmbedForCleanLatents(nn.Module):
-    def __init__(self, inner_dim):
-        super().__init__()
-        self.proj = nn.Conv3d(16, inner_dim, kernel_size=(1, 2, 2), stride=(1, 2, 2))
-        self.proj_2x = nn.Conv3d(16, inner_dim, kernel_size=(2, 4, 4), stride=(2, 4, 4))
-        self.proj_4x = nn.Conv3d(16, inner_dim, kernel_size=(4, 8, 8), stride=(4, 8, 8))
-
-    @torch.no_grad()
-    def initialize_weight_from_another_conv3d(self, another_layer):
-        weight = another_layer.weight.detach().clone()
-        bias = another_layer.bias.detach().clone()
-
-        sd = {
-            'proj.weight': weight.clone(),
-            'proj.bias': bias.clone(),
-            'proj_2x.weight': einops.repeat(weight, 'b c t h w -> b c (t tk) (h hk) (w wk)', tk=2, hk=2, wk=2) / 8.0,
-            'proj_2x.bias': bias.clone(),
-            'proj_4x.weight': einops.repeat(weight, 'b c t h w -> b c (t tk) (h hk) (w wk)', tk=4, hk=4, wk=4) / 64.0,
-            'proj_4x.bias': bias.clone(),
-        }
-
-        sd = {k: v.clone() for k, v in sd.items()}
-
-        self.load_state_dict(sd)
-        return
 
 class HunyuanVideoPipeline(BasePipeline):
     name = 'hunyuan-video'
@@ -415,8 +315,6 @@ class HunyuanVideoPipeline(BasePipeline):
             siglip_path = config['model'].get('siglip_path', "lllyasviel/flux_redux_bfl")
             self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained(siglip_path, subfolder='feature_extractor')
             image_encoder = SiglipVisionModel.from_pretrained(siglip_path, subfolder='image_encoder', torch_dtype=dtype).eval()
-
-            self.rope = HunyuanVideoRotaryPosEmbed((16, 56, 56), 256.0)
             self.vae_and_clip = VaeAndClip(vae, image_encoder).eval()
 
     # delay loading transformer to save RAM
@@ -428,26 +326,29 @@ class HunyuanVideoPipeline(BasePipeline):
         in_channels = self.args.latent_channels
         out_channels = self.args.latent_channels
         with init_empty_weights():
-            transformer = load_model(
-                self.args,
-                in_channels=in_channels,
-                out_channels=out_channels,
-                factor_kwargs=factor_kwargs,
-            )
             if self.framepack:
-                inner_dim = 3072 # constant
-                transformer.image_projection = ClipVisionProjection(3, inner_dim)
-                transformer.clean_x_embedder = HunyuanVideoPatchEmbedForCleanLatents(inner_dim)
+                # default config from kijai
+                cfg = {"_class_name": "HunyuanVideoTransformer3DModelPacked", "_diffusers_version": "0.33.0.dev0", "_name_or_path": "hunyuanvideo-community/HunyuanVideo",
+                        "attention_head_dim": 128, "guidance_embeds": True, "has_clean_x_embedder": True, "has_image_proj": True, "image_proj_dim": 1152, "in_channels": 16,
+                        "mlp_ratio": 4.0, "num_attention_heads": 24, "num_layers": 20, "num_refiner_layers": 2, "num_single_layers": 40, "out_channels": 16,
+                        "patch_size": 2, "patch_size_t": 1, "pooled_projection_dim": 768, "qk_norm": "rms_norm",
+                        "rope_axes_dim": [16, 56, 56], "rope_theta": 256.0, "text_embed_dim": 4096 }
+                transformer = HunyuanVideoTransformer3DModelPacked(**cfg).to(device=factor_kwargs['device'], dtype=factor_kwargs['dtype'])
+            else:
+                transformer = load_model(
+                    self.args,
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    factor_kwargs=factor_kwargs,
+                )
         if transformer_path := self.model_config.get('transformer_path', None):
             state_dict = load_safetensors(transformer_path)
             state_dict = _convert_state_dict_keys(transformer.state_dict(), state_dict)
         else:
             state_dict = load_state_dict(self.args, self.args.model_base)
         params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
+        params_to_keep.update("embedder", "time_text_embed", "context_embedder", "x_embedder") # framepack
         base_dtype = self.model_config['dtype']
-
-        print("transformer.named_parameters()", str(list(transformer.named_parameters())))
-        print("state_dict.keys()", str(list(state_dict.keys())))
 
         for name, param in transformer.named_parameters():
             dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else transformer_dtype
