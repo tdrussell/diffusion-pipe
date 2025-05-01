@@ -1,9 +1,7 @@
 from pathlib import Path
-import sys
 import argparse
 import json
 import os.path
-sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/HunyuanVideo'))
 
 import safetensors
 import numpy as np
@@ -23,7 +21,6 @@ from hyvideo.vae import load_vae
 from hyvideo.constants import PRECISION_TO_TYPE, PROMPT_TEMPLATE
 from hyvideo.text_encoder import TextEncoder
 from hyvideo.modules.attenion import get_cu_seqlens
-from hyvideo.modules.posemb_layers import get_nd_rotary_pos_embed
 from hyvideo.diffusion.schedulers import FlowMatchDiscreteScheduler
 from hyvideo.diffusion.pipelines import HunyuanVideoPipeline as OriginalHunyuanVideoPipeline
 from hyvideo.vae.autoencoder_kl_causal_3d import AutoencoderKLCausal3D
@@ -32,7 +29,6 @@ from .hy_framepack_transformer_blocks import HunyuanVideoTransformer3DModelPacke
 # Framepack
 from transformers import SiglipImageProcessor, SiglipVisionModel
 import einops
-import gc
 
 # In diffusion-pipe, we already converted the dtype to an object. But Hunyuan scripts want the string version in a lot of places.
 TYPE_TO_PRECISION = {v: k for k, v in PRECISION_TO_TYPE.items()}
@@ -120,28 +116,6 @@ def load_state_dict(args, pretrained_model_path):
     return state_dict
 
 
-def _convert_state_dict_keys(model_state_dict, loaded_state_dict):
-    if next(iter(loaded_state_dict.keys())).startswith('model.model.'):
-        # ComfyUI state_dict format.
-        # Construct the key mapping the same way ComfyUI does, then invert it at the very end.
-        sd = {}
-        for k in list(model_state_dict.keys()):
-            key_out = k
-            key_out = key_out.replace("txt_in.t_embedder.mlp.0.", "txt_in.t_embedder.in_layer.").replace("txt_in.t_embedder.mlp.2.", "txt_in.t_embedder.out_layer.")
-            key_out = key_out.replace("txt_in.c_embedder.linear_1.", "txt_in.c_embedder.in_layer.").replace("txt_in.c_embedder.linear_2.", "txt_in.c_embedder.out_layer.")
-            key_out = key_out.replace("_mod.linear.", "_mod.lin.").replace("_attn_qkv.", "_attn.qkv.")
-            key_out = key_out.replace("mlp.fc1.", "mlp.0.").replace("mlp.fc2.", "mlp.2.")
-            key_out = key_out.replace("_attn_q_norm.weight", "_attn.norm.query_norm.scale").replace("_attn_k_norm.weight", "_attn.norm.key_norm.scale")
-            key_out = key_out.replace(".q_norm.weight", ".norm.query_norm.scale").replace(".k_norm.weight", ".norm.key_norm.scale")
-            key_out = key_out.replace("_attn_proj.", "_attn.proj.")
-            key_out = key_out.replace(".modulation.linear.", ".modulation.lin.")
-            key_out = key_out.replace("_in.mlp.2.", "_in.out_layer.").replace("_in.mlp.0.", "_in.in_layer.")
-            key_out = 'model.model.' + key_out
-            sd[k] = loaded_state_dict[key_out]
-        return sd
-    else:
-        return loaded_state_dict
-
 def vae_encode(tensor, vae):
     # tensor values already in range [-1, 1] here
     latents = vae.encode(tensor).latent_dist.sample()
@@ -150,7 +124,7 @@ def vae_encode(tensor, vae):
 
 # Warning: starting the conversion to full framepack
 class HunyuanVideoPipeline(BasePipeline):
-    name = 'hunyuan-video'
+    name = 'framepack-hv'
     framerate = 30
     checkpointable_layers = ['DoubleBlock', 'SingleBlock']
     adapter_target_modules = ['HunyuanVideoTransformerBlock', 'HunyuanVideoSingleTransformerBlock']
@@ -260,10 +234,8 @@ class HunyuanVideoPipeline(BasePipeline):
             args=args,
         )
 
-        self.framepack = config['model'].get('framepack', False)
-        self.framepack_window_size = config['model'].get('framepack_window_size', 30)
+        self.latent_window_size = config['model'].get('latent_window_size', 9)
 
-        assert self.framepack
         print("Loading framepack specific modules")
         siglip_path = config['model'].get('siglip_path', "lllyasviel/flux_redux_bfl")
         self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained(siglip_path, subfolder='feature_extractor')
@@ -273,34 +245,19 @@ class HunyuanVideoPipeline(BasePipeline):
     # delay loading transformer to save RAM
     def load_diffusion_model(self):
         transformer_dtype = self.model_config.get('transformer_dtype', self.model_config['dtype'])
-        # Device needs to be cuda here or we get an error. We initialize the model with empty weights so it doesn't matter, and
-        # then directly load the weights onto CPU right after.
-        factor_kwargs = {"device": 'cuda', "dtype": transformer_dtype}
-        in_channels = self.args.latent_channels
-        out_channels = self.args.latent_channels
         with init_empty_weights():
-            if self.framepack:
-                # default config from kijai
-                cfg = {"_class_name": "HunyuanVideoTransformer3DModelPacked", "_diffusers_version": "0.33.0.dev0", "_name_or_path": "hunyuanvideo-community/HunyuanVideo",
-                        "attention_head_dim": 128, "guidance_embeds": True, "has_clean_x_embedder": True, "has_image_proj": True, "image_proj_dim": 1152, "in_channels": 16,
-                        "mlp_ratio": 4.0, "num_attention_heads": 24, "num_layers": 20, "num_refiner_layers": 2, "num_single_layers": 40, "out_channels": 16,
-                        "patch_size": 2, "patch_size_t": 1, "pooled_projection_dim": 768, "qk_norm": "rms_norm",
-                        "rope_axes_dim": [16, 56, 56], "rope_theta": 256.0, "text_embed_dim": 4096 }
-                transformer = HunyuanVideoTransformer3DModelPacked(**cfg)
-            else:
-                transformer = load_model(
-                    self.args,
-                    in_channels=in_channels,
-                    out_channels=out_channels,
-                    factor_kwargs=factor_kwargs,
-                )
-        if transformer_path := self.model_config.get('transformer_path', None):
-            state_dict = load_safetensors(transformer_path)
-            state_dict = _convert_state_dict_keys(transformer.state_dict(), state_dict)
-        else:
-            state_dict = load_state_dict(self.args, self.args.model_base)
-        params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
-        params_to_keep.update("embedder", "time_text_embed", "context_embedder", "x_embedder") # framepack
+            # default config from kijai
+            cfg = {"_class_name": "HunyuanVideoTransformer3DModelPacked", "_diffusers_version": "0.33.0.dev0", "_name_or_path": "hunyuanvideo-community/HunyuanVideo",
+                    "attention_head_dim": 128, "guidance_embeds": True, "has_clean_x_embedder": True, "has_image_proj": True, "image_proj_dim": 1152, "in_channels": 16,
+                    "mlp_ratio": 4.0, "num_attention_heads": 24, "num_layers": 20, "num_refiner_layers": 2, "num_single_layers": 40, "out_channels": 16,
+                    "patch_size": 2, "patch_size_t": 1, "pooled_projection_dim": 768, "qk_norm": "rms_norm",
+                    "rope_axes_dim": [16, 56, 56], "rope_theta": 256.0, "text_embed_dim": 4096 }
+            transformer = HunyuanVideoTransformer3DModelPacked(**cfg)
+
+        transformer_path = self.model_config['transformer_path']
+        state_dict = load_safetensors(transformer_path)
+
+        params_to_keep = {"norm", "bias", "embedder", "time_text_embed", "context_embedder", "x_embedder"}
         base_dtype = self.model_config['dtype']
 
         for name, param in transformer.named_parameters():
@@ -315,7 +272,7 @@ class HunyuanVideoPipeline(BasePipeline):
             p.original_name = name
 
     def __getattr__(self, name):
-        if name == "vae" and self.framepack:
+        if name == "vae":
             return self.vae_and_clip
         else:
             return getattr(self.diffusers_pipeline, name)
@@ -352,8 +309,7 @@ class HunyuanVideoPipeline(BasePipeline):
         total_frames = latents.shape[2]
         ret = {}
 
-        assert (self.framepack_window_size + 3) % 4 == 0
-        num_frames_framepack = (self.framepack_window_size + 3) // 4
+        num_frames_framepack = self.latent_window_size
 
         # fp_compression_hardcode = 1 + 2 + 16 = 19
         assert total_frames > num_frames_framepack + 19 # with the compressible part
@@ -393,16 +349,12 @@ class HunyuanVideoPipeline(BasePipeline):
         def fn(tensor):
             ret = {}
 
-            if self.framepack:
-                vae = vae_and_clip.vae
-                image_encoder = vae_and_clip.clip
+            vae = vae_and_clip.vae
+            image_encoder = vae_and_clip.clip
 
-                image_encoder_output = hf_clip_vision_encode((tensor[:, :, 0, ...].clone().squeeze(0).permute(1, 2, 0).numpy()*255.).astype(np.uint8), self.siglip_feature_extractor, image_encoder)
-                ret['image_encoder_output'] = image_encoder_output.last_hidden_state.to(image_encoder.device, image_encoder.dtype)
-                ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
-            else:
-                vae = vae_and_clip
-                ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
+            image_encoder_output = hf_clip_vision_encode((tensor[:, :, 0, ...].clone().squeeze(0).permute(1, 2, 0).numpy()*255.).astype(np.uint8), self.siglip_feature_extractor, image_encoder)
+            ret['image_encoder_output'] = image_encoder_output.last_hidden_state.to(image_encoder.device, image_encoder.dtype)
+            ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
             return ret
         return fn
 
@@ -461,7 +413,6 @@ class HunyuanVideoPipeline(BasePipeline):
         mask = inputs['mask']
         image_embeddings = inputs['image_encoder_output']
 
-        assert self.framepack
         rtf = self.random_timecrop_framepack(latents)
         latents = rtf['latents']
 
