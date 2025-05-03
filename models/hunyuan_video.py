@@ -2,6 +2,7 @@ from pathlib import Path
 import argparse
 import json
 import os.path
+import random
 
 import safetensors
 import numpy as np
@@ -234,10 +235,11 @@ class HunyuanVideoPipeline(BasePipeline):
             args=args,
         )
 
-        self.latent_window_size = config['model'].get('latent_window_size', 9)
+        self.latent_window_size = self.model_config.get('latent_window_size', 9)
+        self.t2v = self.model_config.get('t2v', False)
 
         print("Loading framepack specific modules")
-        siglip_path = config['model'].get('siglip_path', "lllyasviel/flux_redux_bfl")
+        siglip_path = self.model_config.get('siglip_path', "lllyasviel/flux_redux_bfl")
         self.siglip_feature_extractor = SiglipImageProcessor.from_pretrained(siglip_path, subfolder='feature_extractor')
         image_encoder = SiglipVisionModel.from_pretrained(siglip_path, subfolder='image_encoder', torch_dtype=dtype).eval()
         self.vae_and_clip = VaeAndClip(vae, image_encoder).eval()
@@ -257,11 +259,11 @@ class HunyuanVideoPipeline(BasePipeline):
         transformer_path = self.model_config['transformer_path']
         state_dict = load_safetensors(transformer_path)
 
-        params_to_keep = {"norm", "bias", "embedder", "time_text_embed", "context_embedder", "x_embedder"}
+        params_to_keep = {"norm", "bias", "time_text_embed", "context_embedder", "x_embedder", "clean_x_embedder", "image_projection"}
         base_dtype = self.model_config['dtype']
 
         for name, param in transformer.named_parameters():
-            dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else transformer_dtype
+            dtype_to_use = base_dtype if (any(keyword in name for keyword in params_to_keep) or name.startswith('proj_out')) else transformer_dtype
             set_module_tensor_to_device(transformer, name, device='cpu', dtype=dtype_to_use, value=state_dict[name])
 
         self.diffusers_pipeline.transformer = transformer
@@ -285,9 +287,8 @@ class HunyuanVideoPipeline(BasePipeline):
 
     def save_adapter(self, save_dir, peft_state_dict):
         self.peft_config.save_pretrained(save_dir)
-        # Diffusers LoRA convention.
-        # if not self.frameppack:
-        #     peft_state_dict = {'transformer.'+k: v for k, v in peft_state_dict.items()}
+        # Diffusers format (maybe, works with Kijai ComfyUI wrapper).
+        peft_state_dict = {'transformer.'+k: v for k, v in peft_state_dict.items()}
         safetensors.torch.save_file(peft_state_dict, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
 
     def save_model(self, save_dir, diffusers_sd):
@@ -306,44 +307,77 @@ class HunyuanVideoPipeline(BasePipeline):
     # this function should be called dynamically and not preloaded
     # to have greater variety on small datasets
     def random_timecrop_framepack(self, latents):
-        total_frames = latents.shape[2]
-        ret = {}
+        bs, c, f, h, w = latents.shape
+        required_frame_length = self.latent_window_size if self.t2v else self.latent_window_size+1
+        assert f == 1 or f >= required_frame_length
 
-        num_frames_framepack = self.latent_window_size
-
-        # fp_compression_hardcode = 1 + 2 + 16 = 19
-        assert total_frames > num_frames_framepack + 19 # with the compressible part
-        shift = np.random.randint(1, total_frames - num_frames_framepack)
-
-        # train on stage 1 (full last section ctx)
-        if shift > total_frames - num_frames_framepack - 19:
-            fragment = latents[:, :, -num_frames_framepack:, ...]
-            ret['latents'] = fragment
+        if self.t2v or f == 1:
+            first_frame = torch.zeros([bs, c, 0, h, w], device=latents.device)
         else:
-            # train on the stages with compression
-            fragment = latents[:, :, shift:shift+num_frames_framepack, ...]
             first_frame = latents[:, :, 0:1, :, :]
-            the_rest = latents[:, :, shift+num_frames_framepack:, ...]
-            # The line above is from the sampler. Does it mean we are adding only 1+19 latent frames to compressed context instead of the whole video, or I'm missing something? --kabachuha
-            clean_latents_post, clean_latents_2x, clean_latents_4x = the_rest[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
-            clean_latents = torch.cat([first_frame, clean_latents_post], dim=2)
+            latents = latents[:, :, 1:, :, :]
+        first_frame_size = first_frame.size(2)
 
-            ret['latents'] = fragment
-            ret['clean_latents'] = clean_latents
-            ret['clean_latents_2x'] = clean_latents_2x
-            ret['clean_latents_4x'] = clean_latents_4x
+        latent_window_size = 1 if f == 1 else self.latent_window_size
 
-            # getting the frame indices
-            indices = torch.arange(0, sum([1, shift, num_frames_framepack, 1, 2, 16])).unsqueeze(0)
-            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, shift, num_frames_framepack, 1, 2, 16], dim=1)
+        if f == 1:
+            # This is technically wrong. The model seems to have been trained always with clean_latents, even if they are 0s. Doing it like this,
+            # the validation loss starts a bit higher, but then quickly drops to the same value. And it's 2 times faster and uses a bit less
+            # memory. So just always do it like this for images.
+            return {'latents': latents}
+
+        f = latents.size(2)
+        total_latent_sections = f // latent_window_size
+        latent_paddings = [0, 1] + [2] * (total_latent_sections - 3) + [3]
+        latents = latents[:, :, :total_latent_sections*latent_window_size, :, :]
+        latents = F.pad(latents, (0, 0, 0, 0, 0, 19))
+
+        fragment_list = []
+        clean_latents_list = []
+        clean_latents_2x_list = []
+        clean_latents_4x_list = []
+        latent_indices_list = []
+        clean_latent_indices_list = []
+        clean_latent_2x_indices_list = []
+        clean_latent_4x_indices_list = []
+
+        for single_latents, single_first_frame in zip(latents, first_frame):
+            # add batch dimension back
+            single_latents = single_latents.unsqueeze(0)
+            single_first_frame = single_first_frame.unsqueeze(0)
+
+            chosen_segment = random.randrange(0, total_latent_sections)
+            offset = chosen_segment*latent_window_size
+            print(f'latents slice: {offset}:{offset+latent_window_size+19}')
+            latent_slice = single_latents[:, :, offset:offset+latent_window_size+19, :, :]
+            fragment, clean_latents_post, clean_latents_2x, clean_latents_4x = latent_slice.split([latent_window_size, 1, 2, 16], dim=2)
+
+            latent_padding_size = latent_paddings[chosen_segment] * latent_window_size
+            indices = torch.arange(0, sum([first_frame_size, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([first_frame_size, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+            clean_latents = torch.cat([single_first_frame, clean_latents_post], dim=2)
 
-            ret['latent_indices'] = latent_indices
-            ret['clean_latent_indices'] = clean_latent_indices
-            ret['clean_latent_2x_indices'] = clean_latent_2x_indices
-            ret['clean_latent_4x_indices'] = clean_latent_4x_indices
+            fragment_list.append(fragment)
+            clean_latents_list.append(clean_latents)
+            clean_latents_2x_list.append(clean_latents_2x)
+            clean_latents_4x_list.append(clean_latents_4x)
+            latent_indices_list.append(latent_indices)
+            clean_latent_indices_list.append(clean_latent_indices)
+            clean_latent_2x_indices_list.append(clean_latent_2x_indices)
+            clean_latent_4x_indices_list.append(clean_latent_4x_indices)
 
-        return ret
+        return {
+            'latents': torch.cat(fragment_list),
+            'clean_latents': torch.cat(clean_latents_list),
+            'clean_latents_2x': torch.cat(clean_latents_2x_list),
+            'clean_latents_4x': torch.cat(clean_latents_4x_list),
+            'latent_indices': torch.cat(latent_indices_list),
+            'clean_latent_indices': torch.cat(clean_latent_indices_list),
+            'clean_latent_2x_indices': torch.cat(clean_latent_2x_indices_list),
+            'clean_latent_4x_indices': torch.cat(clean_latent_4x_indices_list),
+        }
+
 
     def get_call_vae_fn(self, vae_and_clip):
         def fn(tensor):
@@ -416,16 +450,18 @@ class HunyuanVideoPipeline(BasePipeline):
         rtf = self.random_timecrop_framepack(latents)
         latents = rtf['latents']
 
+        bs, channels, num_frames, h, w = latents.shape
+
         if 'clean_latents' not in rtf:
             # dummy clean latents for microbatch splitting
-            clean_latents = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
-            clean_latents_2x = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
-            clean_latents_4x = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
+            clean_latents = torch.zeros((bs,), device=latents.device, dtype=latents.dtype)
+            clean_latents_2x = torch.zeros((bs,), device=latents.device, dtype=latents.dtype)
+            clean_latents_4x = torch.zeros((bs,), device=latents.device, dtype=latents.dtype)
 
-            latent_indices = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
-            clean_latent_indices = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
-            clean_latent_2x_indices = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
-            clean_latent_4x_indices = torch.zeros((latents.shape[0],), device=latents.device, dtype=latents.dtype)
+            latent_indices = torch.zeros((bs,), device=latents.device, dtype=latents.dtype)
+            clean_latent_indices = torch.zeros((bs,), device=latents.device, dtype=latents.dtype)
+            clean_latent_2x_indices = torch.zeros((bs,), device=latents.device, dtype=latents.dtype)
+            clean_latent_4x_indices = torch.zeros((bs,), device=latents.device, dtype=latents.dtype)
         else:
             clean_latents = rtf['clean_latents']
             clean_latents_2x = rtf['clean_latents_2x']
@@ -436,7 +472,8 @@ class HunyuanVideoPipeline(BasePipeline):
             clean_latent_2x_indices = rtf['clean_latent_2x_indices']
             clean_latent_4x_indices = rtf['clean_latent_4x_indices']
 
-        bs, channels, num_frames, h, w = latents.shape
+        if self.t2v or num_frames == 1:
+            image_embeddings = torch.zeros((bs,), device=image_embeddings.device)
 
         if mask is not None:
             mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
@@ -658,13 +695,14 @@ class InitialLayer(nn.Module):
         encoder_hidden_states = self.context_embedder(encoder_hidden_states, timestep, encoder_attention_mask)
 
         assert self.image_projection is not None
-        assert image_embeddings is not None, 'You must use image embeddings!'
-        extra_encoder_hidden_states = self.image_projection(image_embeddings)
-        extra_attention_mask = torch.ones((batch_size, extra_encoder_hidden_states.shape[1]), dtype=encoder_attention_mask.dtype, device=encoder_attention_mask.device)
+        # Dim 1 means we should not use image embedding (t2v or image training).
+        if image_embeddings.ndim > 1:
+            extra_encoder_hidden_states = self.image_projection(image_embeddings)
+            extra_attention_mask = torch.ones((batch_size, extra_encoder_hidden_states.shape[1]), dtype=encoder_attention_mask.dtype, device=encoder_attention_mask.device)
 
-        # must cat before (not after) encoder_hidden_states, due to attn masking
-        encoder_hidden_states = torch.cat([extra_encoder_hidden_states, encoder_hidden_states], dim=1)
-        encoder_attention_mask = torch.cat([extra_attention_mask, encoder_attention_mask], dim=1)
+            # must cat before (not after) encoder_hidden_states, due to attn masking
+            encoder_hidden_states = torch.cat([extra_encoder_hidden_states, encoder_hidden_states], dim=1)
+            encoder_attention_mask = torch.cat([extra_attention_mask, encoder_attention_mask], dim=1)
 
         with torch.no_grad():
             # Mask getting from off Framepack, with all its flaws
