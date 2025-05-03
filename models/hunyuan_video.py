@@ -385,7 +385,9 @@ class HunyuanVideoPipeline(BasePipeline):
             vae = vae_and_clip.vae
             image_encoder = vae_and_clip.clip
 
-            image_encoder_output = hf_clip_vision_encode((tensor[:, :, 0, ...].clone().squeeze(0).permute(1, 2, 0).numpy()*255.).astype(np.uint8), self.siglip_feature_extractor, image_encoder)
+            first_frame = tensor[:, :, 0, ...].clone().squeeze(0).permute(1, 2, 0)
+            first_frame_0_1 = ((first_frame+1)/2).clamp(0, 1)
+            image_encoder_output = hf_clip_vision_encode((first_frame_0_1.numpy()*255.).astype(np.uint8), self.siglip_feature_extractor, image_encoder)
             ret['image_encoder_output'] = image_encoder_output.last_hidden_state.to(image_encoder.device, image_encoder.dtype)
             ret['latents'] = vae_encode(tensor.to(vae.device, vae.dtype), vae)
             return ret
