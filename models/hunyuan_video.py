@@ -348,7 +348,6 @@ class HunyuanVideoPipeline(BasePipeline):
 
             chosen_segment = random.randrange(0, total_latent_sections)
             offset = chosen_segment*latent_window_size
-            print(f'latents slice: {offset}:{offset+latent_window_size+19}')
             latent_slice = single_latents[:, :, offset:offset+latent_window_size+19, :, :]
             fragment, clean_latents_post, clean_latents_2x, clean_latents_4x = latent_slice.split([latent_window_size, 1, 2, 16], dim=2)
 
