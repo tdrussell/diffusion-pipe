@@ -237,6 +237,7 @@ class HunyuanVideoPipeline(BasePipeline):
 
         self.latent_window_size = self.model_config.get('latent_window_size', 9)
         self.t2v = self.model_config.get('t2v', False)
+        self.f1 = self.model_config.get('f1', False)
 
         print("Loading framepack specific modules")
         siglip_path = self.model_config.get('siglip_path', "lllyasviel/flux_redux_bfl")
@@ -349,13 +350,22 @@ class HunyuanVideoPipeline(BasePipeline):
             chosen_segment = random.randrange(0, total_latent_sections)
             offset = chosen_segment*latent_window_size
             latent_slice = single_latents[:, :, offset:offset+latent_window_size+19, :, :]
-            fragment, clean_latents_post, clean_latents_2x, clean_latents_4x = latent_slice.split([latent_window_size, 1, 2, 16], dim=2)
+            
+            if self.f1:
+                clean_latents_4x, clean_latents_2x, clean_latents_1x, fragment = latent_slice.split([16, 2, 1, latent_window_size], dim=2)
+                
+                indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
+                clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
+                clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
+                clean_latents = torch.cat([single_first_frame, clean_latents_1x], dim=2)
+            else:
+                fragment, clean_latents_post, clean_latents_2x, clean_latents_4x = latent_slice.split([latent_window_size, 1, 2, 16], dim=2)
 
-            latent_padding_size = latent_paddings[chosen_segment] * latent_window_size
-            indices = torch.arange(0, sum([first_frame_size, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([first_frame_size, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
-            clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
-            clean_latents = torch.cat([single_first_frame, clean_latents_post], dim=2)
+                latent_padding_size = latent_paddings[chosen_segment] * latent_window_size
+                indices = torch.arange(0, sum([first_frame_size, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
+                clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([first_frame_size, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
+                clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
+                clean_latents = torch.cat([single_first_frame, clean_latents_post], dim=2)
 
             fragment_list.append(fragment)
             clean_latents_list.append(clean_latents)
