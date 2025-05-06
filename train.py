@@ -303,8 +303,8 @@ if __name__ == '__main__':
         from models import hidream
         model = hidream.HiDreamPipeline(config)
     elif model_type == 'framepack-hv':
-        from models import hunyuan_video
-        model = hunyuan_video.HunyuanVideoPipeline(config)
+        from models import hy_framepack
+        model = hy_framepack.HYFramepackPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
