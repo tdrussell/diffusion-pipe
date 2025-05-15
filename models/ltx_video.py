@@ -3,6 +3,7 @@ import os.path
 import sys
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/LTX_Video'))
 
+import random
 import safetensors
 import torch
 from torch import nn
@@ -166,6 +167,22 @@ class LTXVideoPipeline(BasePipeline):
         x_1 = latents
         x_0 = torch.randn_like(x_1)
         t_expanded = t.view(-1, 1, 1)
+
+        # Copied and modified from https://github.com/Lightricks/LTX-Video-Trainer/blob/main/src/ltxv_trainer/trainer.py
+        if mask is None:
+            mask = torch.ones_like(x_1)
+        first_frame_conditioning_p = self.model_config.get('first_frame_conditioning_p', 0)
+        # If first frame conditioning is enabled, the first latent (first video frame) is left (almost) unchanged.
+        if first_frame_conditioning_p and random.random() < first_frame_conditioning_p:
+            t_expanded = t_expanded.repeat(1, x_1.shape[1], 1)
+            first_frame_end_idx = height * width
+
+            # if we only have one frame (e.g. when training on still images),
+            # skip this step otherwise we have no target to train on.
+            if first_frame_end_idx < x_1.shape[1]:
+                t_expanded[:, :first_frame_end_idx] = 1e-5  # Small sigma close to 0 for the first frame.
+                mask[:, :first_frame_end_idx] = 0.0  # Mask out the loss for the first frame.
+
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
         target = x_0 - x_1
 
@@ -181,6 +198,23 @@ class LTXVideoPipeline(BasePipeline):
             layers.append(TransformerLayer(block))
         layers.append(OutputLayer(transformer))
         return layers
+
+    def get_loss_fn(self):
+        def loss_fn(output, label):
+            target, mask = label
+            with torch.autocast('cuda', enabled=False):
+                output = output.to(torch.float32)
+                target = target.to(output.device, torch.float32)
+                loss = F.mse_loss(output, target, reduction='none')
+                # empty tensor means no masking
+                if mask.numel() > 0:
+                    mask = mask.to(output.device, torch.float32)
+                    # Copied and modified from https://github.com/Lightricks/LTX-Video-Trainer/blob/main/src/ltxv_trainer/trainer.py
+                    loss = loss.mul(mask).div(mask.mean())   # divide by mean to keep the loss scale unchanged.
+                loss = loss.mean()
+            return loss
+        return loss_fn
+
 
 
 class InitialLayer(nn.Module):
