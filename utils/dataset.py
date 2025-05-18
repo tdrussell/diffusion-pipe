@@ -32,6 +32,17 @@ def shuffle_with_seed(l, seed=None):
     random.setstate(rng_state)
 
 
+def shuffle_captions(caption: str, count: int = 0, delimiter: str = ", ") -> list[str]:
+    if count == 0: return [caption]
+
+    def shuffle_caption(caption: str, delimiter: str = ", ") -> str:
+        split = caption.split(delimiter)
+        random.shuffle(split)
+        return delimiter.join(split)
+
+    return [shuffle_caption(caption, delimiter) for _ in range(count)]
+
+
 def process_caption_fn(shuffle_tags=False, caption_prefix=''):
     def fn(example):
         with open(example['caption_file']) as f:
@@ -270,6 +281,8 @@ class DirectoryDataset:
             self.resolutions = self._process_user_provided_resolutions(
                 directory_config.get('resolutions', dataset_config['resolutions'])
             )
+        self.shuffle = directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0))
+        self.shuffle_delimiter = directory_config.get('cache_shuffle_delimiter', dataset_config.get('cache_shuffle_delimiter', ", "))
         self.path = Path(self.directory_config['path'])
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
         # For testing. Default if a mask is missing.
@@ -423,7 +436,7 @@ class DirectoryDataset:
                     assert isinstance(captions, list), 'captions.json must contain lists of captions'
             if captions is None and caption_file:
                 with open(caption_file) as f:
-                    captions = [f.read().strip()]
+                    captions = shuffle_captions(f.read().strip(), self.shuffle, self.shuffle_delimiter)
             if captions is None:
                 captions = ['']
                 logger.warning(f'Cound not find caption for {image_file}. Using empty caption.')
