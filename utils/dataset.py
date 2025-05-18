@@ -442,7 +442,7 @@ class DirectoryDataset:
                 logger.warning(f'Cound not find caption for {image_file}. Using empty caption.')
             if self.directory_config['shuffle_tags'] and self.shuffle == 0: # backwards compatibility
                 self.shuffle = 1
-            captions = shuffle_captions(captions, self.shuffle, self.shuffle_delimiter)
+            captions = shuffle_captions(captions, self.shuffle, self.shuffle_delimiter, self.directory_config['caption_prefix'])
             empty_return = {'image_file': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
 
             image_file = Path(image_file)
