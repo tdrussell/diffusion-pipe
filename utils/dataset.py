@@ -32,15 +32,15 @@ def shuffle_with_seed(l, seed=None):
     random.setstate(rng_state)
 
 
-def shuffle_captions(caption: str, count: int = 0, delimiter: str = ", ") -> list[str]:
-    if count == 0: return [caption]
+def shuffle_captions(captions: list[str], count: int = 0, delimiter: str = ', ', caption_prefix: str = '') -> list[str]:
+    if count == 0: return captions
 
     def shuffle_caption(caption: str, delimiter: str = ", ") -> str:
         split = caption.split(delimiter)
         random.shuffle(split)
         return delimiter.join(split)
 
-    return [shuffle_caption(caption, delimiter) for _ in range(count)]
+    return [caption_prefix + shuffle_caption(caption, delimiter) for _ in range(count) for caption in captions]
 
 
 def process_caption_fn(shuffle_tags=False, caption_prefix=''):
@@ -436,17 +436,13 @@ class DirectoryDataset:
                     assert isinstance(captions, list), 'captions.json must contain lists of captions'
             if captions is None and caption_file:
                 with open(caption_file) as f:
-                    captions = shuffle_captions(f.read().strip(), self.shuffle, self.shuffle_delimiter)
+                    captions = [f.read().strip()]
             if captions is None:
                 captions = ['']
                 logger.warning(f'Cound not find caption for {image_file}. Using empty caption.')
-            for i, caption in enumerate(captions):
-                if self.directory_config['shuffle_tags']:
-                    tags = [tag.strip() for tag in caption.split(',')]
-                    random.shuffle(tags)
-                    caption = ', '.join(tags)
-                caption = self.directory_config['caption_prefix'] + caption
-                captions[i] = caption
+            if self.directory_config['shuffle_tags'] and self.shuffle == 0: # backwards compatibility
+                self.shuffle = 1
+            captions = shuffle_captions(captions, self.shuffle, self.shuffle_delimiter)
             empty_return = {'image_file': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
 
             image_file = Path(image_file)
