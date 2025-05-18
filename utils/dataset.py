@@ -129,6 +129,7 @@ class SizeBucketDataset:
         os.makedirs(self.cache_dir, exist_ok=True)
         self.text_embedding_datasets = []
         self.num_repeats = self.directory_config['num_repeats']
+        self.shuffle_skip = max(directory_config.get('cache_shuffle_num', 0), 1) # Should be provided in DirectoryDataset
         if self.num_repeats <= 0:
             raise ValueError(f'num_repeats must be >0, was {self.num_repeats}')
 
@@ -145,7 +146,8 @@ class SizeBucketDataset:
         iteration_order = []
         for example in self.latent_dataset.select_columns(['image_file', 'caption']):
             image_file = example['image_file']
-            for i, caption in enumerate(example['caption']):
+            captions = example['caption']
+            for i, caption in enumerate([captions[i:i + self.shuffle_skip] for i in range(0, len(captions), self.shuffle_skip)]):
                 iteration_order.append((image_file, caption, i))
         # Shuffle again, since one media file can produce multiple training examples. E.g. video, or maybe
         # in the future data augmentation. Don't need to shuffle text embeddings since those are looked
@@ -173,7 +175,8 @@ class SizeBucketDataset:
         if DEBUG:
             print(Path(image_file).stem)
         for ds in self.text_embedding_datasets:
-            ret.update(ds.get_text_embeddings(image_file, caption_number))
+            offset = random.randrange(self.shuffle_skip)
+            ret.update(ds.get_text_embeddings(image_file, (caption_number*self.shuffle_skip) + offset))
         ret['caption'] = caption
         return ret
 
@@ -282,6 +285,7 @@ class DirectoryDataset:
                 directory_config.get('resolutions', dataset_config['resolutions'])
             )
         self.shuffle = directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0))
+        self.directory_config['cache_shuffle_num'] = self.shuffle # Make accessible if it wasn't yet, for picking one out
         self.shuffle_delimiter = directory_config.get('cache_shuffle_delimiter', dataset_config.get('cache_shuffle_delimiter', ", "))
         self.path = Path(self.directory_config['path'])
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
