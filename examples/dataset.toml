@@ -37,6 +37,11 @@ frame_buckets = [1, 33]
 # If you have >24GB VRAM, or multiple GPUs and use pipeline parallelism, or lower the spatial resolution, you could maybe train with longer frame buckets
 # frame_buckets = [1, 33, 65, 97]
 
+# Shuffle tags before caching, 0 to keep original caption. Increases caching time a little bit, does not affect training time.
+# cache_shuffle_num = 10
+# Delimiter for tags, only used if cache_shuffle_num is not 0. Defaults to ", ".
+# "tag1, tag2, tag3" has ", " as delimiter and will possibly be shuffled like "tag3, tag1, tag2". "tag1;tag2;tag3" has ";" as delimiter and will possibly be shuffled like "tag2;tag1;tag3".
+# cache_shuffle_delimiter = ", "
 
 [[directory]]
 # Path to directory of images/videos, and corresponding caption files. The caption files should match the media file name, but with a .txt extension.
