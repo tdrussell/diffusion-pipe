@@ -1,6 +1,6 @@
 deepspeed
 toml
-transformers
+transformers==4.51.3
 diffusers>=0.32.1
 datasets
 pillow
