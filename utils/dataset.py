@@ -40,7 +40,7 @@ def shuffle_captions(captions: list[str], count: int = 0, delimiter: str = ', ',
         random.shuffle(split)
         return delimiter.join(split)
 
-    return [caption_prefix + shuffle_caption(caption, delimiter) for _ in range(count) for caption in captions]
+    return [caption_prefix + shuffle_caption(caption, delimiter) for caption in captions for _ in range(count)]
 
 
 def process_caption_fn(shuffle_tags=False, caption_prefix=''):
