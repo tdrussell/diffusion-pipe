@@ -67,6 +67,8 @@ dtype = 'bfloat16'
 # Can load the transformer in fp8.
 #transformer_dtype = 'float8'
 timestep_sample_method = 'logit_normal'
+# Probability to use the first video frame as conditioning (i.e. i2v training).
+#first_frame_conditioning_p = 1.0
 ```
 You can train the more recent LTX-Video versions by using single_file_path. Note that you will still need to set diffusers_path to the original model folder (it gets the text encoder from here). Only t2i and t2v training is supported.
 
