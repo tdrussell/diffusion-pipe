@@ -174,10 +174,11 @@ class SizeBucketDataset:
         ret = self.latent_dataset[self.image_file_to_latents_idx[image_file]]
         if DEBUG:
             print(Path(image_file).stem)
+        offset = random.randrange(self.shuffle_skip)
+        caption_idx = (caption_number*self.shuffle_skip) + offset
         for ds in self.text_embedding_datasets:
-            offset = random.randrange(self.shuffle_skip)
-            ret.update(ds.get_text_embeddings(image_file, (caption_number*self.shuffle_skip) + offset))
-        ret['caption'] = caption
+            ret.update(ds.get_text_embeddings(image_file, caption_idx))
+        ret['caption'] = caption[caption_idx]
         return ret
 
     def __len__(self):
