@@ -524,13 +524,14 @@ class WanPipeline(BasePipeline):
                 assert tensor.ndim == 5, f'i2v/flf2v must train on videos, got tensor with shape {tensor.shape}'
                 first_frame = tensor[:, :, 0:1, ...].clone()
                 clip_context = self.clip.visual(first_frame.to(p.device, p.dtype))
-                tensor[:, :, 1:, ...] = 0
 
                 if self.flf2v:
-                    last_frame = tensor[:, :, -2:-1, ...].clone()
+                    last_frame = tensor[:, :, -1:, ...].clone()
                     # NOTE: dim=1 is a hack to pass clip_context without microbatching breaking the zeroth dim
                     clip_context = torch.cat([clip_context, self.clip.visual(last_frame.to(p.device, p.dtype))], dim=1)
-                    tensor[:, :, :-2, ...] = 0
+                    tensor[:, :, 1:-1, ...] = 0
+                else:
+                    tensor[:, :, 1:, ...] = 0
 
                 # Image conditioning. Same shame as latents, first frame is unchanged, rest is 0.
                 # NOTE: encoding 0s with the VAE doesn't give you 0s in the latents, I tested this. So we need to
