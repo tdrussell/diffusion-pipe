@@ -465,7 +465,7 @@ if __name__ == '__main__':
 
     # WandB logging
     wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)
-    if wandb_enable:
+    if wandb_enable and is_main_process():
         wandb_api_key     = config['monitoring']['wandb_api_key']
         wandb_tracker     = config['monitoring']['wandb_tracker_name']
         wandb_run_name    = config['monitoring']['wandb_run_name']
