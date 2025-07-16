@@ -374,7 +374,7 @@ class DirectoryDataset:
         for grouping_key in unique_grouping_keys:
             grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(grouping_key)}'
             print(f'Loading grouped metadata with grouping key {grouping_key}')
-            metadata = datasets.load_from_disk(grouped_cache_dir)
+            metadata = datasets.load_from_disk(str(grouped_cache_dir))
             if self.use_size_buckets:
                 assert len(grouping_key) == 3
                 self.size_bucket_datasets.append(
@@ -416,12 +416,12 @@ class DirectoryDataset:
             for size_bucket, metadata in grouped_metadata.items():
                 metadata = datasets.Dataset.from_dict(metadata)
                 grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(size_bucket)}'
-                metadata.save_to_disk(grouped_cache_dir)
+                metadata.save_to_disk(str(grouped_cache_dir))
         else:
             for ar_bucket, metadata in grouped_metadata.items():
                 metadata = datasets.Dataset.from_dict(metadata)
                 grouped_cache_dir = self.cache_dir / f'metadata/grouped_metadata_{bucket_suffix(ar_bucket)}'
-                metadata.save_to_disk(grouped_cache_dir)
+                metadata.save_to_disk(str(grouped_cache_dir))
 
         with open(self.grouping_keys_json_file, 'w') as f:
             json.dump(unique_grouping_keys, f)
@@ -508,13 +508,13 @@ class DirectoryDataset:
             seed = int(hashlib.md5(str.encode(str(self.path))).hexdigest(), 16) % int(1e9)
             metadata_dataset = metadata_dataset.shuffle(seed=seed)
             print('Saving intermediate metadata dataset.')
-            metadata_dataset.save_to_disk(metadata_cache_file_1)
+            metadata_dataset.save_to_disk(str(metadata_cache_file_1))
             # Need to delete and load from disk, or else the map() call below is extremely slow to launch worker processes
             # and they use huge amounts of memory. Probably because this dataset is in memory?
             del metadata_dataset
 
         print('Loading intermediate metadata dataset.')
-        metadata_dataset = datasets.load_from_disk(metadata_cache_file_1)
+        metadata_dataset = datasets.load_from_disk(str(metadata_cache_file_1))
 
         metadata_map_fn = self._metadata_map_fn()
         print('Caching ungrouped metadata.')
