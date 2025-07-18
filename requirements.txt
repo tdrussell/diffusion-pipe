@@ -7,7 +7,7 @@ pillow
 sentencepiece
 protobuf
 peft
-torch-optimi
+torch-optimi==0.2.1
 tensorboard
 tqdm
 safetensors
