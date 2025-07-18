@@ -1,13 +1,13 @@
 deepspeed==0.17.0
 toml
-transformers
+transformers==4.51.3
 diffusers>=0.32.1
 datasets
 pillow
 sentencepiece
 protobuf
 peft
-torch-optimi
+torch-optimi==0.2.1
 tensorboard
 tqdm
 safetensors
