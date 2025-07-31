@@ -26,3 +26,4 @@ easydict
 ftfy
 pytorch-optimizer
 wandb
+optimum
