@@ -759,7 +759,7 @@ if __name__ == '__main__':
             train_dataloader.load_state_dict(client_state['custom_loader'])
         step = client_state['step'] + 1
         if 'examples' in client_state:
-            examples = client_state['examples']
+            examples = client_state['examples'] + global_batch_size
         else:
             examples = step * global_batch_size
         del client_state
