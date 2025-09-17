@@ -45,6 +45,7 @@ parser.add_argument('--local_rank', type=int, default=-1,
 parser.add_argument('--resume_from_checkpoint', nargs='?', const=True, default=None,
                     help='resume training from checkpoint. If no value is provided, resume from the most recent checkpoint. If a folder name is provided, resume from that specific folder.')
 parser.add_argument('--reset_dataloader', action='store_true', help='Start dataloader from scratch when resuming from checkpoint, i.e. only load the optimizer states.')
+parser.add_argument('--reset_optimizer', action='store_true')
 parser.add_argument('--regenerate_cache', action='store_true', help='Force regenerate cache.')
 parser.add_argument('--cache_only', action='store_true', help='Cache model inputs then exit.')
 parser.add_argument('--trust_cache', action='store_true', help='Load from metadata cache files if they exist, without checking if any fingerprints have changed. Can make loading much faster for large datasets.')
@@ -749,7 +750,8 @@ if __name__ == '__main__':
         load_path, client_state = model_engine.load_checkpoint(
             run_dir,
             load_module_strict=False,
-            load_lr_scheduler_states='force_constant_lr' not in config,
+            load_lr_scheduler_states='force_constant_lr' not in config and not args.reset_optimizer,
+            load_optimizer_states=not args.reset_optimizer,
         )
         dist.barrier()  # just so the print below doesn't get swamped
         assert load_path is not None
