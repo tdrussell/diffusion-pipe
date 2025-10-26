@@ -17,7 +17,7 @@ av
 einops
 accelerate
 loguru
-flash-attn==2.8.1
+flash-attn
 omegaconf
 iopath
 termcolor
