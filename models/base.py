@@ -33,12 +33,12 @@ def extract_clips(video, target_frames, video_clip_mode):
         start = int((frames - target_frames) / 2)
         assert frames-start >= target_frames
         return [video[:, start:start+target_frames, ...]]
-    elif video_clip_mode == 'multiple_overlapping':
-        # Extract multiple clips so we use the whole video for training.
-        # The clips might overlap a little bit. We never cut anything off the end of the video.
-        num_clips = ((frames - 1) // target_frames) + 1
-        start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
-        return [video[:, i:i+target_frames, ...] for i in start_indices]
+    # elif video_clip_mode == 'multiple_overlapping':
+    #     # Extract multiple clips so we use the whole video for training.
+    #     # The clips might overlap a little bit. We never cut anything off the end of the video.
+    #     num_clips = ((frames - 1) // target_frames) + 1
+    #     start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
+    #     return [video[:, i:i+target_frames, ...] for i in start_indices]
     else:
         raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
 
