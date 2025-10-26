@@ -1109,10 +1109,11 @@ class DatasetManager:
         # I think this is because HF Datasets uses the multiprocess library (different from Python multiprocessing!) so it will always use fork.
         cpu_results = {}
         for k, v in results.items():
+            # Cast all floats to float16 because Arrow files don't support bfloat16, so it would end up float32 on disk. Cuts size in half.
             if isinstance(v, (list, tuple)):
-                cpu_results[k] = [x.to('cpu') for x in v]
+                cpu_results[k] = [x.to('cpu', torch.float16 if torch.is_floating_point(x) else x.dtype) for x in v]
             else:
-                cpu_results[k] = v.to('cpu')
+                cpu_results[k] = v.to('cpu', torch.float16 if torch.is_floating_point(v) else v.dtype)
         pipe.send(cpu_results)
 
 
