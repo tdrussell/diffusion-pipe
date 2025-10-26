@@ -210,11 +210,13 @@ class SizeBucketDataset:
             # up by image file name.
             shuffle_with_seed(iteration_order_list, 42)
 
-            def iteration_order_gen():
-                for image_spec, latents_idx, caption, caption_number in iteration_order_list:
-                    yield {'image_spec': image_spec, 'latents_idx': latents_idx, 'caption': caption, 'caption_number': caption_number}
-
-            iteration_order = datasets.Dataset.from_generator(iteration_order_gen, keep_in_memory=True)
+            iteration_order_dict = defaultdict(list)
+            for image_spec, latents_idx, caption, caption_number in iteration_order_list:
+                iteration_order_dict['image_spec'].append(image_spec)
+                iteration_order_dict['latents_idx'].append(latents_idx)
+                iteration_order_dict['caption'].append(caption)
+                iteration_order_dict['caption_number'].append(caption_number)
+            iteration_order = datasets.Dataset.from_dict(iteration_order_dict)
             iteration_order.save_to_disk(str(iteration_order_cache_dir))
             del iteration_order
 
