@@ -1,0 +1,37 @@
+{
+  "_class_name": "AutoencoderKL",
+  "_diffusers_version": "0.30.0.dev0",
+  "_name_or_path": "/raid/.cache/huggingface/models--fal--AuraFlow/snapshots/edf69bec4c8c57f5278a655aaca3ceb60d82c0b4/vae",
+  "act_fn": "silu",
+  "block_out_channels": [
+    128,
+    256,
+    512,
+    512
+  ],
+  "down_block_types": [
+    "DownEncoderBlock2D",
+    "DownEncoderBlock2D",
+    "DownEncoderBlock2D",
+    "DownEncoderBlock2D"
+  ],
+  "force_upcast": true,
+  "in_channels": 3,
+  "latent_channels": 4,
+  "latents_mean": null,
+  "latents_std": null,
+  "layers_per_block": 2,
+  "norm_num_groups": 32,
+  "out_channels": 3,
+  "sample_size": 1024,
+  "scaling_factor": 0.13025,
+  "shift_factor": null,
+  "up_block_types": [
+    "UpDecoderBlock2D",
+    "UpDecoderBlock2D",
+    "UpDecoderBlock2D",
+    "UpDecoderBlock2D"
+  ],
+  "use_post_quant_conv": true,
+  "use_quant_conv": true
+}

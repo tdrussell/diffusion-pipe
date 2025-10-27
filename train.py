@@ -340,6 +340,9 @@ if __name__ == '__main__':
     elif model_type == 'hunyuan_image':
         from models import hunyuan_image
         model = hunyuan_image.HunyuanImagePipeline(config)
+    elif model_type == 'auraflow':
+        from models import auraflow
+        model = auraflow.AuraFlowPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 

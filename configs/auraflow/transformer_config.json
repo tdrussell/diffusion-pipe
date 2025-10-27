@@ -1,0 +1,15 @@
+{
+  "_class_name": "AuraFlowTransformer2DModel",
+  "_diffusers_version": "0.34.0.dev0",
+  "attention_head_dim": 256,
+  "caption_projection_dim": 3072,
+  "in_channels": 4,
+  "joint_attention_dim": 2048,
+  "num_attention_heads": 12,
+  "num_mmdit_layers": 4,
+  "num_single_dit_layers": 32,
+  "out_channels": 4,
+  "patch_size": 2,
+  "pos_embed_max_size": 9216,
+  "sample_size": 64
+}
