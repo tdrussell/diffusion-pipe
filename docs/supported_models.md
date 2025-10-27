@@ -19,6 +19,7 @@
 |Qwen-Image      |✅    |✅              |✅                |
 |Qwen-Image-Edit |✅    |✅              |✅                |
 |HunyuanImage-2.1|✅    |✅              |✅                |
+|AuraFlow        |✅    |❌              |✅                |
 
 
 ## SDXL
@@ -415,3 +416,19 @@ transformer_dtype = 'float8'
 Due to the high spatial compression of the VAE and the architecture of the DiT model, the compute and memory requirements at a certain image resolution are the same as half the image side length for other models. That is, 1024 resolution for Hunyuan is the same compute as 512 for Flux, Qwen, Lumina, etc. You can train at 512 resolution for a speed boost, and it does seem to learn mostly fine from this resolution even though it is relatively low for this model. But depending on the dataset, it may be better to train at 1024+, especially if you are trying to learn unique fine-grained details from your dataset.
 
 HunyuanImage-2.1 LoRAs are saved in ComfyUI format. Notably, this means some of the key names are different from the original model structure. Keep this in mind if you are trying to use the LoRA anywhere but ComfyUI.
+
+## AuraFlow
+```
+[model]
+type = 'auraflow'
+# All these paths are to the ComfyUI files.
+transformer_path = '/data2/imagegen_models/comfyui-models/auraflow/pony-v7-base.safetensors'
+text_encoder_path = '/data2/imagegen_models/comfyui-models/auraflow/umt5_auraflow.fp16.safetensors'
+vae_path = '/data2/imagegen_models/comfyui-models/auraflow/sdxl_vae.safetensors'
+dtype = 'bfloat16'
+transformer_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+max_sequence_length = 768  # 768 for Pony-V7. Base AuraFlow is 256.
+```
+
+AuraFlow LoRAs are saved in Diffusers format. This format will work in ComfyUI.
