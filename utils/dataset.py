@@ -115,12 +115,13 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
 
 
 class TextEmbeddingDataset:
-    def __init__(self, te_dataset):
+    def __init__(self, te_dataset, flattened_captions):
         self.te_dataset = te_dataset
+        self.flattened_captions = flattened_captions
         self.image_spec_to_te_idx = defaultdict(list)
         # TODO: maybe make this use Dataset object like the latents. But, you won't be caching text embeddings
         # when training on very large datasets, so perhaps it doesn't really matter.
-        for i, image_spec in enumerate(te_dataset['image_spec']):
+        for i, image_spec in enumerate(flattened_captions['image_spec']):
             self.image_spec_to_te_idx[tuple(image_spec)].append(i)
 
     def get_text_embeddings(self, image_spec, caption_number):
@@ -150,7 +151,8 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         regenerate_cache=regenerate_cache,
         caching_batch_size=caching_batch_size,
     )
-    return TextEmbeddingDataset(te_dataset)
+    assert len(te_dataset) == len(flattened_captions)
+    return TextEmbeddingDataset(te_dataset, flattened_captions)
 
 
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
@@ -187,6 +189,7 @@ class SizeBucketDataset:
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
         )
+        assert len(self.latent_dataset) == len(self.metadata_dataset)
 
         iteration_order_cache_dir = self.cache_dir / 'iteration_order'
 
@@ -194,7 +197,7 @@ class SizeBucketDataset:
             print('Building iteration order')
             image_spec_to_latents_idx = {
                 tuple(image_spec): i
-                for i, image_spec in enumerate(self.latent_dataset['image_spec'])
+                for i, image_spec in enumerate(self.metadata_dataset['image_spec'])
             }
 
             iteration_order_list = []
