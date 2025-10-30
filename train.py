@@ -357,9 +357,36 @@ if __name__ == '__main__':
 
     with open(config['dataset']) as f:
         dataset_config = toml.load(f)
+
+    micro_batch_size_per_gpu = config.get('micro_batch_size_per_gpu', 1)
+    if isinstance(micro_batch_size_per_gpu, int):
+        micro_batch_size_per_gpu = {None: micro_batch_size_per_gpu}
+    elif isinstance(micro_batch_size_per_gpu, list):
+        micro_batch_size_per_gpu = {x[0]: x[1] for x in micro_batch_size_per_gpu}
+
+    eval_micro_batch_size_per_gpu = config.get('eval_micro_batch_size_per_gpu', micro_batch_size_per_gpu)
+    if isinstance(eval_micro_batch_size_per_gpu, int):
+        eval_micro_batch_size_per_gpu = {None: eval_micro_batch_size_per_gpu}
+    elif isinstance(eval_micro_batch_size_per_gpu, list):
+        eval_micro_batch_size_per_gpu = {x[0]: x[1] for x in eval_micro_batch_size_per_gpu}
+
+    image_micro_batch_size_per_gpu = config.get('image_micro_batch_size_per_gpu', micro_batch_size_per_gpu)
+    if isinstance(image_micro_batch_size_per_gpu, int):
+        image_micro_batch_size_per_gpu = {None: image_micro_batch_size_per_gpu}
+    elif isinstance(image_micro_batch_size_per_gpu, list):
+        image_micro_batch_size_per_gpu = {x[0]: x[1] for x in image_micro_batch_size_per_gpu}
+
+    eval_image_micro_batch_size_per_gpu = config.get('eval_image_micro_batch_size_per_gpu', image_micro_batch_size_per_gpu)
+    if isinstance(eval_image_micro_batch_size_per_gpu, int):
+        eval_image_micro_batch_size_per_gpu = {None: eval_image_micro_batch_size_per_gpu}
+    elif isinstance(eval_image_micro_batch_size_per_gpu, list):
+        eval_image_micro_batch_size_per_gpu = {x[0]: x[1] for x in eval_image_micro_batch_size_per_gpu}
+
+    default_micro_batch_size_per_gpu = list(micro_batch_size_per_gpu.values())[0]
+
     gradient_release = config['optimizer'].get('gradient_release', False)
     ds_config = {
-        'train_micro_batch_size_per_gpu': config.get('micro_batch_size_per_gpu', 1),
+        'train_micro_batch_size_per_gpu': default_micro_batch_size_per_gpu,
         'gradient_accumulation_steps': config.get('gradient_accumulation_steps', 1),
         # Can't do gradient clipping with gradient release, since there are no grads at the end of the step anymore.
         'gradient_clipping': 0. if gradient_release else config.get('gradient_clipping', 1.0),
@@ -712,17 +739,17 @@ if __name__ == '__main__':
     train_data.post_init(
         model_engine.grid.get_data_parallel_rank(),
         model_engine.grid.get_data_parallel_world_size(),
-        model_engine.train_micro_batch_size_per_gpu(),
+        micro_batch_size_per_gpu,
         model_engine.gradient_accumulation_steps(),
-        config.get('image_micro_batch_size_per_gpu', model_engine.train_micro_batch_size_per_gpu()),
+        image_micro_batch_size_per_gpu,
     )
     for eval_data in eval_data_map.values():
         eval_data.post_init(
             model_engine.grid.get_data_parallel_rank(),
             model_engine.grid.get_data_parallel_world_size(),
-            config.get('eval_micro_batch_size_per_gpu', model_engine.train_micro_batch_size_per_gpu()),
+            eval_micro_batch_size_per_gpu,
             config['eval_gradient_accumulation_steps'],
-            config.get('image_eval_micro_batch_size_per_gpu', config.get('eval_micro_batch_size_per_gpu', model_engine.train_micro_batch_size_per_gpu())),
+            eval_image_micro_batch_size_per_gpu,
         )
 
     # Might be useful because we set things in fp16 / bf16 without explicitly enabling Deepspeed fp16 mode.

@@ -256,7 +256,7 @@ class ConcatenatedBatchedDataset:
         self.datasets = datasets
         self.post_init_called = False
 
-    def post_init(self, batch_size, batch_size_image):
+    def post_init(self, batch_size: dict, batch_size_image: dict):
         iteration_order = []
         size_bucket = self.datasets[0].size_bucket
         for i, ds in enumerate(self.datasets):
@@ -268,7 +268,22 @@ class ConcatenatedBatchedDataset:
             iteration_order[k] = (dataset_idx, cumulative_sums[dataset_idx])
             cumulative_sums[dataset_idx] += 1
         self.iteration_order = np.array(iteration_order)
-        self.batch_size = batch_size_image if size_bucket[-1] == 1 else batch_size
+
+        # size_bucket could be [ar, w, h, frame] or [w, h, frames]
+        batch_size_dict = batch_size_image if size_bucket[-1] == 1 else batch_size
+        if None in batch_size_dict:
+            # single value
+            self.batch_size = batch_size_dict[None]
+        else:
+            # per image size batch size
+            bucket_size = math.sqrt(size_bucket[-2] * size_bucket[-3])
+            min_diff = float('inf')
+            for size, bs in batch_size_dict.items():
+                diff = abs(size - bucket_size)
+                if diff < min_diff:
+                    min_diff = diff
+                    self.batch_size = bs
+
         self._make_divisible_by(self.batch_size)
         self.post_init_called = True
 
@@ -820,13 +835,11 @@ class Dataset:
             )
             self.directory_datasets.append(directory_dataset)
 
-    def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size, gradient_accumulation_steps, per_device_batch_size_image):
+    def post_init(self, data_parallel_rank, data_parallel_world_size, per_device_batch_size: dict, gradient_accumulation_steps, per_device_batch_size_image: dict):
         self.data_parallel_rank = data_parallel_rank
         self.data_parallel_world_size = data_parallel_world_size
-        self.batch_size = per_device_batch_size * gradient_accumulation_steps
-        self.batch_size_image = per_device_batch_size_image * gradient_accumulation_steps
-        self.global_batch_size = self.data_parallel_world_size * self.batch_size
-        self.global_batch_size_image = self.data_parallel_world_size * self.batch_size_image
+        global_batch_size = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size.items()}
+        global_batch_size_image = {size: bs * gradient_accumulation_steps * self.data_parallel_world_size for size, bs in per_device_batch_size_image.items()}
 
         # group same size_bucket together
         datasets_by_size_bucket = defaultdict(list)
@@ -838,7 +851,7 @@ class Dataset:
             self.buckets.append(ConcatenatedBatchedDataset(datasets))
 
         for bucket in self.buckets:
-            bucket.post_init(self.global_batch_size, self.global_batch_size_image)
+            bucket.post_init(global_batch_size, global_batch_size_image)
 
         iteration_order = []
         for i, bucket in enumerate(self.buckets):
@@ -871,7 +884,6 @@ class Dataset:
         examples = self.buckets[i][j]
         assert len(examples) % self.data_parallel_world_size == 0
         batch_size = len(examples) // self.data_parallel_world_size
-        assert batch_size in (self.batch_size, self.batch_size_image)
         start_idx = self.data_parallel_rank * batch_size
         examples_for_this_dp_rank = examples[start_idx:start_idx+batch_size]
         if DEBUG:
