@@ -290,7 +290,7 @@ class ConcatenatedBatchedDataset:
 
 
 class ARBucketDataset:
-    def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, cache_base):
+    def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, cache_base, round_to_multiple):
         self.ar_frames = ar_frames
         self.resolutions = resolutions
         self.metadata_dataset = metadata_dataset
@@ -299,6 +299,7 @@ class ARBucketDataset:
         self.path = Path(directory_config['path'])
         self.cache_base = cache_base
         self.cache_dir = cache_base / f'ar_frames_{bucket_suffix(self.ar_frames)}'
+        self.round_to_multiple = round_to_multiple
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def get_size_bucket_datasets(self):
@@ -311,8 +312,8 @@ class ARBucketDataset:
             area = res**2
             w = math.sqrt(area * self.ar_frames[0])
             h = area / w
-            w = round_to_nearest_multiple(w, IMAGE_SIZE_ROUND_TO_MULTIPLE)
-            h = round_to_nearest_multiple(h, IMAGE_SIZE_ROUND_TO_MULTIPLE)
+            w = round_to_nearest_multiple(w, self.round_to_multiple)
+            h = round_to_nearest_multiple(h, self.round_to_multiple)
             size_bucket = (w, h, self.ar_frames[1])
             # to make sure the directory has a unique name
             naming_size_bucket = (self.ar_frames[0],) + size_bucket
@@ -337,7 +338,7 @@ class ARBucketDataset:
 
 
 class DirectoryDataset:
-    def __init__(self, directory_config, dataset_config, model_name, framerate=None, skip_dataset_validation=False):
+    def __init__(self, directory_config, dataset_config, model_name, framerate=None, round_to_multiple=32, skip_dataset_validation=False):
         self._set_defaults(directory_config, dataset_config)
         self.directory_config = directory_config
         self.dataset_config = dataset_config
@@ -345,6 +346,7 @@ class DirectoryDataset:
             self.validate()
         self.model_name = model_name
         self.framerate = framerate
+        self.round_to_multiple = round_to_multiple
         self.enable_ar_bucket = directory_config.get('enable_ar_bucket', dataset_config.get('enable_ar_bucket', False))
         # Configure directly from user-specified size buckets.
         self.size_buckets = directory_config.get('size_buckets', dataset_config.get('size_buckets', None))
@@ -459,6 +461,7 @@ class DirectoryDataset:
                         metadata,
                         self.directory_config,
                         self.cache_dir,
+                        self.round_to_multiple,
                     )
                 )
 
@@ -812,6 +815,7 @@ class Dataset:
                 dataset_config,
                 self.model_name,
                 framerate=model.framerate,
+                round_to_multiple=model.pixels_round_to_multiple,
                 skip_dataset_validation=skip_dataset_validation,
             )
             self.directory_datasets.append(directory_dataset)

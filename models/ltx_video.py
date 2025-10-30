@@ -24,6 +24,7 @@ KEEP_IN_HIGH_PRECISION = ['norm', 'bias', 'scale_shift_table', 'patchify_proj', 
 class LTXVideoPipeline(BasePipeline):
     name = 'ltx-video'
     framerate = 25
+    pixels_round_to_multiple = 32
     checkpointable_layers = ['TransformerLayer']
     adapter_target_modules = ['BasicTransformerBlock']
 

@@ -44,6 +44,7 @@ COMFYUI_TO_ORIGINAL_LORA_MAPPING = {v: k for k, v in ORIGINAL_TO_COMFYUI_LORA_MA
 
 class HunyuanImagePipeline(BasePipeline):
     name = 'hunyuan_image'
+    pixels_round_to_multiple = 32
     checkpointable_layers = ['DoubleBlock', 'SingleBlock']
     adapter_target_modules = ['MMDoubleStreamBlock', 'MMSingleStreamBlock']
 

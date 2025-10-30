@@ -151,6 +151,7 @@ class PreprocessMediaFile:
 
 class BasePipeline:
     framerate = None
+    pixels_round_to_multiple = 16
 
     def load_diffusion_model(self):
         pass
