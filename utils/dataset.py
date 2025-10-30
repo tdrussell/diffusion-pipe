@@ -869,10 +869,13 @@ class Dataset:
         assert self.post_init_called
         i, j = self.iteration_order[idx]
         examples = self.buckets[i][j]
-        start_idx = self.data_parallel_rank*self.batch_size
-        examples_for_this_dp_rank = examples[start_idx:start_idx+self.batch_size]
+        assert len(examples) % self.data_parallel_world_size == 0
+        batch_size = len(examples) // self.data_parallel_world_size
+        assert batch_size in (self.batch_size, self.batch_size_image)
+        start_idx = self.data_parallel_rank * batch_size
+        examples_for_this_dp_rank = examples[start_idx:start_idx+batch_size]
         if DEBUG:
-            print((start_idx, start_idx+self.batch_size))
+            print((start_idx, start_idx+batch_size))
         batch = self._collate(examples_for_this_dp_rank)
         return batch
 
