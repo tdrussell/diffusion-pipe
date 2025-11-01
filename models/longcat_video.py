@@ -51,8 +51,6 @@ def retrieve_latents(encoder_output: torch.Tensor, sample_mode: str = "sample") 
 
 
 class LongcatVideoPipeline(BasePipeline):
-    # Use a neutral name so dataset batching follows the same path as Wan/Chroma
-    # (avoids legacy special-casing tied to 'longcat-video').
     name = 'longcat'
     framerate = 15
     checkpointable_layers = ['TransformerLayer']
@@ -87,8 +85,6 @@ class LongcatVideoPipeline(BasePipeline):
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
     def model_specific_dataset_config_validation(self, dataset_config):
-        # Follow the same behavior as other models (Wan, Chroma):
-        # do not modify dataset config here.
         pass
 
     def load_diffusion_model(self):
