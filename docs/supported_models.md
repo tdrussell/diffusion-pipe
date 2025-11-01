@@ -20,6 +20,7 @@
 |Qwen-Image-Edit |✅    |✅              |✅                |
 |HunyuanImage-2.1|✅    |✅              |✅                |
 |AuraFlow        |✅    |❌              |✅                |
+|LongCat-Video   |✅    |❌              |✅                |
 
 
 ## SDXL
@@ -55,7 +56,8 @@ diffusers_path = '/data2/imagegen_models/FLUX.1-dev'
 #transformer_path = '/data2/imagegen_models/flux-dev-single-files/consolidated_s6700-schnell.safetensors'
 dtype = 'bfloat16'
 # Flux supports fp8 for the transformer when training LoRA.
-transformer_dtype = 'float8'
+# Optional; training currently expects bfloat16 weights, leave unset unless you know you need fp8
+#transformer_dtype = 'float8'
 # Resolution-dependent timestep shift towards more noise. Same meaning as sd-scripts.
 flux_shift = true
 # For FLEX.1-alpha, you can bypass the guidance embedding which is the recommended way to train that model.
@@ -432,3 +434,19 @@ max_sequence_length = 768  # 768 for Pony-V7. Base AuraFlow is 256.
 ```
 
 AuraFlow LoRAs are saved in Diffusers format. This format will work in ComfyUI.
+
+
+## LongCat-Video
+```
+[model]
+type = 'longcat'
+ckpt_path = '/data2/imagegen_models/LongCat-Video'
+dtype = 'bfloat16'
+transformer_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+```
+
+ckpt_path needs to point to a clone of https://huggingface.co/meituan-longcat/LongCat-Video
+see examples/longcat.toml for an example pipeline
+
+LongCat-Video LoRAs are saved in ComfyUI format (`diffusion_model.*` keys)
