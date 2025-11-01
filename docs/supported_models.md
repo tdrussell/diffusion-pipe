@@ -447,6 +447,8 @@ timestep_sample_method = 'logit_normal'
 ```
 
 ckpt_path needs to point to a clone of https://huggingface.co/meituan-longcat/LongCat-Video
-see examples/longcat.toml for an example pipeline
+
+see examples/longcat.toml for an example pipeline that runs on 24gb vram (for a image only 512p dataset).
+Adjust block swapping and batch size as needed.
 
 LongCat-Video LoRAs are saved in ComfyUI format (`diffusion_model.*` keys)
