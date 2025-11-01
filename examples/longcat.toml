@@ -1,0 +1,52 @@
+
+
+output_dir = 'out'
+dataset = 'dataset.toml'
+
+
+# training settings
+epochs = 1000
+micro_batch_size_per_gpu = 1
+pipeline_stages = 1
+gradient_accumulation_steps = 2
+gradient_clipping = 1
+#warmup_steps = 100
+
+# eval settings
+eval_every_n_epochs = 1
+#eval_every_n_steps = 100
+eval_before_first_step = false
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+# misc settings
+save_every_n_epochs = 5
+checkpoint_every_n_epochs = 5
+activation_checkpointing = true
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 8
+steps_per_print = 1
+blocks_to_swap = 20
+
+[model]
+type = 'longcat'
+# clone of https://huggingface.co/meituan-longcat/LongCat-Video
+ckpt_path = 'models/longcat'
+dtype = 'bfloat16'
+transformer_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+
+
+[adapter]
+type = 'lora'
+rank = 16
+dtype = 'bfloat16'
+
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 2e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8

@@ -343,6 +343,9 @@ if __name__ == '__main__':
     elif model_type == 'auraflow':
         from models import auraflow
         model = auraflow.AuraFlowPipeline(config)
+    elif model_type == 'longcat':
+        from models import longcat_video
+        model = longcat_video.LongcatVideoPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
