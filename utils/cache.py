@@ -26,9 +26,7 @@ class Cache:
         assert isinstance(idx, int)
         shard_id, shard_index = self.items[idx]
         offset, size = self.shard_metadata[shard_id][shard_index]
-        if shard_id not in self.open_files:
-            self.open_files[shard_id] = open(self.path / f'shard_{shard_id}.bin', 'rb')
-        f = self.open_files[shard_id]
+        f = self.open_files.setdefault(shard_id, open(self.path / f'shard_{shard_id}.bin', 'rb'))
         f.seek(offset)
         byte_string = f.read(size)
         buffer = io.BytesIO(byte_string)
@@ -41,7 +39,7 @@ class Cache:
         # create database
         self.con = sqlite3.connect(self.metadata_db, autocommit=False)
 
-        # existing fingerprint or None
+        # check fingerprint, clear cache if different
         self.con.execute('CREATE TABLE IF NOT EXISTS fingerprint(value)')
         existing_fingerprint = self.con.execute('SELECT value FROM fingerprint').fetchone()
         if existing_fingerprint is not None:

@@ -19,9 +19,9 @@ from PIL import Image
 import imageio
 import multiprocess as mp
 from tqdm import tqdm
-from tqdm.contrib.concurrent import thread_map
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
+from utils.cache import Cache
 
 
 DEBUG = False
@@ -74,44 +74,67 @@ def dedup_and_sort(values):
 
 
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
-    # TODO: remove. Currently using this to avoid recaching everything.
-    # cache_arrow_files = list(str(path) for path in cache_dir.glob(f'{cache_file_prefix}*.arrow'))
-    # cache_arrow_files.sort()
-    # if len(cache_arrow_files) > 0:
-    #     dataset_shards = thread_map(
-    #         datasets.Dataset.from_file,
-    #         cache_arrow_files,
-    #         desc="Loading from map() cached files",
-    #     )
-
-    #     dataset = datasets.concatenate_datasets(
-    #         #[datasets.Dataset.from_file(f) for f in cache_arrow_files]
-    #         dataset_shards
-    #     )
-    #     dataset.set_format('torch')
-    #     return dataset
-
-    # Do the fingerprinting ourselves, because otherwise map() does it by serializing the map function.
-    # That goes poorly when the function is capturing huge models (slow, OOMs, etc).
     new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
     new_fingerprint_args.append(dataset._fingerprint)
     new_fingerprint = Hasher.hash(new_fingerprint_args)
-    cache_file = cache_dir / f'{cache_file_prefix}{new_fingerprint}.arrow'
-    cache_file = str(cache_file)
-    dataset = dataset.map(
-        map_fn,
-        cache_file_name=cache_file,
-        load_from_cache_file=(not regenerate_cache),
-        writer_batch_size=100,
-        new_fingerprint=new_fingerprint,
-        remove_columns=dataset.column_names,
-        batched=True,
-        batch_size=caching_batch_size,
-        num_proc=NUM_PROC,
-        with_rank=True,
-    )
-    dataset.set_format('torch')
-    return dataset
+    if cache_file_prefix:
+        cache_dir = cache_dir / cache_file_prefix.strip('_')
+
+    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10)
+
+    if map_fn is None:
+        # loading directly from cache without mapping
+        assert new_fingerprint == cache.fingerprint
+        return cache
+
+    if regenerate_cache:
+        cache.clear()
+
+    # Cache has either been cleared if fingerprint didn't match, or has some (maybe 0) existing items in it.
+
+    # Skip existing items
+    cache_size = len(cache)
+    dataset_size = len(dataset)
+    assert cache_size <= dataset_size
+    if cache_size == dataset_size:
+        return cache
+    dataset = dataset.select(range(cache_size, dataset_size), keep_in_memory=True)
+
+    # Let each worker process know its rank
+    manager = mp.Manager()
+    id_queue = manager.Queue()
+
+    def init(queue):
+        global rank
+        rank = queue.get()
+
+    for i in range(NUM_PROC):
+        id_queue.put(i)
+
+    pool = mp.Pool(NUM_PROC, init, (id_queue,))
+
+    def wrapper(example):
+        global rank
+        return map_fn(example, rank)
+
+    def unbatch_iter(batch):
+        length = len(next(iter(batch.values())))
+        for i in range(length):
+            result = {}
+            for key in batch:
+                result[key] = batch[key][i]
+            yield result
+
+    completed_batches = cache_size // caching_batch_size
+    total_batches = dataset_size // caching_batch_size
+
+    for batch in tqdm(pool.imap(wrapper, dataset.iter(batch_size=caching_batch_size)), initial=completed_batches, total=total_batches):
+        for example in unbatch_iter(batch):
+            cache.add(example)
+
+    pool.close()
+    cache.finalize_current_shard()
+    return cache
 
 
 class TextEmbeddingDataset:
