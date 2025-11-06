@@ -117,18 +117,33 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
         global rank
         return map_fn(example, rank)
 
+    # Tensor slices reference the entire memory of the original tensor, and everything would be pickled and stored
+    # in cache, so we do this.
+    def recursive_clone_tensors(obj):
+        if torch.is_tensor(obj):
+            return obj.clone()
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                obj[k] = recursive_clone_tensors(v)
+            return obj
+        elif isinstance(obj, (list, tuple)):
+            return [recursive_clone_tensors(x) for x in obj]
+        else:
+            return obj
+
     def unbatch_iter(batch):
         length = len(next(iter(batch.values())))
         for i in range(length):
             result = {}
             for key in batch:
                 result[key] = batch[key][i]
-            yield result
+            yield recursive_clone_tensors(result)
 
     completed_batches = cache_size // caching_batch_size
     total_batches = dataset_size // caching_batch_size
 
-    for batch in tqdm(pool.imap(wrapper, dataset.iter(batch_size=caching_batch_size)), initial=completed_batches, total=total_batches):
+    map_iter = pool.imap(wrapper, dataset.iter(batch_size=caching_batch_size))
+    for batch in tqdm(map_iter, initial=completed_batches, total=total_batches):
         for example in unbatch_iter(batch):
             cache.add(example)
 
@@ -1135,11 +1150,10 @@ class DatasetManager:
         # I think this is because HF Datasets uses the multiprocess library (different from Python multiprocessing!) so it will always use fork.
         cpu_results = {}
         for k, v in results.items():
-            # Cast all floats to float16 because Arrow files don't support bfloat16, so it would end up float32 on disk. Cuts size in half.
             if isinstance(v, (list, tuple)):
-                cpu_results[k] = [x.to('cpu', torch.float16 if torch.is_floating_point(x) else x.dtype) for x in v]
+                cpu_results[k] = [x.to('cpu') for x in v]
             else:
-                cpu_results[k] = v.to('cpu', torch.float16 if torch.is_floating_point(v) else v.dtype)
+                cpu_results[k] = v.to('cpu')
         pipe.send(cpu_results)
 
 

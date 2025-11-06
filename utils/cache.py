@@ -88,6 +88,7 @@ class Cache:
     def create_new_shard(self):
         self.shard_file = open(self.path / f'shard_{self.shard}.bin', 'wb')
         self.shard_table = f'shard_{self.shard}'
+        print(f'[CACHE] Creating new shard: {self.shard_table}')
         self.con.execute(f'CREATE TABLE {self.shard_table}(offset, size)')
         self.shard_index = 0
         self.offset = 0
