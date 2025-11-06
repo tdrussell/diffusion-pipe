@@ -376,7 +376,7 @@ if __name__ == '__main__':
     elif isinstance(image_micro_batch_size_per_gpu, list):
         image_micro_batch_size_per_gpu = {x[0]: x[1] for x in image_micro_batch_size_per_gpu}
 
-    eval_image_micro_batch_size_per_gpu = config.get('eval_image_micro_batch_size_per_gpu', image_micro_batch_size_per_gpu)
+    eval_image_micro_batch_size_per_gpu = config.get('eval_image_micro_batch_size_per_gpu', eval_micro_batch_size_per_gpu)
     if isinstance(eval_image_micro_batch_size_per_gpu, int):
         eval_image_micro_batch_size_per_gpu = {None: eval_image_micro_batch_size_per_gpu}
     elif isinstance(eval_image_micro_batch_size_per_gpu, list):
