@@ -28,6 +28,7 @@ class EvalDumpManager:
         self.write_metadata_json = True
         self._config: dict = {}
         self._state = EvalDumpState()
+        self.group_by = 'eval'
 
     def apply_config(self, cfg: Optional[dict]):
         cfg = cfg or {}
@@ -39,6 +40,7 @@ class EvalDumpManager:
         self.video_format = cfg.get('format', self.video_format)
         self.video_fps = int(cfg.get('video_fps', self.video_fps))
         self.write_metadata_json = bool(cfg.get('write_metadata_json', True))
+        self.group_by = cfg.get('group_by', 'eval')
 
     def set_run_dir(self, run_dir: Path | str):
         if not self.enabled:
@@ -94,16 +96,26 @@ class EvalDumpManager:
     def current_context(self) -> EvalDumpState:
         return self._state
 
-    def current_eval_dir(self) -> Optional[Path]:
+    def group_by_sample(self) -> bool:
+        return self.group_by == 'sample'
+
+    def group_flat(self) -> bool:
+        return self.group_by == 'flat'
+
+    def build_output_dir(self, sample_slug: Optional[str] = None) -> Optional[Path]:
         if not self.should_record():
             return None
         dataset = self._state.dataset or "dataset"
-        step = self._state.step or 0
         quantile = self._state.quantile if self._state.quantile is not None else 0.0
-        path = self.output_dir / dataset / f"step_{step}" / f"quantile_{quantile:.2f}"
+        step = self._state.step or 0
+        if self.group_by_sample() and sample_slug:
+            path = self.output_dir / dataset / f"quantile_{quantile:.2f}" / sample_slug
+        elif self.group_flat():
+            path = self.output_dir
+        else:
+            path = self.output_dir / dataset / f"step_{step}" / f"quantile_{quantile:.2f}"
         path.mkdir(parents=True, exist_ok=True)
         return path
 
 
 eval_dump_manager = EvalDumpManager()
-

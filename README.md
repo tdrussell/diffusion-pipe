@@ -141,12 +141,14 @@ output_dir = "eval_samples"
 caption_max_bytes = 160   # optional, truncation budget for prompt text
 source_max_bytes = 256    # optional, truncation budget for source path
 video_fps = 15            # mp4 fps when writing videos
+group_by = "eval"         # options: "eval" (per-step directories), "sample" (per-sample history folders), "flat" (all files in output_dir)
 ```
 
 When enabled:
 - Only Longcat runs save predictions (other model types ignore this block for now).
 - The last pipeline stage on data-parallel rank 0 reconstructs the predicted clean latents, decodes them with the Longcat VAE, and writes MP4 files plus a small JSON sidecar containing the prompt/source metadata.
-- Outputs live under `<output_dir>/<dataset_name>/step_<step>/quantile_<quantile>/`.
+- `group_by = "sample"` stores files under `<dataset>/quantile_xx/<slug>/step_<step>.mp4`, making it easy to see how each saved example evolves over time.
+- With the default `group_by = "eval"`, outputs live under `<output_dir>/<dataset>/step_<step>/quantile_<quantile>/`. Use `group_by = "sample"` to get `<output_dir>/<dataset>/quantile_<quantile>/<sample_slug>/step_<step>.mp4`, or `group_by = "flat"` to drop all mp4/json pairs directly inside `output_dir`.
 - Metadata capture adds a small amount of host memory overhead; leave `enabled = false` to disable the feature entirely.
 
 ## Parallelism

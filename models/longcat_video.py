@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+from collections import defaultdict
 from pathlib import Path
 from typing import Tuple
 
@@ -89,6 +90,7 @@ class LongcatVideoPipeline(BasePipeline):
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         self.eval_capture_active = False
         self.eval_capture_context = {}
+        self.sample_slug_counts = defaultdict(int)
 
     def model_specific_dataset_config_validation(self, dataset_config):
         pass
@@ -97,6 +99,9 @@ class LongcatVideoPipeline(BasePipeline):
         self.eval_capture_active = enabled
         if not enabled:
             self.eval_capture_context = {}
+            self.sample_slug_counts = defaultdict(int)
+        else:
+            self.sample_slug_counts = defaultdict(int)
 
     def set_eval_capture_context(self, context: dict):
         if not self.eval_capture_active:
@@ -433,9 +438,6 @@ class LongcatVideoPipeline(BasePipeline):
         vae = self._ensure_vae_device(vae_device)
         decoded = vae.decode(denorm_latents.to(vae_device, vae.dtype)).sample.to(torch.float32)
         decoded = decoded.clamp(-1, 1).cpu()
-        output_dir = eval_dump_manager.current_eval_dir()
-        if output_dir is None:
-            return
         timesteps_cpu = timesteps[:batch].detach().cpu()
         written = 0
         for idx in range(batch):
@@ -443,10 +445,21 @@ class LongcatVideoPipeline(BasePipeline):
                 break
             caption = self._decode_metadata_string(caption_bytes, caption_len, idx)
             source = self._decode_metadata_string(source_bytes, source_len, idx)
-            slug = self._make_slug(caption or source or f'sample{idx}')
+            slug = self._make_slug(caption, source, f'sample{idx}')
+            output_dir = eval_dump_manager.build_output_dir(slug if eval_dump_manager.group_by_sample() else None)
+            if output_dir is None:
+                break
             current_state = eval_dump_manager.current_context()
             sequential_id = (current_state.samples_written or 0) + 1
-            filename = output_dir / f"{sequential_id:04d}_{slug}.{eval_dump_manager.video_format}"
+            step_val = self.eval_capture_context.get('step') or current_state.step or 0
+            quantile_val = self.eval_capture_context.get('quantile')
+            if eval_dump_manager.group_by_sample():
+                filename_stem = f"step_{int(step_val):06d}_q{(quantile_val or 0.0):.2f}"
+            elif eval_dump_manager.group_flat():
+                filename_stem = f"{slug}_step_{int(step_val):06d}_q{(quantile_val or 0.0):.2f}"
+            else:
+                filename_stem = f"{sequential_id:04d}_{slug}"
+            filename = output_dir / f"{filename_stem}.{eval_dump_manager.video_format}"
             video_np = self._tensor_to_video(decoded[idx])
             imageio.imwrite(filename, video_np, fps=eval_dump_manager.video_fps)
             if eval_dump_manager.write_metadata_json:
@@ -474,10 +487,20 @@ class LongcatVideoPipeline(BasePipeline):
         data = bytes_tensor[index][:length].cpu().tolist()
         return bytes(data).decode('utf-8', errors='ignore')
 
-    def _make_slug(self, text: str, max_length: int = 60):
-        slug = re.sub(r'[^A-Za-z0-9]+', '-', text.strip())[:max_length]
-        slug = slug.strip('-')
-        return slug or 'sample'
+    def _make_slug(self, caption: str, source: str = '', fallback: str = 'sample', max_length: int = 60):
+        base = caption.strip() if caption else ''
+        if not base and source:
+            base = Path(source).stem
+        if not base:
+            base = fallback
+        slug = re.sub(r'[^A-Za-z0-9]+', '-', base)[:max_length].strip('-')
+        if not slug:
+            slug = fallback
+        count = self.sample_slug_counts[slug]
+        self.sample_slug_counts[slug] += 1
+        if count > 0:
+            slug = f"{slug}-{count}"
+        return slug
 
     def _tensor_to_video(self, tensor):
         if tensor.ndim != 4:

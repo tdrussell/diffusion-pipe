@@ -59,3 +59,4 @@ output_dir = 'eval_samples'
 caption_max_bytes = 160
 source_max_bytes = 256
 video_fps = 15
+group_by = 'eval'  # use 'sample' for per-sample history folders
