@@ -19,9 +19,9 @@ from PIL import Image
 import imageio
 import multiprocess as mp
 from tqdm import tqdm
-from tqdm.contrib.concurrent import thread_map
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
+from utils.cache import Cache
 
 
 DEBUG = False
@@ -74,53 +74,92 @@ def dedup_and_sort(values):
 
 
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
-    # TODO: remove. Currently using this to avoid recaching everything.
-    # cache_arrow_files = list(str(path) for path in cache_dir.glob(f'{cache_file_prefix}*.arrow'))
-    # cache_arrow_files.sort()
-    # if len(cache_arrow_files) > 0:
-    #     dataset_shards = thread_map(
-    #         datasets.Dataset.from_file,
-    #         cache_arrow_files,
-    #         desc="Loading from map() cached files",
-    #     )
-
-    #     dataset = datasets.concatenate_datasets(
-    #         #[datasets.Dataset.from_file(f) for f in cache_arrow_files]
-    #         dataset_shards
-    #     )
-    #     dataset.set_format('torch')
-    #     return dataset
-
-    # Do the fingerprinting ourselves, because otherwise map() does it by serializing the map function.
-    # That goes poorly when the function is capturing huge models (slow, OOMs, etc).
     new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
     new_fingerprint_args.append(dataset._fingerprint)
     new_fingerprint = Hasher.hash(new_fingerprint_args)
-    cache_file = cache_dir / f'{cache_file_prefix}{new_fingerprint}.arrow'
-    cache_file = str(cache_file)
-    dataset = dataset.map(
-        map_fn,
-        cache_file_name=cache_file,
-        load_from_cache_file=(not regenerate_cache),
-        writer_batch_size=100,
-        new_fingerprint=new_fingerprint,
-        remove_columns=dataset.column_names,
-        batched=True,
-        batch_size=caching_batch_size,
-        num_proc=NUM_PROC,
-        with_rank=True,
-    )
-    dataset.set_format('torch')
-    return dataset
+    if cache_file_prefix:
+        cache_dir = cache_dir / cache_file_prefix.strip('_')
+
+    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10)
+
+    if map_fn is None:
+        # loading directly from cache without mapping
+        assert new_fingerprint == cache.fingerprint
+        return cache
+
+    if regenerate_cache:
+        cache.clear()
+
+    # Cache has either been cleared if fingerprint didn't match, or has some (maybe 0) existing items in it.
+
+    # Skip existing items
+    cache_size = len(cache)
+    dataset_size = len(dataset)
+    assert cache_size <= dataset_size
+    if cache_size == dataset_size:
+        return cache
+    dataset = dataset.select(range(cache_size, dataset_size), keep_in_memory=True)
+
+    # Let each worker process know its rank
+    manager = mp.Manager()
+    id_queue = manager.Queue()
+
+    def init(queue):
+        global rank
+        rank = queue.get()
+
+    for i in range(NUM_PROC):
+        id_queue.put(i)
+
+    pool = mp.Pool(NUM_PROC, init, (id_queue,))
+
+    def wrapper(example):
+        global rank
+        return map_fn(example, rank)
+
+    # Tensor slices reference the entire memory of the original tensor, and everything would be pickled and stored
+    # in cache, so we do this.
+    def recursive_clone_tensors(obj):
+        if torch.is_tensor(obj):
+            return obj.clone()
+        elif isinstance(obj, dict):
+            for k, v in obj.items():
+                obj[k] = recursive_clone_tensors(v)
+            return obj
+        elif isinstance(obj, (list, tuple)):
+            return [recursive_clone_tensors(x) for x in obj]
+        else:
+            return obj
+
+    def unbatch_iter(batch):
+        length = len(next(iter(batch.values())))
+        for i in range(length):
+            result = {}
+            for key in batch:
+                result[key] = batch[key][i]
+            yield recursive_clone_tensors(result)
+
+    completed_batches = cache_size // caching_batch_size
+    total_batches = dataset_size // caching_batch_size
+
+    map_iter = pool.imap(wrapper, dataset.iter(batch_size=caching_batch_size))
+    for batch in tqdm(map_iter, initial=completed_batches, total=total_batches):
+        for example in unbatch_iter(batch):
+            cache.add(example)
+
+    pool.close()
+    cache.finalize_current_shard()
+    return cache
 
 
 class TextEmbeddingDataset:
-    def __init__(self, te_dataset):
+    def __init__(self, te_dataset, flattened_captions):
         self.te_dataset = te_dataset
+        self.flattened_captions = flattened_captions
         self.image_spec_to_te_idx = defaultdict(list)
         # TODO: maybe make this use Dataset object like the latents. But, you won't be caching text embeddings
         # when training on very large datasets, so perhaps it doesn't really matter.
-        for i, image_spec in enumerate(te_dataset['image_spec']):
+        for i, image_spec in enumerate(flattened_captions['image_spec']):
             self.image_spec_to_te_idx[tuple(image_spec)].append(i)
 
     def get_text_embeddings(self, image_spec, caption_number):
@@ -150,7 +189,8 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
         regenerate_cache=regenerate_cache,
         caching_batch_size=caching_batch_size,
     )
-    return TextEmbeddingDataset(te_dataset)
+    assert len(te_dataset) == len(flattened_captions)
+    return TextEmbeddingDataset(te_dataset, flattened_captions)
 
 
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
@@ -187,6 +227,7 @@ class SizeBucketDataset:
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
         )
+        assert len(self.latent_dataset) == len(self.metadata_dataset)
 
         iteration_order_cache_dir = self.cache_dir / 'iteration_order'
 
@@ -194,7 +235,7 @@ class SizeBucketDataset:
             print('Building iteration order')
             image_spec_to_latents_idx = {
                 tuple(image_spec): i
-                for i, image_spec in enumerate(self.latent_dataset['image_spec'])
+                for i, image_spec in enumerate(self.metadata_dataset['image_spec'])
             }
 
             equal_num_captions = True
@@ -1149,11 +1190,10 @@ class DatasetManager:
         # I think this is because HF Datasets uses the multiprocess library (different from Python multiprocessing!) so it will always use fork.
         cpu_results = {}
         for k, v in results.items():
-            # Cast all floats to float16 because Arrow files don't support bfloat16, so it would end up float32 on disk. Cuts size in half.
             if isinstance(v, (list, tuple)):
-                cpu_results[k] = [x.to('cpu', torch.float16 if torch.is_floating_point(x) else x.dtype) for x in v]
+                cpu_results[k] = [x.to('cpu') for x in v]
             else:
-                cpu_results[k] = v.to('cpu', torch.float16 if torch.is_floating_point(v) else v.dtype)
+                cpu_results[k] = v.to('cpu')
         pipe.send(cpu_results)
 
 
