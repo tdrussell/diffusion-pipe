@@ -50,3 +50,12 @@ lr = 2e-4
 betas = [0.9, 0.99]
 weight_decay = 0.01
 eps = 1e-8
+
+[eval_dump]
+# Optional: enable Longcat eval video dumps
+enabled = true
+max_per_eval = 4
+output_dir = 'eval_samples'
+caption_max_bytes = 160
+source_max_bytes = 256
+video_fps = 15

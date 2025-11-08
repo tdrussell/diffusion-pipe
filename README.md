@@ -130,6 +130,25 @@ The [wan_14b_min_vram.toml](./examples/wan_14b_min_vram.toml) example file has a
   - On my system, sometimes this causes random CUDA failures. If training gets through a few steps though, it will train indefinitely without failures. Very weird.
 - Use unsloth activation checkpointing: ```activation_checkpointing = 'unsloth'```
 
+## Saving Eval Outputs (Longcat only)
+You can optionally dump Longcat-Video eval predictions (PoC) whenever an eval pass runs. Set the following block in your training config:
+
+```
+[eval_dump]
+enabled = true
+max_per_eval = 4          # optional, 0 = no limit
+output_dir = "eval_samples"
+caption_max_bytes = 160   # optional, truncation budget for prompt text
+source_max_bytes = 256    # optional, truncation budget for source path
+video_fps = 15            # mp4 fps when writing videos
+```
+
+When enabled:
+- Only Longcat runs save predictions (other model types ignore this block for now).
+- The last pipeline stage on data-parallel rank 0 reconstructs the predicted clean latents, decodes them with the Longcat VAE, and writes MP4 files plus a small JSON sidecar containing the prompt/source metadata.
+- Outputs live under `<output_dir>/<dataset_name>/step_<step>/quantile_<quantile>/`.
+- Metadata capture adds a small amount of host memory overhead; leave `enabled = false` to disable the feature entirely.
+
 ## Parallelism
 This code uses hybrid data- and pipeline-parallelism. Set the ```--num_gpus``` flag appropriately for your setup. Set ```pipeline_stages``` in the config file to control the degree of pipeline parallelism. Then the data parallelism degree will automatically be set to use all GPUs (number of GPUs must be divisible by pipeline_stages). For example, with 4 GPUs and pipeline_stages=2, you will run two instances of the model, each divided across two GPUs.
 

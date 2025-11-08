@@ -802,6 +802,9 @@ class Dataset:
         #     self.model_name = 'cosmos_predict2'
         self.post_init_called = False
         self.eval_quantile = None
+        self.capture_eval_metadata = False
+        self.eval_caption_max_bytes = None
+        self.eval_source_max_bytes = None
         if not skip_dataset_validation:
             self.model.model_specific_dataset_config_validation(self.dataset_config)
 
@@ -857,6 +860,11 @@ class Dataset:
     def set_eval_quantile(self, quantile):
         self.eval_quantile = quantile
 
+    def enable_eval_metadata(self, caption_max_bytes: int = 160, source_max_bytes: int = 256):
+        self.capture_eval_metadata = True
+        self.eval_caption_max_bytes = caption_max_bytes
+        self.eval_source_max_bytes = source_max_bytes
+
     def __len__(self):
         assert self.post_init_called
         return len(self.iteration_order)
@@ -874,6 +882,48 @@ class Dataset:
 
     # Collates a list of feature dictionaries into a single dictionary of batched features.
     # Each feature can be a tensor, list, or single item.
+    def _encode_eval_string(self, text: str, max_bytes: int):
+        encoded = (text or '').encode('utf-8')[:max_bytes]
+        tensor = torch.zeros(max_bytes, dtype=torch.uint8)
+        if len(encoded):
+            tensor[:len(encoded)] = torch.tensor(list(encoded), dtype=torch.uint8)
+        length_tensor = torch.tensor(len(encoded), dtype=torch.int32)
+        return tensor, length_tensor
+
+    def _format_image_spec(self, image_spec):
+        if not image_spec:
+            return ''
+        tar_path, inner_path = image_spec
+        if tar_path:
+            return f'{tar_path}:{inner_path}'
+        return str(inner_path)
+
+    def _get_caption_text(self, caption_field):
+        if isinstance(caption_field, (list, tuple)):
+            return caption_field[0] if caption_field else ''
+        return caption_field or ''
+
+    def _inject_eval_metadata(self, ret, examples):
+        caption_bytes = []
+        caption_lens = []
+        source_bytes = []
+        source_lens = []
+        max_caption = self.eval_caption_max_bytes or 160
+        max_source = self.eval_source_max_bytes or 256
+        for example in examples:
+            caption_text = self._get_caption_text(example.get('caption', ''))
+            source_text = self._format_image_spec(example.get('image_spec'))
+            cap_tensor, cap_len = self._encode_eval_string(caption_text, max_caption)
+            src_tensor, src_len = self._encode_eval_string(source_text, max_source)
+            caption_bytes.append(cap_tensor)
+            caption_lens.append(cap_len)
+            source_bytes.append(src_tensor)
+            source_lens.append(src_len)
+        ret['eval_caption_bytes'] = torch.stack(caption_bytes)
+        ret['eval_caption_len'] = torch.stack(caption_lens)
+        ret['eval_source_bytes'] = torch.stack(source_bytes)
+        ret['eval_source_len'] = torch.stack(source_lens)
+
     def _collate(self, examples):
         ret = {}
         for key in examples[0]:
@@ -903,6 +953,8 @@ class Dataset:
         else:
             # We can leave the batch mask as None and the loss_fn will skip masking entirely.
             ret['mask'] = None
+        if self.capture_eval_metadata:
+            self._inject_eval_metadata(ret, examples)
         return ret
 
     def cache_metadata(self, regenerate_cache=False, trust_cache=False):
@@ -1165,6 +1217,7 @@ class PipelineDataLoader:
         self.num_batches_pulled = 0
         self.next_micro_batch = None
         self.recreate_dataloader = False
+        self.include_eval_metadata = getattr(dataset, 'capture_eval_metadata', False)
         # Be careful to only create the DataLoader some bounded number of times: https://github.com/pytorch/pytorch/issues/91252
         self._create_dataloader()
         self.data = self._pull_batches_from_dataloader()
@@ -1216,15 +1269,36 @@ class PipelineDataLoader:
             prefetch_factor=2 if self.num_dataloader_workers > 0 else None,
         )
 
+    def _extract_eval_metadata(self, batch):
+        if not self.include_eval_metadata:
+            return None
+        return (
+            batch.pop('eval_caption_bytes'),
+            batch.pop('eval_caption_len'),
+            batch.pop('eval_source_bytes'),
+            batch.pop('eval_source_len'),
+        )
+
     def _pull_batches_from_dataloader(self):
         for batch in self.dataloader:
+            metadata = self._extract_eval_metadata(batch)
             features, label = self.model.prepare_inputs(batch, timestep_quantile=self.eval_quantile)
-            target, mask = label
+            if isinstance(label, (list, tuple)):
+                target = label[0]
+                mask = label[1] if len(label) > 1 else torch.tensor([])
+                extra_label_items = tuple(label[2:]) if len(label) > 2 else ()
+            else:
+                target, mask = label
+                extra_label_items = ()
             # The target depends on the noise, so we must broadcast it from the first stage to the last.
             # NOTE: I had to patch the pipeline parallel TrainSchedule so that the LoadMicroBatch commands
             # would line up on the first and last stage so that this doesn't deadlock.
             target = self._broadcast_target(target)
             label = (target, mask)
+            if extra_label_items:
+                label = (*label, *extra_label_items)
+            if metadata is not None:
+                label = (*label, *metadata)
             self.num_batches_pulled += 1
             for micro_batch in split_batch((features, label), self.gradient_accumulation_steps):
                 yield micro_batch

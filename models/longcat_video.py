@@ -1,8 +1,11 @@
+import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Tuple
 
+import imageio.v3 as imageio
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -12,6 +15,7 @@ from transformers import AutoTokenizer, UMT5EncoderModel
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE, is_main_process
 from utils.offloading import ModelOffloader
+from utils.eval_dump import eval_dump_manager
 
 
 submodule_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/LongCat-Video')
@@ -83,9 +87,22 @@ class LongcatVideoPipeline(BasePipeline):
         self.latents_std = 1.0 / raw_std
 
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+        self.eval_capture_active = False
+        self.eval_capture_context = {}
 
     def model_specific_dataset_config_validation(self, dataset_config):
         pass
+
+    def enable_eval_capture(self, enabled: bool):
+        self.eval_capture_active = enabled
+        if not enabled:
+            self.eval_capture_context = {}
+
+    def set_eval_capture_context(self, context: dict):
+        if not self.eval_capture_active:
+            return
+        self.eval_capture_context = context
+        self._vae_loaded_device = getattr(self, '_vae_loaded_device', None)
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
@@ -311,6 +328,9 @@ class LongcatVideoPipeline(BasePipeline):
         x_0 = torch.randn_like(x_1)
         t_expanded = t.view(-1, 1, 1, 1, 1)
         x_t = (1 - t_expanded) * x_1 + t_expanded * x_0
+        capture_payload = None
+        if self.eval_capture_active:
+            capture_payload = (x_t.detach().contiguous(), t.detach().clone())
 
         # Flow target direction: some FM/rectified-flow stacks expect x1-x0 and others x0-x1.
         # Default to x1-x0 (moves sample toward data as dt becomes negative in Euler FM schedulers).
@@ -336,7 +356,164 @@ class LongcatVideoPipeline(BasePipeline):
             timestep_input,
         )
         label = (target, mask)
+        if capture_payload is not None:
+            label = (*label, *capture_payload)
         return features, label
+
+    def get_loss_fn(self):
+        pseudo_huber_c = self.config.get('pseudo_huber_c', None)
+
+        def loss_fn(output, label):
+            target = label[0]
+            mask = label[1]
+            extras = label[2:] if len(label) > 2 else ()
+            with torch.autocast('cuda', enabled=False):
+                output32 = output.to(torch.float32)
+                target32 = target.to(output32.device, torch.float32)
+                if pseudo_huber_c is not None:
+                    c = pseudo_huber_c
+                    loss_val = torch.sqrt((output32 - target32) ** 2 + c**2) - c
+                else:
+                    loss_val = F.mse_loss(output32, target32, reduction='none')
+                if mask.numel() > 0:
+                    mask32 = mask.to(output32.device, torch.float32)
+                    loss_val *= mask32
+                loss_val = loss_val.mean()
+            parsed_extras = self._parse_eval_extras(extras)
+            if self._should_capture_eval_outputs(parsed_extras):
+                self._record_eval_batch(output32.detach(), parsed_extras)
+            return loss_val
+
+        return loss_fn
+
+    def _parse_eval_extras(self, extras):
+        if not extras:
+            return (None, None, None, None, None, None)
+        idx = 0
+        x_t = timesteps = None
+        if self.eval_capture_active and len(extras) >= 2:
+            x_t = extras[0]
+            timesteps = extras[1]
+            idx = 2
+        caption_bytes = caption_len = source_bytes = source_len = None
+        if len(extras) >= idx + 4:
+            caption_bytes, caption_len, source_bytes, source_len = extras[idx:idx+4]
+        return (x_t, timesteps, caption_bytes, caption_len, source_bytes, source_len)
+
+    def _should_capture_eval_outputs(self, parsed_extras):
+        if not self.eval_capture_active or not eval_dump_manager.should_record():
+            return False
+        engine = getattr(self, 'model_engine', None)
+        if engine is None or not engine.is_last_stage():
+            return False
+        if engine.grid.get_data_parallel_rank() != 0:
+            return False
+        x_t, timesteps, *_ = parsed_extras
+        return x_t is not None and timesteps is not None
+
+    def _record_eval_batch(self, prediction, parsed_extras):
+        if not eval_dump_manager.should_record():
+            return
+        x_t, timesteps, caption_bytes, caption_len, source_bytes, source_len = parsed_extras
+        remaining = eval_dump_manager.remaining_slots()
+        if remaining <= 0:
+            return
+        batch = min(prediction.size(0), remaining)
+        prediction = prediction[:batch]
+        x_t = x_t[:batch].to(prediction.device)
+        timesteps = timesteps[:batch].to(prediction.device)
+        flow_target = self.model_config.get('flow_target', 'x1_minus_x0')
+        t_scaled = timesteps.view(-1, 1, 1, 1, 1)
+        if flow_target == 'x0_minus_x1':
+            clean_latents = x_t - t_scaled * prediction
+        else:
+            clean_latents = x_t + t_scaled * prediction
+        denorm_latents = self.denormalize_latents(clean_latents)
+        vae_device = prediction.device
+        vae = self._ensure_vae_device(vae_device)
+        decoded = vae.decode(denorm_latents.to(vae_device, vae.dtype)).sample.to(torch.float32)
+        decoded = decoded.clamp(-1, 1).cpu()
+        output_dir = eval_dump_manager.current_eval_dir()
+        if output_dir is None:
+            return
+        timesteps_cpu = timesteps[:batch].detach().cpu()
+        written = 0
+        for idx in range(batch):
+            if eval_dump_manager.remaining_slots() <= 0:
+                break
+            caption = self._decode_metadata_string(caption_bytes, caption_len, idx)
+            source = self._decode_metadata_string(source_bytes, source_len, idx)
+            slug = self._make_slug(caption or source or f'sample{idx}')
+            current_state = eval_dump_manager.current_context()
+            sequential_id = (current_state.samples_written or 0) + 1
+            filename = output_dir / f"{sequential_id:04d}_{slug}.{eval_dump_manager.video_format}"
+            video_np = self._tensor_to_video(decoded[idx])
+            imageio.imwrite(filename, video_np, fps=eval_dump_manager.video_fps)
+            if eval_dump_manager.write_metadata_json:
+                meta = {
+                    'caption': caption,
+                    'source': source,
+                    'dataset': self.eval_capture_context.get('dataset'),
+                    'quantile': self.eval_capture_context.get('quantile'),
+                    'step': self.eval_capture_context.get('step'),
+                    't_value': float(timesteps_cpu[idx].item()),
+                }
+                with open(filename.with_suffix('.json'), 'w', encoding='utf-8') as f:
+                    json.dump(meta, f, ensure_ascii=False, indent=2)
+            eval_dump_manager.increment(1)
+            written += 1
+        if written > 0:
+            print(f'[EvalDump] Saved {written} sample(s) to {output_dir}')
+
+    def _decode_metadata_string(self, bytes_tensor, len_tensor, index):
+        if bytes_tensor is None or len_tensor is None:
+            return ''
+        length = int(len_tensor[index].item())
+        if length <= 0:
+            return ''
+        data = bytes_tensor[index][:length].cpu().tolist()
+        return bytes(data).decode('utf-8', errors='ignore')
+
+    def _make_slug(self, text: str, max_length: int = 60):
+        slug = re.sub(r'[^A-Za-z0-9]+', '-', text.strip())[:max_length]
+        slug = slug.strip('-')
+        return slug or 'sample'
+
+    def _tensor_to_video(self, tensor):
+        if tensor.ndim != 4:
+            raise ValueError('Expected 4D tensor for video decode')
+        if tensor.shape[0] in (3, 4):
+            video = tensor.permute(1, 2, 3, 0)
+        elif tensor.shape[1] in (3, 4):
+            video = tensor.permute(0, 2, 3, 1)
+        else:
+            video = tensor
+        video = ((video + 1) / 2).clamp(0, 1)
+        return (video * 255).to(torch.uint8).cpu().numpy()
+
+    def _ensure_vae_device(self, device: torch.device):
+        if not hasattr(self, '_vae_loaded_device'):
+            self._vae_loaded_device = None
+        param = next(self.vae.parameters(), None)
+        current_device = None if param is None else param.device
+        is_meta = getattr(param, 'is_meta', False)
+        if is_meta or param is None:
+            dtype = self.model_config['dtype']
+            self.vae = AutoencoderKLWan.from_pretrained(self.vae_path, torch_dtype=dtype)
+            param = next(self.vae.parameters(), None)
+            current_device = None if param is None else param.device
+        needs_move = current_device != device or self._vae_loaded_device != device
+        if needs_move:
+            target_dtype = getattr(self.vae, 'dtype', None)
+            if target_dtype is None and param is not None:
+                target_dtype = param.dtype
+            if target_dtype is not None:
+                self.vae = self.vae.to(device=device, dtype=target_dtype)
+            else:
+                self.vae = self.vae.to(device=device)
+            self._vae_loaded_device = device
+        return self.vae
+
 
     def to_layers(self):
         transformer = self.transformer
