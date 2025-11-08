@@ -77,6 +77,11 @@ Install the rest of the dependencies:
 pip install -r requirements.txt
 ```
 
+(Optional) Install Flash Attention. It's not in the requirements file. Some models need it.
+```
+pip install flash-attn
+```
+
 ### Cosmos requirements
 NVIDIA Cosmos (the original Cosmos video model, not Cosmos-Predict2) additionally requires TransformerEngine.
 

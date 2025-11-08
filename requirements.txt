@@ -17,7 +17,6 @@ av
 einops
 accelerate
 loguru
-flash-attn
 omegaconf
 iopath
 termcolor
@@ -27,3 +26,5 @@ ftfy
 pytorch-optimizer
 wandb
 optimum-quanto
+wheel
+ninja
