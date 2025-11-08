@@ -355,7 +355,7 @@ class ConcatenatedBatchedDataset:
 
     def __len__(self):
         assert self.post_init_called
-        return len(self.iteration_order) // self.batch_size
+        return len(self.iteration_order) // self.global_batch_size
 
     def __getitem__(self, idx):
         assert self.post_init_called
