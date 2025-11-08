@@ -318,7 +318,9 @@ class ConcatenatedBatchedDataset:
         self.datasets = datasets
         self.post_init_called = False
 
-    def post_init(self, batch_size: dict, batch_size_image: dict):
+    def post_init(self, global_batch_size: dict, global_batch_size_image: dict, data_parallel_rank: int, data_parallel_world_size: int):
+        self.data_parallel_rank = data_parallel_rank
+        self.data_parallel_world_size = data_parallel_world_size
         iteration_order = []
         size_bucket = self.datasets[0].size_bucket
         for i, ds in enumerate(self.datasets):
@@ -332,21 +334,23 @@ class ConcatenatedBatchedDataset:
         self.iteration_order = np.array(iteration_order)
 
         # size_bucket could be [ar, w, h, frame] or [w, h, frames]
-        batch_size_dict = batch_size_image if size_bucket[-1] == 1 else batch_size
-        if None in batch_size_dict:
+        global_batch_size_dict = global_batch_size_image if size_bucket[-1] == 1 else global_batch_size
+        if None in global_batch_size_dict:
             # single value
-            self.batch_size = batch_size_dict[None]
+            self.global_batch_size = global_batch_size_dict[None]
         else:
             # per image size batch size
             bucket_size = math.sqrt(size_bucket[-2] * size_bucket[-3])
             min_diff = float('inf')
-            for size, bs in batch_size_dict.items():
+            for size, bs in global_batch_size_dict.items():
                 diff = abs(size - bucket_size)
                 if diff < min_diff:
                     min_diff = diff
-                    self.batch_size = bs
+                    self.global_batch_size = bs
 
-        self._make_divisible_by(self.batch_size)
+        assert self.global_batch_size % self.data_parallel_world_size == 0
+        self._make_divisible_by(self.global_batch_size)
+        self.batch_size = self.global_batch_size // self.data_parallel_world_size
         self.post_init_called = True
 
     def __len__(self):
@@ -355,9 +359,9 @@ class ConcatenatedBatchedDataset:
 
     def __getitem__(self, idx):
         assert self.post_init_called
-        start = idx * self.batch_size
-        end = start + self.batch_size
-        return [self.datasets[i.item()][j.item()] for i, j in self.iteration_order[start:end]]
+        start_idx = idx * self.global_batch_size + self.data_parallel_rank * self.batch_size
+        end_idx = start_idx + self.batch_size
+        return [self.datasets[i.item()][j.item()] for i, j in self.iteration_order[start_idx : end_idx]]
 
     def _make_divisible_by(self, n):
         new_length = (len(self.iteration_order) // n) * n
@@ -913,7 +917,7 @@ class Dataset:
             self.buckets.append(ConcatenatedBatchedDataset(datasets))
 
         for bucket in self.buckets:
-            bucket.post_init(global_batch_size, global_batch_size_image)
+            bucket.post_init(global_batch_size, global_batch_size_image, data_parallel_rank, data_parallel_world_size)
 
         iteration_order = []
         for i, bucket in enumerate(self.buckets):
@@ -943,13 +947,7 @@ class Dataset:
     def __getitem__(self, idx):
         assert self.post_init_called
         i, j = self.iteration_order[idx]
-        examples = self.buckets[i][j]
-        assert len(examples) % self.data_parallel_world_size == 0
-        batch_size = len(examples) // self.data_parallel_world_size
-        start_idx = self.data_parallel_rank * batch_size
-        examples_for_this_dp_rank = examples[start_idx:start_idx+batch_size]
-        if DEBUG:
-            print((start_idx, start_idx+batch_size))
+        examples_for_this_dp_rank = self.buckets[i][j]
         batch = self._collate(examples_for_this_dp_rank)
         return batch
 
