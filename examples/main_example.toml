@@ -15,6 +15,7 @@ epochs = 1000
 # Maximum number of steps to train.
 #max_steps = 5000
 # Batch size of a single forward/backward pass for one GPU.
+# Can also do per-resolution batch sizes, like this: micro_batch_size_per_gpu = [[512, 4], [1024, 1]]
 micro_batch_size_per_gpu = 1
 # For mixed video / image training, you can have a different batch size for images.
 #image_micro_batch_size_per_gpu = 4
