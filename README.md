@@ -141,15 +141,22 @@ output_dir = "eval_samples"
 caption_max_bytes = 160   # optional, truncation budget for prompt text
 source_max_bytes = 256    # optional, truncation budget for source path
 video_fps = 15            # mp4 fps when writing videos
-group_by = "eval"         # options: "eval" (per-step directories), "sample" (per-sample history folders), "flat" (all files in output_dir)
+group_by = "eval"         # options: "eval" (per-step dirs), "sample" (per-sample history folders), "flat" (everything in output_dir)
+mode = "inference"        # "teacher_forced", "inference", or "both"
+eval_prompts = ["pov arms grabbing a ball."]
+snapshot_seed = "constant"   # or an int for a custom base seed
+snapshot_frames = 49
+snapshot_resolution = [832, 480]  # width, height (multiples of 16)
 ```
 
 When enabled:
 - Only Longcat runs save predictions (other model types ignore this block for now).
-- The last pipeline stage on data-parallel rank 0 reconstructs the predicted clean latents, decodes them with the Longcat VAE, and writes MP4 files plus a small JSON sidecar containing the prompt/source metadata.
-- `group_by = "sample"` stores files under `<dataset>/quantile_xx/<slug>/step_<step>.mp4`, making it easy to see how each saved example evolves over time.
-- With the default `group_by = "eval"`, outputs live under `<output_dir>/<dataset>/step_<step>/quantile_<quantile>/`. Use `group_by = "sample"` to get `<output_dir>/<dataset>/quantile_<quantile>/<sample_slug>/step_<step>.mp4`, or `group_by = "flat"` to drop all mp4/json pairs directly inside `output_dir`.
-- Metadata capture adds a small amount of host memory overhead; leave `enabled = false` to disable the feature entirely.
+- `mode = "teacher_forced"` (default) dumps the denoising targets used for the eval loss (cheap). `mode = "inference"` runs the built-in Longcat sampler after every eval pass and generates one video per prompt in `eval_prompts` using the training pipeline itself (requires `pipeline_stages = 1`). `mode = "both"` keeps both behaviors and they share the `max_per_eval` budget.
+- Inference snapshots reuse the same seed each step when `snapshot_seed = "constant"`, making it easy to compare training progress; set an integer to choose your own base seed or omit the key for fresh random seeds.
+- `snapshot_frames` and `snapshot_resolution` control the generated clip shape. Step count and CFG strength follow Longcat defaults unless you also set `snapshot_steps` / `snapshot_guidance`.
+- `group_by = "sample"` stores files under `<dataset>/quantile_xx/<slug>/step_<step>.mp4`, making it easy to see how each saved example evolves over time. `group_by = "flat"` drops all MP4/JSON pairs directly inside `output_dir`.
+- With the default `group_by = "eval"`, outputs live under `<output_dir>/<dataset>/step_<step>/quantile_<quantile>/` (inference runs use `quantile_-1.00`).
+- Metadata capture adds a small amount of host memory overhead; leave `enabled = false` to disable the feature entirely or stick to `mode = "inference"` to skip per-sample reconstructions.
 
 ## Parallelism
 This code uses hybrid data- and pipeline-parallelism. Set the ```--num_gpus``` flag appropriately for your setup. Set ```pipeline_stages``` in the config file to control the degree of pipeline parallelism. Then the data parallelism degree will automatically be set to use all GPUs (number of GPUs must be divisible by pipeline_stages). For example, with 4 GPUs and pipeline_stages=2, you will run two instances of the model, each divided across two GPUs.

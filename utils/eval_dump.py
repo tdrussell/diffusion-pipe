@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -12,6 +13,16 @@ class EvalDumpState:
     quantile: Optional[float] = None
     samples_written: int = 0
     active: bool = False
+
+
+@dataclass
+class SnapshotJob:
+    prompt: str
+    seed: int
+    frames: int
+    resolution: tuple[int, int]
+    steps: Optional[int] = None
+    guidance: Optional[float] = None
 
 
 class EvalDumpManager:
@@ -29,6 +40,13 @@ class EvalDumpManager:
         self._config: dict = {}
         self._state = EvalDumpState()
         self.group_by = 'eval'
+        self.mode = 'teacher_forced'
+        self.eval_prompts: list[str] = []
+        self.snapshot_seed: int | str | None = None
+        self.snapshot_frames: int = 49
+        self.snapshot_resolution: tuple[int, int] | None = None
+        self.snapshot_steps: int | None = None
+        self.snapshot_guidance: float | None = None
 
     def apply_config(self, cfg: Optional[dict]):
         cfg = cfg or {}
@@ -41,6 +59,23 @@ class EvalDumpManager:
         self.video_fps = int(cfg.get('video_fps', self.video_fps))
         self.write_metadata_json = bool(cfg.get('write_metadata_json', True))
         self.group_by = cfg.get('group_by', 'eval')
+        self.mode = cfg.get('mode', 'teacher_forced')
+        self.eval_prompts = list(cfg.get('eval_prompts', []))
+        seed_cfg = cfg.get('snapshot_seed')
+        if isinstance(seed_cfg, str) and seed_cfg.isdigit():
+            self.snapshot_seed = int(seed_cfg)
+        else:
+            self.snapshot_seed = seed_cfg
+        self.snapshot_frames = int(cfg.get('snapshot_frames', self.snapshot_frames))
+        resolution = cfg.get('snapshot_resolution')
+        if resolution and len(resolution) == 2:
+            self.snapshot_resolution = (int(resolution[0]), int(resolution[1]))
+        else:
+            self.snapshot_resolution = None
+        steps_cfg = cfg.get('snapshot_steps')
+        self.snapshot_steps = int(steps_cfg) if steps_cfg is not None else None
+        guidance_cfg = cfg.get('snapshot_guidance')
+        self.snapshot_guidance = float(guidance_cfg) if guidance_cfg is not None else None
 
     def set_run_dir(self, run_dir: Path | str):
         if not self.enabled:
@@ -53,7 +88,13 @@ class EvalDumpManager:
         self.output_dir = path
 
     def requires_metadata(self) -> bool:
-        return self.enabled
+        return self.wants_teacher_forced()
+
+    def wants_teacher_forced(self) -> bool:
+        return self.enabled and self.mode in {'teacher_forced', 'both'}
+
+    def wants_inference_snapshots(self) -> bool:
+        return self.enabled and self.mode in {'inference', 'both'} and len(self.eval_prompts) > 0
 
     def begin_eval(self, step: int):
         if not self.enabled:
@@ -101,6 +142,40 @@ class EvalDumpManager:
 
     def group_flat(self) -> bool:
         return self.group_by == 'flat'
+
+    def build_snapshot_jobs(self, step: int) -> list[SnapshotJob]:
+        if not self.wants_inference_snapshots():
+            return []
+        jobs: list[SnapshotJob] = []
+        width, height = (self.snapshot_resolution or (832, 480))
+        for idx, prompt in enumerate(self.eval_prompts):
+            seed = self._resolve_snapshot_seed(idx, step)
+            jobs.append(
+                SnapshotJob(
+                    prompt=prompt,
+                    seed=seed,
+                    frames=self.snapshot_frames,
+                    resolution=(width, height),
+                    steps=self.snapshot_steps,
+                    guidance=self.snapshot_guidance,
+                )
+            )
+        return jobs
+
+    def _resolve_snapshot_seed(self, prompt_idx: int, step: int) -> int:
+        seed_cfg = self.snapshot_seed
+        if isinstance(seed_cfg, int):
+            base = seed_cfg
+        elif isinstance(seed_cfg, str):
+            if seed_cfg.lower() == 'constant':
+                base = 0
+            elif seed_cfg.lower() == 'step':
+                base = step
+            else:
+                base = random.randint(0, 2**31 - 1)
+        else:
+            base = random.randint(0, 2**31 - 1)
+        return int(base) + prompt_idx
 
     def build_output_dir(self, sample_slug: Optional[str] = None) -> Optional[Path]:
         if not self.should_record():

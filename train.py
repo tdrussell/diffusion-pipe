@@ -186,7 +186,7 @@ def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_st
     return total_loss / count
 
 
-def _evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps):
+def _evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps, dump_enabled, capture_teacher):
     pbar_total = 0
     for eval_dataloader in eval_dataloaders.values():
         pbar_total += len(eval_dataloader) * len(TIMESTEP_QUANTILES_FOR_EVAL) // eval_gradient_accumulation_steps
@@ -197,19 +197,19 @@ def _evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradi
         pbar = None
 
     start = time.time()
-    capture_active = eval_dump_manager.enabled and getattr(model, 'name', '') == 'longcat'
     for name, eval_dataloader in eval_dataloaders.items():
-        if capture_active and hasattr(model, 'set_eval_capture_context'):
+        if dump_enabled:
             eval_dump_manager.set_dataset(name)
         losses = []
         for quantile in TIMESTEP_QUANTILES_FOR_EVAL:
-            if capture_active and hasattr(model, 'set_eval_capture_context'):
+            if dump_enabled:
                 eval_dump_manager.set_quantile(quantile)
-                model.set_eval_capture_context({
-                    'step': step,
-                    'dataset': name,
-                    'quantile': quantile,
-                })
+                if capture_teacher and hasattr(model, 'set_eval_capture_context'):
+                    model.set_eval_capture_context({
+                        'step': step,
+                        'dataset': name,
+                        'quantile': quantile,
+                    })
             loss = evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_steps, quantile, pbar=pbar)
             losses.append(loss)
             if is_main_process():
@@ -221,6 +221,18 @@ def _evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradi
             tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
             if wandb_enable:
                 wandb.log({f'{name}/loss': avg_loss, 'step': step})
+        if dump_enabled and eval_dump_manager.wants_inference_snapshots() and hasattr(model, 'generate_snapshot_videos'):
+            eval_dump_manager.set_quantile(-1.0)
+            jobs = eval_dump_manager.build_snapshot_jobs(step)
+            if jobs:
+                model.generate_snapshot_videos(
+                    jobs,
+                    {
+                        'dataset': name,
+                        'step': step,
+                        'quantile': -1.0,
+                    },
+                )
 
     duration = time.time() - start
     if is_main_process():
@@ -235,19 +247,31 @@ def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradie
         return
     empty_cuda_cache()
     model.prepare_block_swap_inference(disable_block_swap=disable_block_swap)
-    capture_active = eval_dump_manager.enabled and getattr(model, 'name', '') == 'longcat'
-    if capture_active and hasattr(model, 'enable_eval_capture'):
+    dump_enabled = eval_dump_manager.enabled and getattr(model, 'name', '') == 'longcat'
+    capture_teacher = dump_enabled and eval_dump_manager.wants_teacher_forced()
+    if capture_teacher and hasattr(model, 'enable_eval_capture'):
         model.enable_eval_capture(True)
+    if dump_enabled:
         eval_dump_manager.begin_eval(step)
     with torch.no_grad(), isolate_rng():
         seed = get_rank()
         random.seed(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
-        _evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
+        _evaluate(
+            model,
+            model_engine,
+            eval_dataloaders,
+            tb_writer,
+            step,
+            eval_gradient_accumulation_steps,
+            dump_enabled,
+            capture_teacher,
+        )
     empty_cuda_cache()
-    if capture_active and hasattr(model, 'enable_eval_capture'):
+    if capture_teacher and hasattr(model, 'enable_eval_capture'):
         model.enable_eval_capture(False)
+    if dump_enabled:
         eval_dump_manager.end_eval()
     model.prepare_block_swap_training()
 
@@ -478,6 +502,13 @@ if __name__ == '__main__':
                         break
         dist.barrier()
         quit()
+
+    if (
+        eval_dump_manager.wants_inference_snapshots()
+        and getattr(model, 'name', '') == 'longcat'
+        and hasattr(model, 'preload_snapshot_prompts')
+    ):
+        model.preload_snapshot_prompts(eval_dump_manager.eval_prompts)
 
     dataset_manager.cache()
     if args.cache_only:

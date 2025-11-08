@@ -52,11 +52,11 @@ weight_decay = 0.01
 eps = 1e-8
 
 [eval_dump]
-# Optional: enable Longcat eval video dumps
 enabled = true
-max_per_eval = 4
 output_dir = 'eval_samples'
-caption_max_bytes = 160
-source_max_bytes = 256
-video_fps = 15
-group_by = 'eval'  # use 'sample' for per-sample history folders
+group_by = 'sample'
+mode = 'inference'
+eval_prompts = ["pov arms grabbing a ball."]
+snapshot_seed = "constant"
+snapshot_frames = 49
+snapshot_resolution = [320, 480]

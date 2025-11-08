@@ -4,7 +4,7 @@ import re
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import imageio.v3 as imageio
 import torch
@@ -14,6 +14,8 @@ from safetensors import torch as safetorch
 from transformers import AutoTokenizer, UMT5EncoderModel
 
 from models.base import BasePipeline, PreprocessMediaFile, make_contiguous
+from tqdm import tqdm
+
 from utils.common import AUTOCAST_DTYPE, is_main_process
 from utils.offloading import ModelOffloader
 from utils.eval_dump import eval_dump_manager
@@ -91,6 +93,7 @@ class LongcatVideoPipeline(BasePipeline):
         self.eval_capture_active = False
         self.eval_capture_context = {}
         self.sample_slug_counts = defaultdict(int)
+        self._snapshot_prompt_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
     def model_specific_dataset_config_validation(self, dataset_config):
         pass
@@ -251,6 +254,7 @@ class LongcatVideoPipeline(BasePipeline):
         dtype,
         max_sequence_length: int = 512,
         num_videos_per_prompt: int = 1,
+        text_encoder: Optional[UMT5EncoderModel] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         prompt = [prompt] if isinstance(prompt, str) else list(prompt)
         text_inputs = self.tokenizer(
@@ -265,7 +269,8 @@ class LongcatVideoPipeline(BasePipeline):
         input_ids = text_inputs.input_ids.to(device)
         attention_mask = text_inputs.attention_mask.to(device)
 
-        hidden_states = self.text_encoder(input_ids, attention_mask).last_hidden_state.to(device=device, dtype=dtype)
+        encoder = text_encoder or self.text_encoder
+        hidden_states = encoder(input_ids, attention_mask).last_hidden_state.to(device=device, dtype=dtype)
 
         batch_size, seq_len, hidden = hidden_states.shape
         hidden_states = hidden_states.repeat_interleave(num_videos_per_prompt, dim=0)
@@ -440,43 +445,35 @@ class LongcatVideoPipeline(BasePipeline):
         decoded = decoded.clamp(-1, 1).cpu()
         timesteps_cpu = timesteps[:batch].detach().cpu()
         written = 0
+        last_path = None
         for idx in range(batch):
             if eval_dump_manager.remaining_slots() <= 0:
                 break
             caption = self._decode_metadata_string(caption_bytes, caption_len, idx)
             source = self._decode_metadata_string(source_bytes, source_len, idx)
             slug = self._make_slug(caption, source, f'sample{idx}')
-            output_dir = eval_dump_manager.build_output_dir(slug if eval_dump_manager.group_by_sample() else None)
-            if output_dir is None:
-                break
-            current_state = eval_dump_manager.current_context()
-            sequential_id = (current_state.samples_written or 0) + 1
-            step_val = self.eval_capture_context.get('step') or current_state.step or 0
-            quantile_val = self.eval_capture_context.get('quantile')
-            if eval_dump_manager.group_by_sample():
-                filename_stem = f"step_{int(step_val):06d}_q{(quantile_val or 0.0):.2f}"
-            elif eval_dump_manager.group_flat():
-                filename_stem = f"{slug}_step_{int(step_val):06d}_q{(quantile_val or 0.0):.2f}"
-            else:
-                filename_stem = f"{sequential_id:04d}_{slug}"
-            filename = output_dir / f"{filename_stem}.{eval_dump_manager.video_format}"
             video_np = self._tensor_to_video(decoded[idx])
-            imageio.imwrite(filename, video_np, fps=eval_dump_manager.video_fps)
-            if eval_dump_manager.write_metadata_json:
-                meta = {
-                    'caption': caption,
-                    'source': source,
-                    'dataset': self.eval_capture_context.get('dataset'),
-                    'quantile': self.eval_capture_context.get('quantile'),
-                    'step': self.eval_capture_context.get('step'),
-                    't_value': float(timesteps_cpu[idx].item()),
-                }
-                with open(filename.with_suffix('.json'), 'w', encoding='utf-8') as f:
-                    json.dump(meta, f, ensure_ascii=False, indent=2)
-            eval_dump_manager.increment(1)
+            meta = {
+                'caption': caption,
+                'source': source,
+                'dataset': self.eval_capture_context.get('dataset'),
+                'quantile': self.eval_capture_context.get('quantile'),
+                'step': self.eval_capture_context.get('step'),
+                't_value': float(timesteps_cpu[idx].item()),
+                'mode': 'teacher_forced',
+            }
+            saved_path = self._emit_eval_artifact(
+                video_np,
+                slug,
+                meta,
+                sample_slug=slug if eval_dump_manager.group_by_sample() else None,
+            )
+            if saved_path is None:
+                break
+            last_path = saved_path
             written += 1
-        if written > 0:
-            print(f'[EvalDump] Saved {written} sample(s) to {output_dir}')
+        if written > 0 and last_path is not None:
+            print(f'[EvalDump] Saved {written} teacher sample(s) under {last_path.parent}')
 
     def _decode_metadata_string(self, bytes_tensor, len_tensor, index):
         if bytes_tensor is None or len_tensor is None:
@@ -502,6 +499,31 @@ class LongcatVideoPipeline(BasePipeline):
             slug = f"{slug}-{count}"
         return slug
 
+    def _emit_eval_artifact(self, video_np, slug: str, meta: dict, sample_slug: Optional[str] = None):
+        folder_slug = sample_slug or slug
+        dir_arg = folder_slug if eval_dump_manager.group_by_sample() else None
+        output_dir = eval_dump_manager.build_output_dir(dir_arg)
+        if output_dir is None:
+            return None
+        current_state = eval_dump_manager.current_context()
+        step_val = meta.get('step') or current_state.step or 0
+        quantile_val = meta.get('quantile') if meta.get('quantile') is not None else current_state.quantile
+        sequential_id = (current_state.samples_written or 0) + 1
+        if eval_dump_manager.group_by_sample():
+            filename_stem = f"step_{int(step_val):06d}_q{(quantile_val or 0.0):.2f}"
+        elif eval_dump_manager.group_flat():
+            filename_stem = f"{slug}_step_{int(step_val):06d}_q{(quantile_val or 0.0):.2f}"
+        else:
+            filename_stem = f"{sequential_id:04d}_{slug}"
+        filename = output_dir / f"{filename_stem}.{eval_dump_manager.video_format}"
+        imageio.imwrite(filename, video_np, fps=eval_dump_manager.video_fps)
+        if eval_dump_manager.write_metadata_json:
+            json_path = filename.with_suffix('.json')
+            with open(json_path, 'w', encoding='utf-8') as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+        eval_dump_manager.increment(1)
+        return filename
+
     def _tensor_to_video(self, tensor):
         if tensor.ndim != 4:
             raise ValueError('Expected 4D tensor for video decode')
@@ -514,6 +536,184 @@ class LongcatVideoPipeline(BasePipeline):
         video = ((video + 1) / 2).clamp(0, 1)
         return (video * 255).to(torch.uint8).cpu().numpy()
 
+    def preload_snapshot_prompts(self, prompts, include_uncond: bool = True, device: Optional[torch.device] = None):
+        if not prompts or not eval_dump_manager.wants_inference_snapshots():
+            return
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self._ensure_snapshot_prompt_cache(prompts, include_uncond, device)
+
+    def _ensure_snapshot_prompt_cache(self, prompts: list[str], include_uncond: bool, device: torch.device):
+        needed = set(prompts)
+        if include_uncond:
+            needed.add('')
+        missing = [p for p in needed if p not in self._snapshot_prompt_cache]
+        if not missing:
+            return
+        encoder = self._load_snapshot_text_encoder(device)
+        try:
+            for prompt in missing:
+                embeds, mask = self.encode_prompt(
+                    [prompt],
+                    device=device,
+                    dtype=encoder.dtype,
+                    text_encoder=encoder,
+                )
+                self._snapshot_prompt_cache[prompt] = (
+                    embeds.detach().to('cpu', torch.float32),
+                    mask.detach().to('cpu'),
+                )
+        finally:
+            del encoder
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _get_cached_snapshot_prompt(self, prompt: str, device: torch.device, dtype: torch.dtype):
+        embeds_cpu, mask_cpu = self._snapshot_prompt_cache[prompt]
+        return embeds_cpu.to(device=device, dtype=dtype), mask_cpu.to(device=device)
+
+    def _load_snapshot_text_encoder(self, device: torch.device):
+        dtype = self.model_config['dtype']
+        if device.type != 'cuda' and dtype not in (torch.float32, torch.float64):
+            dtype = torch.float32
+        encoder = UMT5EncoderModel.from_pretrained(self.text_encoder_path, torch_dtype=dtype)
+        encoder.requires_grad_(False)
+        return encoder.to(device).eval()
+
+    def _snapshot_guidance(self, job):
+        guidance_scale = job.guidance
+        if guidance_scale is None:
+            guidance_scale = eval_dump_manager.snapshot_guidance
+        if guidance_scale is None:
+            guidance_scale = float(self.model_config.get('guidance', 4.0))
+        if isinstance(guidance_scale, str):
+            guidance_scale = float(guidance_scale)
+        return guidance_scale
+
+    def _can_run_snapshot_sampler(self) -> bool:
+        engine = getattr(self, 'model_engine', None)
+        if engine is not None and getattr(engine, 'num_stages', 1) > 1:
+            print('[EvalDump] Skipping inference snapshots because pipeline_stages > 1')
+            return False
+        return True
+
+    def generate_snapshot_videos(self, jobs, context):
+        if not jobs or not self._can_run_snapshot_sampler():
+            return
+        device = next(self.transformer.parameters()).device
+        transformer_dtype = next(self.transformer.parameters()).dtype
+        include_uncond = any(self._snapshot_guidance(job) > 1.0 + 1e-5 for job in jobs)
+        self._ensure_snapshot_prompt_cache([job.prompt for job in jobs], include_uncond, device)
+        print(f"[EvalDump] Generating {len(jobs)} snapshot(s) for step {context.get('step')}, dataset {context.get('dataset')}")
+        was_training_transformer = self.transformer.training
+        was_training_text = self.text_encoder.training
+        was_training_vae = self.vae.training
+        self.transformer.eval()
+        self.text_encoder.eval()
+        self.vae.eval()
+        try:
+            with torch.no_grad():
+                progress = tqdm(total=len(jobs), desc='Eval snapshots', leave=False)
+                for idx, job in enumerate(jobs):
+                    if eval_dump_manager.remaining_slots() <= 0:
+                        progress.write('[EvalDump] Snapshot quota exhausted for this eval, skipping remaining prompts.')
+                        break
+                    video_tensor = self._run_snapshot_job(
+                        job,
+                        device,
+                        transformer_dtype,
+                        step_desc=f'Steps ({idx + 1}/{len(jobs)})',
+                    )
+                    if video_tensor is None:
+                        progress.update(1)
+                        continue
+                    video_np = self._tensor_to_video(video_tensor)
+                    slug = self._make_slug(job.prompt, '', f'prompt{idx}')
+                    meta = {
+                        'caption': job.prompt,
+                        'source': '',
+                        'dataset': context.get('dataset'),
+                        'quantile': context.get('quantile'),
+                        'step': context.get('step'),
+                        'mode': 'inference',
+                        'prompt': job.prompt,
+                        'seed': job.seed,
+                        'frames': job.frames,
+                        'resolution': {'width': job.resolution[0], 'height': job.resolution[1]},
+                    }
+                    saved_path = self._emit_eval_artifact(
+                        video_np,
+                        slug,
+                        meta,
+                        sample_slug=slug if eval_dump_manager.group_by_sample() else None,
+                    )
+                    if saved_path is None:
+                        break
+                    progress.write(f'[EvalDump] Snapshot saved: {saved_path}')
+                    progress.update(1)
+                progress.close()
+        finally:
+            if was_training_transformer:
+                self.transformer.train(True)
+            if was_training_text:
+                self.text_encoder.train(True)
+            if was_training_vae:
+                self.vae.train(True)
+        print('[EvalDump] Snapshot generation complete.')
+
+    def _run_snapshot_job(self, job, device, transformer_dtype, step_desc: Optional[str] = None):
+        steps = int(job.steps or eval_dump_manager.snapshot_steps or 24)
+        guidance_scale = self._snapshot_guidance(job)
+        do_cfg = guidance_scale is not None and guidance_scale > 1.0 + 1e-5
+        width, height = int(job.resolution[0]), int(job.resolution[1])
+        frames = int(job.frames)
+        spatial_down = getattr(self.vae.config, 'scale_factor_spatial', 8)
+        temporal_down = getattr(self.vae.config, 'scale_factor_temporal', 4)
+        if height % spatial_down != 0 or width % spatial_down != 0:
+            raise ValueError(f'snapshot_resolution {job.resolution} must be divisible by {spatial_down}')
+        num_latent_frames = (frames - 1) // temporal_down + 1
+        latent_height = height // spatial_down
+        latent_width = width // spatial_down
+        latents_shape = (1, self.transformer.config.in_channels, num_latent_frames, latent_height, latent_width)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(job.seed) & 0xFFFFFFFF)
+        latents = torch.randn(latents_shape, generator=generator, device=device, dtype=torch.float32)
+        prompt_embeds, prompt_attention_mask = self._get_cached_snapshot_prompt(job.prompt, device, transformer_dtype)
+        if do_cfg:
+            uncond_embeds, uncond_mask = self._get_cached_snapshot_prompt('', device, transformer_dtype)
+            prompt_embeds = torch.cat([uncond_embeds, prompt_embeds], dim=0)
+            prompt_attention_mask = torch.cat([uncond_mask, prompt_attention_mask], dim=0)
+        scheduler = self.scheduler
+        sigmas = torch.linspace(1.0, 0.001, steps)
+        scheduler.set_timesteps(steps, sigmas=sigmas, device=device)
+        timesteps = scheduler.timesteps.to(device=device, dtype=torch.float32)
+        latents_dtype = latents.dtype
+        step_bar = tqdm(total=len(timesteps), desc=step_desc or 'Snapshot steps', leave=False)
+        for t in timesteps:
+            latent_input = torch.cat([latents, latents], dim=0) if do_cfg else latents
+            latent_model_input = latent_input.to(transformer_dtype)
+            timestep_vec = t.expand(latent_input.shape[0]).to(device=device, dtype=latents.dtype)
+            with torch.autocast('cuda', dtype=AUTOCAST_DTYPE):
+                noise_pred = self.transformer(
+                    hidden_states=latent_model_input,
+                    timestep=timestep_vec,
+                    encoder_hidden_states=prompt_embeds,
+                    encoder_attention_mask=prompt_attention_mask,
+                )
+            noise_pred = noise_pred.to(latents_dtype)
+            if do_cfg:
+                noise_uncond, noise_cond = noise_pred.chunk(2)
+                noise_pred = noise_uncond + guidance_scale * (noise_cond - noise_uncond)
+            noise_pred = -noise_pred
+            latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+            step_bar.update(1)
+        step_bar.close()
+        latents = latents.to(self.vae.dtype)
+        denorm_latents = self.denormalize_latents(latents)
+        vae = self._ensure_vae_device(device)
+        decoded = vae.decode(denorm_latents.to(device, vae.dtype)).sample.to(torch.float32)
+        decoded = decoded.clamp(-1, 1).cpu()
+        return decoded[0]
     def _ensure_vae_device(self, device: torch.device):
         if not hasattr(self, '_vae_loaded_device'):
             self._vae_loaded_device = None
