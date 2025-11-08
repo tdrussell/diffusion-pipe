@@ -47,6 +47,8 @@ class EvalDumpManager:
         self.snapshot_resolution: tuple[int, int] | None = None
         self.snapshot_steps: int | None = None
         self.snapshot_guidance: float | None = None
+        self.snapshot_init_seed: int = -1
+        self._eval_seed_base: Optional[int] = None
 
     def apply_config(self, cfg: Optional[dict]):
         cfg = cfg or {}
@@ -76,6 +78,7 @@ class EvalDumpManager:
         self.snapshot_steps = int(steps_cfg) if steps_cfg is not None else None
         guidance_cfg = cfg.get('snapshot_guidance')
         self.snapshot_guidance = float(guidance_cfg) if guidance_cfg is not None else None
+        self.snapshot_init_seed = int(cfg.get('snapshot_init_seed', self.snapshot_init_seed))
 
     def set_run_dir(self, run_dir: Path | str):
         if not self.enabled:
@@ -100,9 +103,11 @@ class EvalDumpManager:
         if not self.enabled:
             return
         self._state = EvalDumpState(step=step, samples_written=0, active=True)
+        self._eval_seed_base = self._compute_eval_seed_base()
 
     def end_eval(self):
         self._state = EvalDumpState()
+        self._eval_seed_base = None
 
     def set_dataset(self, name: str):
         if not self.enabled:
@@ -167,15 +172,24 @@ class EvalDumpManager:
         if isinstance(seed_cfg, int):
             base = seed_cfg
         elif isinstance(seed_cfg, str):
-            if seed_cfg.lower() == 'constant':
-                base = 0
-            elif seed_cfg.lower() == 'step':
+            lowered = seed_cfg.lower()
+            if lowered == 'constant':
+                base = self._eval_seed_base if self._eval_seed_base is not None else self._compute_eval_seed_base()
+            elif lowered == 'step':
                 base = step
             else:
-                base = random.randint(0, 2**31 - 1)
+                base = self._random_seed()
         else:
-            base = random.randint(0, 2**31 - 1)
+            base = self._eval_seed_base if self._eval_seed_base is not None else self._compute_eval_seed_base()
         return int(base) + prompt_idx
+
+    def _compute_eval_seed_base(self) -> int:
+        if self.snapshot_init_seed is not None and self.snapshot_init_seed >= 0:
+            return int(self.snapshot_init_seed)
+        return self._random_seed()
+
+    def _random_seed(self) -> int:
+        return random.randint(0, 2**31 - 1)
 
     def build_output_dir(self, sample_slug: Optional[str] = None) -> Optional[Path]:
         if not self.should_record():

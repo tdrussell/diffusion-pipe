@@ -58,5 +58,6 @@ group_by = 'sample'
 mode = 'inference'
 eval_prompts = ["pov arms grabbing a ball."]
 snapshot_seed = "constant"
+snapshot_init_seed = -1
 snapshot_frames = 49
 snapshot_resolution = [320, 480]

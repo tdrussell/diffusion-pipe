@@ -484,7 +484,7 @@ class LongcatVideoPipeline(BasePipeline):
         data = bytes_tensor[index][:length].cpu().tolist()
         return bytes(data).decode('utf-8', errors='ignore')
 
-    def _make_slug(self, caption: str, source: str = '', fallback: str = 'sample', max_length: int = 60):
+    def _make_slug(self, caption: str, source: str = '', fallback: str = 'sample', max_length: int = 60, dedupe: bool = True):
         base = caption.strip() if caption else ''
         if not base and source:
             base = Path(source).stem
@@ -493,10 +493,11 @@ class LongcatVideoPipeline(BasePipeline):
         slug = re.sub(r'[^A-Za-z0-9]+', '-', base)[:max_length].strip('-')
         if not slug:
             slug = fallback
-        count = self.sample_slug_counts[slug]
-        self.sample_slug_counts[slug] += 1
-        if count > 0:
-            slug = f"{slug}-{count}"
+        if dedupe:
+            count = self.sample_slug_counts[slug]
+            self.sample_slug_counts[slug] += 1
+            if count > 0:
+                slug = f"{slug}-{count}"
         return slug
 
     def _emit_eval_artifact(self, video_np, slug: str, meta: dict, sample_slug: Optional[str] = None):
@@ -628,7 +629,8 @@ class LongcatVideoPipeline(BasePipeline):
                         progress.update(1)
                         continue
                     video_np = self._tensor_to_video(video_tensor)
-                    slug = self._make_slug(job.prompt, '', f'prompt{idx}')
+                    dedupe_slug = not eval_dump_manager.group_by_sample()
+                    slug = self._make_slug(job.prompt, '', f'prompt{idx}', dedupe=dedupe_slug)
                     meta = {
                         'caption': job.prompt,
                         'source': '',
