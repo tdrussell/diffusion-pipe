@@ -30,13 +30,14 @@ from utils.isolate_rng import isolate_rng
 from utils.patches import apply_patches
 from utils.unsloth_utils import unsloth_checkpoint
 from utils.pipeline import ManualPipelineModule
+from utils.eval_dump import eval_dump_manager
 
 # needed for broadcasting Queue in dataset.py
 mp.current_process().authkey = b'afsaskgfdjh4'
 
 wandb_enable = False
 
-TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+TIMESTEP_QUANTILES_FOR_EVAL = [0.5, 0.9]
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--config', help='Path to TOML configuration file.')
@@ -185,7 +186,7 @@ def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_st
     return total_loss / count
 
 
-def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps):
+def _evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps, dump_enabled, capture_teacher):
     pbar_total = 0
     for eval_dataloader in eval_dataloaders.values():
         pbar_total += len(eval_dataloader) * len(TIMESTEP_QUANTILES_FOR_EVAL) // eval_gradient_accumulation_steps
@@ -197,8 +198,18 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
 
     start = time.time()
     for name, eval_dataloader in eval_dataloaders.items():
+        if dump_enabled:
+            eval_dump_manager.set_dataset(name)
         losses = []
         for quantile in TIMESTEP_QUANTILES_FOR_EVAL:
+            if dump_enabled:
+                eval_dump_manager.set_quantile(quantile)
+                if capture_teacher and hasattr(model, 'set_eval_capture_context'):
+                    model.set_eval_capture_context({
+                        'step': step,
+                        'dataset': name,
+                        'quantile': quantile,
+                    })
             loss = evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_steps, quantile, pbar=pbar)
             losses.append(loss)
             if is_main_process():
@@ -210,6 +221,18 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
             tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
             if wandb_enable:
                 wandb.log({f'{name}/loss': avg_loss, 'step': step})
+        if dump_enabled and eval_dump_manager.wants_inference_snapshots() and hasattr(model, 'generate_snapshot_videos'):
+            eval_dump_manager.set_quantile(-1.0)
+            jobs = eval_dump_manager.build_snapshot_jobs(step)
+            if jobs:
+                model.generate_snapshot_videos(
+                    jobs,
+                    {
+                        'dataset': name,
+                        'step': step,
+                        'quantile': -1.0,
+                    },
+                )
 
     duration = time.time() - start
     if is_main_process():
@@ -224,13 +247,32 @@ def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradie
         return
     empty_cuda_cache()
     model.prepare_block_swap_inference(disable_block_swap=disable_block_swap)
+    dump_enabled = eval_dump_manager.enabled and getattr(model, 'name', '') == 'longcat'
+    capture_teacher = dump_enabled and eval_dump_manager.wants_teacher_forced()
+    if capture_teacher and hasattr(model, 'enable_eval_capture'):
+        model.enable_eval_capture(True)
+    if dump_enabled:
+        eval_dump_manager.begin_eval(step)
     with torch.no_grad(), isolate_rng():
         seed = get_rank()
         random.seed(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
-        _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
+        _evaluate(
+            model,
+            model_engine,
+            eval_dataloaders,
+            tb_writer,
+            step,
+            eval_gradient_accumulation_steps,
+            dump_enabled,
+            capture_teacher,
+        )
     empty_cuda_cache()
+    if capture_teacher and hasattr(model, 'enable_eval_capture'):
+        model.enable_eval_capture(False)
+    if dump_enabled:
+        eval_dump_manager.end_eval()
     model.prepare_block_swap_training()
 
 
@@ -273,6 +315,7 @@ if __name__ == '__main__':
         config = json.loads(json.dumps(toml.load(f)))
 
     set_config_defaults(config)
+    eval_dump_manager.apply_config(config.get('eval_dump', {}))
     common.AUTOCAST_DTYPE = config['model']['dtype']
     dataset_util.UNCOND_FRACTION = config.get('uncond_fraction', 0.0)
     if map_num_proc := config.get('map_num_proc', None):
@@ -343,6 +386,9 @@ if __name__ == '__main__':
     elif model_type == 'auraflow':
         from models import auraflow
         model = auraflow.AuraFlowPipeline(config)
+    elif model_type == 'longcat':
+        from models import longcat_video
+        model = longcat_video.LongcatVideoPipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -381,8 +427,14 @@ if __name__ == '__main__':
             config_path = eval_dataset['config']
         with open(config_path) as f:
             eval_dataset_config = toml.load(f)
-        eval_data_map[name] = dataset_util.Dataset(eval_dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
-        dataset_manager.register(eval_data_map[name])
+        eval_dataset_obj = dataset_util.Dataset(eval_dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
+        if eval_dump_manager.requires_metadata():
+            eval_dataset_obj.enable_eval_metadata(
+                caption_max_bytes=eval_dump_manager.caption_max_bytes,
+                source_max_bytes=eval_dump_manager.source_max_bytes,
+            )
+        eval_data_map[name] = eval_dataset_obj
+        dataset_manager.register(eval_dataset_obj)
 
     # For testing
 
@@ -451,6 +503,13 @@ if __name__ == '__main__':
         dist.barrier()
         quit()
 
+    if (
+        eval_dump_manager.wants_inference_snapshots()
+        and getattr(model, 'name', '') == 'longcat'
+        and hasattr(model, 'preload_snapshot_prompts')
+    ):
+        model.preload_snapshot_prompts(eval_dump_manager.eval_prompts)
+
     dataset_manager.cache()
     if args.cache_only:
         quit()
@@ -483,6 +542,8 @@ if __name__ == '__main__':
             raise ValueError(f"Checkpoint directory {run_dir} does not exist")
     else:  # Not resuming, use most recent (newly created) dir
         run_dir = get_most_recent_run_dir(config['output_dir'])
+
+    eval_dump_manager.set_run_dir(run_dir)
 
     # WandB logging
     wandb_enable = config.get('monitoring', {}).get('enable_wandb', False)

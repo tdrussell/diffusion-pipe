@@ -106,7 +106,7 @@ steps_per_print = 1
 # single_beginning: one clip starting at the beginning of the video
 # single_middle: one clip from the middle of the video (cutting off the start and end equally)
 # default is single_beginning
-video_clip_mode = 'single_beginning'
+video_clip_mode = 'single_middle'
 
 # By default, the loss graphs in Tensorboard / WandB have step as the x-axis. You can change it to number of examples seen instead.
 #x_axis_examples = true

@@ -22,3 +22,7 @@
 [submodule "submodules/HunyuanImage-2.1"]
 	path = submodules/HunyuanImage-2.1
 	url = https://github.com/Tencent-Hunyuan/HunyuanImage-2.1
+[submodule "submodules/LongCat-Video"]
+	path = submodules/LongCat-Video
+	url = https://github.com/meituan-longcat/LongCat-Video
+
