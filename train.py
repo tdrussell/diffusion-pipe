@@ -733,13 +733,57 @@ if __name__ == '__main__':
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
-    scheduler_type = config.get('lr_scheduler', 'constant')
-    if scheduler_type == 'constant':
-        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
-    elif scheduler_type == 'linear':
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
-    else:
-        raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
+
+    def create_scheduler(optimizer, config, total_steps):
+        """Recursively create a scheduler from config."""
+
+        # Make a copy so we can pop items
+        config = config.copy()
+        scheduler_type = config.pop('type')
+
+        if scheduler_type == 'constant':
+            # Can pass 'factor' in config. Defaults to 1.0
+            return torch.optim.lr_scheduler.ConstantLR(optimizer, **config)
+
+        elif scheduler_type == 'linear':
+            # Auto-calculate total_iters if not provided
+            if 'total_iters' not in config:
+                config['total_iters'] = total_steps
+            return torch.optim.lr_scheduler.LinearLR(optimizer, **config)
+
+        elif scheduler_type == 'cosine_annealing_warm_restarts':
+            if 'T_0' not in config:
+                raise ValueError("Config error: T_0 must be specified for cosine_annealing_warm_restarts")
+            return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, **config)
+
+        elif scheduler_type == 'exponential':
+            if 'gamma' not in config:
+                raise ValueError("Config error: 'gamma' must be specified for exponential scheduler")
+            return torch.optim.lr_scheduler.ExponentialLR(optimizer, **config)
+
+        elif scheduler_type == 'sequential':
+            if 'schedulers' not in config or 'milestones' not in config:
+                raise ValueError("Config error: 'schedulers' (list) and 'milestones' (list) must be set for sequential scheduler")
+
+            sub_schedulers = []
+            for sub_config in config['schedulers']:
+                sub_schedulers.append(create_scheduler(optimizer, sub_config, total_steps))
+
+            milestones = config['milestones']
+            return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=sub_schedulers, milestones=milestones)
+
+        else:
+            raise NotImplementedError(f'Unknown lr_scheduler type: {scheduler_type}')
+
+
+    old_scheduler_type = config.get('lr_scheduler', None)
+    if old_scheduler_type:
+        print('Warning: lr_scheduler is deprecated. Use lr_scheduler_config instead.')
+    scheduler_config = config.get('lr_scheduler_config', {'type': old_scheduler_type or 'constant'})
+    total_steps_for_scheduler = config['epochs'] * steps_per_epoch
+    lr_scheduler = create_scheduler(optimizer, scheduler_config, total_steps_for_scheduler)
+
+
     if config['warmup_steps'] > 0:
         warmup_steps = config['warmup_steps']
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)

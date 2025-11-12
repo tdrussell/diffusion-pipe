@@ -25,13 +25,12 @@ pipeline_stages = 1
 gradient_accumulation_steps = 1
 # Grad norm clipping.
 gradient_clipping = 1.0
-# Learning rate warmup.
-warmup_steps = 100
+
 # Force the learning rate to be this value, regardless of what the optimizer or anything else says.
 # Can be used to change learning rate even when resuming from checkpoint.
 #force_constant_lr = 1e-5
-# Can be 'constant' or 'linear'. If unset, will default to 'constant', i.e. no LR scheduler.
-#lr_scheduler = 'linear'
+# DEPRECATED: Can be 'constant' or 'linear'. If unset, will default to 'constant', i.e. no LR scheduler.
+#lr_scheduler = 'linear' # Use lr_scheduler_config instead.
 
 # Block swapping is supported for Wan, HunyuanVideo, Flux, and Chroma. This value controls the number
 # of blocks kept offloaded to RAM. Increasing it lowers VRAM use, but has a performance penalty. The
@@ -110,6 +109,55 @@ video_clip_mode = 'single_beginning'
 
 # By default, the loss graphs in Tensorboard / WandB have step as the x-axis. You can change it to number of examples seen instead.
 #x_axis_examples = true
+
+
+
+# Learning rate warmup.
+warmup_steps = 100
+
+#[lr_scheduler_config]
+# Scheduler type
+#type = 'cosine_annealing_warm_restarts'
+
+# Required: Number of iterations (steps) for the first restart
+#T_0 = 1000
+
+# Optional: Factor by which T_0 is multiplied after a restart (default: 1)
+# T_mult = 1
+
+# Optional: Minimum learning rate (default: 0)
+# eta_min = 1e-6
+
+#[lr_scheduler_config]
+# Scheduler type
+#type = 'linear'
+# Optional: Starting LR factor (default: 1.0)
+# start_factor = 1.0
+# Optional: Ending LR factor (default: 0.0)
+# end_factor = 0.0
+# Optional: Total iterations.
+# If omitted, it's auto-calculated from 'epochs' * 'steps_per_epoch'
+# total_iters = 50000
+
+#[lr_scheduler_config]
+# Set the top-level type to 'sequential'
+#type = 'sequential'
+# Define the milestones (when to switch schedulers)
+# This means: scheduler 0 runs for 5000 steps (from 0 to 5000)
+# scheduler 1 runs after that (from step 5001 onwards)
+#milestones = [5000]
+# Define the list of schedulers
+#schedulers = [
+# 1. First scheduler: ExponentialLR for the first 5000 steps
+#    { type = 'exponential', gamma = 0.999 },
+# 2. Second scheduler: CosineAnnealingWarmRestarts for the rest of training
+#    { type = 'cosine_annealing_warm_restarts', T_0 = 1000, T_mult = 1, eta_min = 1e-6 }
+#]
+
+[lr_scheduler_config]
+type = 'constant'
+# Optional: The factor by which to multiply the LR (default: 1.0)
+# factor = 1.0
 
 # This is how you configure HunyuanVideo. Other models will be different. See docs/supported_models.md for
 # details on the configuration and options for each model.
