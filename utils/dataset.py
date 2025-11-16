@@ -723,7 +723,9 @@ class DirectoryDataset:
                 filepath_or_file = str(image_file)
             else:
                 tar_filename = image_spec[0]
-                tar_f = tarfile_map.setdefault(tar_filename, tarfile.TarFile(tar_filename))
+                if tar_filename not in tarfile_map:
+                    tarfile_map[tar_filename] = tarfile.TarFile(tar_filename)
+                tar_f = tarfile_map[tar_filename]
                 filepath_or_file = tar_f.extractfile(str(image_file))
 
             if image_file.suffix == '.webp':
@@ -1045,7 +1047,9 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         for i in range(0, len(tensors_and_masks), caching_batch_size):
             tensor = torch.stack([t[0] for t in tensors_and_masks[i:i+caching_batch_size]])
             c_tensor = torch.stack([t[0] for t in control_tensors_and_masks[i:i+caching_batch_size]]) if is_edit_dataset else None
-            parent_conn, child_conn = pipes.setdefault(rank, mp.Pipe(duplex=False))
+            if rank not in pipes:
+                pipes[rank] = mp.Pipe(duplex=False)
+            parent_conn, child_conn = pipes[rank]
             queue.put((0, tensor, c_tensor, child_conn))
             result = parent_conn.recv()  # dict
             for k, v in result.items():
@@ -1063,7 +1067,9 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 
     for text_encoder_idx in range(num_text_encoders):
         def text_embedding_map_fn(example, rank):
-            parent_conn, child_conn = pipes.setdefault(rank, mp.Pipe(duplex=False))
+            if rank not in pipes:
+                pipes[rank] = mp.Pipe(duplex=False)
+            parent_conn, child_conn = pipes[rank]
             control_file = example['control_file'] if 'control_file' in example else None
             queue.put((text_encoder_idx+1, example['caption'], example['is_video'], control_file, child_conn))
             result = parent_conn.recv()  # dict

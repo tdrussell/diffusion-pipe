@@ -86,7 +86,9 @@ class PreprocessMediaFile:
             filepath_or_file = str(spec[1])
         else:
             tar_filename = spec[0]
-            tar_f = self.tarfile_map.setdefault(tar_filename, tarfile.TarFile(tar_filename))
+            if tar_filename not in self.tarfile_map:
+                self.tarfile_map[tar_filename] = tarfile.TarFile(tar_filename)
+            tar_f = self.tarfile_map[tar_filename]
             filepath_or_file = tar_f.extractfile(str(spec[1]))
 
         if is_video:
