@@ -110,10 +110,12 @@ video_clip_mode = 'single_beginning'
 # By default, the loss graphs in Tensorboard / WandB have step as the x-axis. You can change it to number of examples seen instead.
 #x_axis_examples = true
 
-
-
 # Learning rate warmup.
-warmup_steps = 100
+# If value is between 0.0 and 1.0, it is treated as a percentage of total training steps.
+# Example: 0.05 means 5% of total steps will be used for warmup.
+# If value is > 1.0, it is treated as an absolute number of steps.
+# Example: 500 means exactly 500 steps will be used for warmup.
+warmup_steps = 0.05
 
 #[lr_scheduler_config]
 #type = 'cosine_annealing_warm_restarts_decay'

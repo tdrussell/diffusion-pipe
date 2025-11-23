@@ -827,11 +827,30 @@ if __name__ == '__main__':
     total_steps_for_scheduler = config['epochs'] * steps_per_epoch
     lr_scheduler = create_scheduler(optimizer, scheduler_config, total_steps_for_scheduler)
 
+    raw_warmup = config.get('warmup_steps', 0)
+    warmup_steps = 0
 
-    if config['warmup_steps'] > 0:
-        warmup_steps = config['warmup_steps']
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
-        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+    if raw_warmup > 0:
+        if raw_warmup <= 1.0:
+            # If the value is between 0 and 1, we treat it as a percentage of total steps.
+            warmup_steps = int(raw_warmup * total_steps_for_scheduler)
+            if is_main_process():
+                print(
+                    f'Warmup: calculated {warmup_steps} steps from percentage {raw_warmup} (Total steps: {total_steps_for_scheduler})')
+        else:
+            # If the value is > 1, we treat it as the literal number of steps
+            warmup_steps = int(raw_warmup)
+
+    # We apply warmup only if the calculated number of steps is > 0
+    if warmup_steps > 0:
+        # We use max(1, ...) to avoid division by zero in rare cases.
+        start_factor = 1.0 / max(1, warmup_steps)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=start_factor, total_iters=warmup_steps
+        )
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps]
+        )
     model_engine.lr_scheduler = lr_scheduler
 
     step = 1
