@@ -58,6 +58,7 @@ parser.add_argument('--lr_finder', action='store_true', help='Run Learning Rate 
 parser.add_argument('--lr_finder_steps', type=int, default=100, help='Number of steps for LR Finder (default: 100). Increase if the plot is too noisy.')
 parser.add_argument('--lr_finder_start', type=float, default=1e-7, help='Start LR for LR Finder (default: 1e-7). Lower this for large models.')
 parser.add_argument('--lr_finder_end', type=float, default=10.0, help='End LR for LR Finder (default: 10.0).')
+parser.add_argument('--run_id', type=str, default=None, help='Optional custom suffix for the run directory name.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -492,12 +493,31 @@ if __name__ == '__main__':
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
-        run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
+        # The base name is the date and time
+        run_name_components = [datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S')]
+
+        # 1. Automatic postfix for LR Finder
+        if args.lr_finder:
+            run_name_components.append('lr_finder')
+
+        # 2. User's own postfix (if provided)
+        if args.run_id:
+            # We clean the string of dangerous characters (optional, but good for security)
+            safe_run_id = "".join([c for c in args.run_id if c.isalnum() or c in "._- "]).strip().replace(" ", "_")
+            if safe_run_id:
+                run_name_components.append(safe_run_id)
+
+        # We connect everything with underlines
+        run_dirname = "__".join(run_name_components)
+
+        run_dir = os.path.join(config['output_dir'], run_dirname)
+
         os.makedirs(run_dir, exist_ok=True)
         shutil.copy(args.config, run_dir)
         shutil.copy(config['dataset'], run_dir)
         for eval_dataset in config['eval_datasets']:
             shutil.copy(eval_dataset['config'], run_dir)
+
     # wait for all processes then get the most recent dir (may have just been created)
     dist.barrier()
     if resume_from_checkpoint is True:  # No specific folder provided, use most recent
