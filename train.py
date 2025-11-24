@@ -54,6 +54,10 @@ parser.add_argument('--trust_cache', action='store_true', help='Load from metada
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
 parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
 parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
+parser.add_argument('--lr_finder', action='store_true', help='Run Learning Rate Finder to determine optimal LR and exit.')
+parser.add_argument('--lr_finder_steps', type=int, default=100, help='Number of steps for LR Finder (default: 100). Increase if the plot is too noisy.')
+parser.add_argument('--lr_finder_start', type=float, default=1e-7, help='Start LR for LR Finder (default: 1e-7). Lower this for large models.')
+parser.add_argument('--lr_finder_end', type=float, default=10.0, help='End LR for LR Finder (default: 10.0).')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -893,6 +897,150 @@ if __name__ == '__main__':
     }
 
     epoch = train_dataloader.epoch
+
+    if args.lr_finder:
+        # We initialise the writer only for LR Finder
+        if is_main_process():
+            print("\n🔎 Launching Learning Rate Finder (TensorBoard version)...")
+            tb_writer = SummaryWriter(log_dir=run_dir)
+
+        # Configuration
+        start_lr = args.lr_finder_start
+        end_lr = args.lr_finder_end
+        num_steps = args.lr_finder_steps
+        lr_mult = (end_lr / start_lr) ** (1 / num_steps)
+
+        if is_main_process():
+            print(f"Scope of the test: {start_lr:.1e} -> {end_lr:.1e} ({num_steps} steps)")
+
+        model_engine.lr_scheduler = None
+        for pg in optimizer.param_groups:
+            pg['lr'] = start_lr
+
+        lrs = []
+        losses = []
+        best_loss = float('inf')
+        smoothed_loss = 0
+        beta = 0.98
+
+        model_engine.train()
+        pbar = tqdm(total=num_steps, desc="LR Finder", disable=not is_main_process())
+
+        try:
+            for step_i in range(num_steps):
+                model_engine.reset_activation_shape()
+                iterator = get_data_iterator_for_step(train_dataloader, model_engine)
+                loss_val = model_engine.train_batch(iterator).item()
+
+                # Smoothing
+                if step_i == 0:
+                    smoothed_loss = loss_val
+                else:
+                    smoothed_loss = beta * smoothed_loss + (1 - beta) * loss_val
+
+                current_lr = optimizer.param_groups[0]['lr']
+                lrs.append(current_lr)
+                losses.append(smoothed_loss)
+
+                # Live login to TB (to see if it works)
+                if is_main_process():
+                    tb_writer.add_scalar('lr_finder/raw_loss', loss_val, step_i)
+                    tb_writer.add_scalar('lr_finder/smoothed_loss', smoothed_loss, step_i)
+                    tb_writer.add_scalar('lr_finder/learning_rate', current_lr, step_i)
+
+                # Explosion protection
+                if smoothed_loss < best_loss:
+                    best_loss = smoothed_loss
+                if step_i > 20 and smoothed_loss > 4 * best_loss:
+                    if is_main_process():
+                        print(f"\n❌ The loss exploded in the crotch {step_i}.")
+                    break
+
+                # Update LR
+                new_lr = lrs[-1] * lr_mult
+                for pg in optimizer.param_groups:
+                    pg['lr'] = new_lr
+
+                pbar.update(1)
+
+        except Exception as e:
+            print(f"LR Finder interrupted: {e}")
+
+        pbar.close()
+
+        # Generate Matplotlib chart and save to TensorBoard
+        if is_main_process():
+            import matplotlib.pyplot as plt
+
+            # Create plot
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(lrs, losses)
+            ax.set_xscale('log')
+
+            # --- ADVANCED SCALING AND WARNING LOGIC ---
+            min_loss_val = min(losses)
+            min_idx = losses.index(min_loss_val)
+            num_points = len(losses)
+
+            # Default limits (fallback)
+            lower_limit = min_loss_val * 0.9
+            upper_limit = min_loss_val * 3.0
+
+            # CASE 1: Minimum at the very beginning (Start LR too high)
+            if min_idx == 0:
+                print(f"\n⚠️  WARNING: Lowest loss occurred at the VERY BEGINNING (step 0, lr={lrs[0]:.2e}).")
+                print("    This means 'lr_finder_start' is likely TOO HIGH for this model.")
+                print("    Loss is increasing from the start. Decrease --lr_finder_start (e.g., to 1e-10).")
+
+                # Show the plot to cut off the giant explosion but show that it's rising.
+                # Set top to 2x initial value.
+                upper_limit = losses[0] * 2.0
+
+            # CASE 2: Minimum at the very end (End LR too low, still dropping)
+            elif min_idx == num_points - 1:
+                print(f"\n⚠️  WARNING: Lowest loss occurred at the VERY END (step {min_idx}, lr={lrs[-1]:.2e}).")
+                print("    This means 'lr_finder_end' is TOO LOW or the model needs a huge LR.")
+                print("    The curve is still dropping. Increase --lr_finder_end.")
+
+                # Show the full Y range because loss kept dropping
+                upper_limit = max(losses) * 1.05
+
+            # CASE 3: Normal "valley" (Minimum somewhere in the middle)
+            else:
+                pre_min_losses = losses[:min_idx]
+                if pre_min_losses:
+                    median_pre_loss = np.median(pre_min_losses)
+                    # Cut off the top at 1.5x the median of the pre-valley phase.
+                    # This frames the "valley" perfectly, ignoring early instabilities.
+                    upper_limit = median_pre_loss * 1.5
+
+                    # Optional: Info for user
+                    optimal_lr_guess = lrs[min_idx] / 10.0
+                    print(f"\n✅ Found minimum at LR = {lrs[min_idx]:.2e}.")
+                    print(f"   Suggested start point (rule of thumb /10): {optimal_lr_guess:.2e}")
+
+            # Apply calculated limits
+            if upper_limit > lower_limit:
+                ax.set_ylim(bottom=lower_limit, top=upper_limit)
+            # ------------------------------------------------------
+
+            ax.set_xlabel('Learning Rate (log scale)')
+            ax.set_ylabel('Loss (smoothed)')
+            ax.set_title('Learning Rate Finder Result')
+            ax.grid(True, which="both", ls="-", alpha=0.5)
+
+            # Save the plot as an image in TensorBoard
+            tb_writer.add_figure('LR Finder/Chart', fig, 0)
+            tb_writer.flush()
+            tb_writer.close()
+
+            print(f"\n✅ Finished. Open TensorBoard (logdir: {run_dir}) and navigate to the “IMAGES” tab.")
+            print("Find the lowest point on the graph and select an LR value slightly to the left of it.")
+            print(f"\n✅ Completed.")
+
+        dist.barrier()
+        quit()
+
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
 
