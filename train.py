@@ -75,6 +75,26 @@ class DummyOptimizer(torch.optim.Optimizer):
         pass
 
 
+class CosineAnnealingWarmRestartsDecay(torch.optim.lr_scheduler.CosineAnnealingWarmRestarts):
+    def __init__(self, optimizer, T_0, T_mult=1, eta_min=0, last_epoch=-1, gamma=1.0):
+        self.gamma = gamma
+        super().__init__(optimizer, T_0, T_mult, eta_min, last_epoch)
+
+    def step(self, epoch=None):
+        super().step(epoch)
+
+        # We are checking whether a restart has occurred.
+        if self.T_cur == 0 and self.last_epoch > 0:
+            # We reduce the base LR (fading)
+            self.base_lrs = [lr * self.gamma for lr in self.base_lrs]
+
+            # --- CORRECTION: Manual optimiser update ---
+            # Since super().step() set LR according to the ‘old’ database,
+            # we need to overwrite it with a new, smaller value for the SAME step.
+            for param_group, lr in zip(self.optimizer.param_groups, self.base_lrs):
+                param_group['lr'] = lr
+
+
 # Monkeypatch this so it counts all layer parameters, not just trainable parameters.
 # This helps it divide the layers between GPUs more evenly when training a LoRA.
 def _count_all_layer_params(self):
@@ -751,10 +771,12 @@ if __name__ == '__main__':
                 config['total_iters'] = total_steps
             return torch.optim.lr_scheduler.LinearLR(optimizer, **config)
 
-        elif scheduler_type == 'cosine_annealing_warm_restarts':
+        elif scheduler_type == 'cosine_annealing_warm_restarts_decay':
             if 'T_0' not in config:
                 raise ValueError("Config error: T_0 must be specified for cosine_annealing_warm_restarts")
-            return torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, **config)
+            # We use our improved class with “gamma” support.
+            # By default, gamma=1.0 (no dimming) if not specified in the configuration.
+            return CosineAnnealingWarmRestartsDecay(optimizer, **config)
 
         elif scheduler_type == 'exponential':
             if 'gamma' not in config:

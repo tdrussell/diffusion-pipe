@@ -116,17 +116,17 @@ video_clip_mode = 'single_beginning'
 warmup_steps = 100
 
 #[lr_scheduler_config]
-# Scheduler type
-#type = 'cosine_annealing_warm_restarts'
-
-# Required: Number of iterations (steps) for the first restart
+#type = 'cosine_annealing_warm_restarts_decay'
+# Required: Length of the first cycle in steps.
 #T_0 = 1000
-
 # Optional: Factor by which T_0 is multiplied after a restart (default: 1)
-# T_mult = 1
-
+#T_mult = 1
 # Optional: Minimum learning rate (default: 0)
-# eta_min = 1e-6
+#eta_min = 1e-7
+# NEW: Restart fade factor.
+# 1.0 = restart always to full LR (standard)
+# 0.9 = each subsequent restart to 90% of the previous maximum
+#gamma = 0.9
 
 #[lr_scheduler_config]
 # Scheduler type
