@@ -1,3 +1,4 @@
+import importlib
 import argparse
 import os
 import wandb
@@ -793,6 +794,27 @@ if __name__ == '__main__':
 
             milestones = config['milestones']
             return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=sub_schedulers, milestones=milestones)
+
+        elif scheduler_type == 'external':
+            if 'class' not in config:
+                raise ValueError("Config error: 'class' parameter (path.to.MyScheduler) is required for external type")
+
+            class_path = config.pop('class')
+
+            try:
+                module_name, class_name = class_path.rsplit('.', 1)
+                module = importlib.import_module(module_name)
+                scheduler_class = getattr(module, class_name)
+
+                if is_main_process():
+                    print(f"Loading external scheduler: {class_name} from {module_name}")
+
+                return scheduler_class(optimizer, **config)
+
+            except (ImportError, AttributeError) as e:
+                raise ValueError(f"Failed to load external scheduler '{class_path}': {e}")
+            except Exception as e:
+                raise ValueError(f"Error initializing external scheduler '{class_path}': {e}")
 
         else:
             raise NotImplementedError(f'Unknown lr_scheduler type: {scheduler_type}')

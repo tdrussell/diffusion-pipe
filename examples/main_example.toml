@@ -154,6 +154,13 @@ warmup_steps = 100
 #    { type = 'cosine_annealing_warm_restarts', T_0 = 1000, T_mult = 1, eta_min = 1e-6 }
 #]
 
+#[lr_scheduler_config]
+# Loading external scheduler
+#type = 'external'
+#class = 'torch.optim.lr_scheduler.StepLR'
+#step_size = 30
+#gamma = 0.1
+
 [lr_scheduler_config]
 type = 'constant'
 # Optional: The factor by which to multiply the LR (default: 1.0)
