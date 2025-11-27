@@ -1,3 +1,4 @@
+import importlib
 import argparse
 import os
 import wandb
@@ -21,6 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import multiprocess as mp
 import numpy as np
+import psutil
 
 from utils import dataset as dataset_util
 from utils import common
@@ -53,6 +55,11 @@ parser.add_argument('--trust_cache', action='store_true', help='Load from metada
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
 parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
 parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
+parser.add_argument('--lr_finder', action='store_true', help='Run Learning Rate Finder to determine optimal LR and exit.')
+parser.add_argument('--lr_finder_steps', type=int, default=100, help='Number of steps for LR Finder (default: 100). Increase if the plot is too noisy.')
+parser.add_argument('--lr_finder_start', type=float, default=1e-7, help='Start LR for LR Finder (default: 1e-7). Lower this for large models.')
+parser.add_argument('--lr_finder_end', type=float, default=10.0, help='End LR for LR Finder (default: 10.0).')
+parser.add_argument('--run_id', type=str, default=None, help='Optional custom suffix for the run directory name.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -73,6 +80,26 @@ class DummyOptimizer(torch.optim.Optimizer):
 
     def load_state_dict(self, state_dict):
         pass
+
+
+class CosineAnnealingWarmRestartsDecay(torch.optim.lr_scheduler.CosineAnnealingWarmRestarts):
+    def __init__(self, optimizer, T_0, T_mult=1, eta_min=0, last_epoch=-1, gamma=1.0):
+        self.gamma = gamma
+        super().__init__(optimizer, T_0, T_mult, eta_min, last_epoch)
+
+    def step(self, epoch=None):
+        super().step(epoch)
+
+        # We are checking whether a restart has occurred.
+        if self.T_cur == 0 and self.last_epoch > 0:
+            # We reduce the base LR (fading)
+            self.base_lrs = [lr * self.gamma for lr in self.base_lrs]
+
+            # --- CORRECTION: Manual optimiser update ---
+            # Since super().step() set LR according to the ‘old’ database,
+            # we need to overwrite it with a new, smaller value for the SAME step.
+            for param_group, lr in zip(self.optimizer.param_groups, self.base_lrs):
+                param_group['lr'] = lr
 
 
 # Monkeypatch this so it counts all layer parameters, not just trainable parameters.
@@ -467,12 +494,31 @@ if __name__ == '__main__':
 
     # if this is a new run, create a new dir for it
     if not resume_from_checkpoint and is_main_process():
-        run_dir = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
+        # The base name is the date and time
+        run_name_components = [datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S')]
+
+        # 1. Automatic postfix for LR Finder
+        if args.lr_finder:
+            run_name_components.append('lr_finder')
+
+        # 2. User's own postfix (if provided)
+        if args.run_id:
+            # We clean the string of dangerous characters (optional, but good for security)
+            safe_run_id = "".join([c for c in args.run_id if c.isalnum() or c in "._- "]).strip().replace(" ", "_")
+            if safe_run_id:
+                run_name_components.append(safe_run_id)
+
+        # We connect everything with underlines
+        run_dirname = "__".join(run_name_components)
+
+        run_dir = os.path.join(config['output_dir'], run_dirname)
+
         os.makedirs(run_dir, exist_ok=True)
         shutil.copy(args.config, run_dir)
         shutil.copy(config['dataset'], run_dir)
         for eval_dataset in config['eval_datasets']:
             shutil.copy(eval_dataset['config'], run_dir)
+
     # wait for all processes then get the most recent dir (may have just been created)
     dist.barrier()
     if resume_from_checkpoint is True:  # No specific folder provided, use most recent
@@ -733,17 +779,103 @@ if __name__ == '__main__':
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
-    scheduler_type = config.get('lr_scheduler', 'constant')
-    if scheduler_type == 'constant':
-        lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
-    elif scheduler_type == 'linear':
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
-    else:
-        raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
-    if config['warmup_steps'] > 0:
-        warmup_steps = config['warmup_steps']
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1/warmup_steps, total_iters=warmup_steps)
-        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+
+    def create_scheduler(optimizer, config, total_steps):
+        """Recursively create a scheduler from config."""
+
+        # Make a copy so we can pop items
+        config = config.copy()
+        scheduler_type = config.pop('type')
+
+        if scheduler_type == 'constant':
+            # Can pass 'factor' in config. Defaults to 1.0
+            return torch.optim.lr_scheduler.ConstantLR(optimizer, **config)
+
+        elif scheduler_type == 'linear':
+            # Auto-calculate total_iters if not provided
+            if 'total_iters' not in config:
+                config['total_iters'] = total_steps
+            return torch.optim.lr_scheduler.LinearLR(optimizer, **config)
+
+        elif scheduler_type == 'cosine_annealing_warm_restarts_decay':
+            if 'T_0' not in config:
+                raise ValueError("Config error: T_0 must be specified for cosine_annealing_warm_restarts")
+            # We use our improved class with “gamma” support.
+            # By default, gamma=1.0 (no dimming) if not specified in the configuration.
+            return CosineAnnealingWarmRestartsDecay(optimizer, **config)
+
+        elif scheduler_type == 'exponential':
+            if 'gamma' not in config:
+                raise ValueError("Config error: 'gamma' must be specified for exponential scheduler")
+            return torch.optim.lr_scheduler.ExponentialLR(optimizer, **config)
+
+        elif scheduler_type == 'sequential':
+            if 'schedulers' not in config or 'milestones' not in config:
+                raise ValueError("Config error: 'schedulers' (list) and 'milestones' (list) must be set for sequential scheduler")
+
+            sub_schedulers = []
+            for sub_config in config['schedulers']:
+                sub_schedulers.append(create_scheduler(optimizer, sub_config, total_steps))
+
+            milestones = config['milestones']
+            return torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=sub_schedulers, milestones=milestones)
+
+        elif scheduler_type == 'external':
+            if 'class' not in config:
+                raise ValueError("Config error: 'class' parameter (path.to.MyScheduler) is required for external type")
+
+            class_path = config.pop('class')
+
+            try:
+                module_name, class_name = class_path.rsplit('.', 1)
+                module = importlib.import_module(module_name)
+                scheduler_class = getattr(module, class_name)
+
+                if is_main_process():
+                    print(f"Loading external scheduler: {class_name} from {module_name}")
+
+                return scheduler_class(optimizer, **config)
+
+            except (ImportError, AttributeError) as e:
+                raise ValueError(f"Failed to load external scheduler '{class_path}': {e}")
+            except Exception as e:
+                raise ValueError(f"Error initializing external scheduler '{class_path}': {e}")
+
+        else:
+            raise NotImplementedError(f'Unknown lr_scheduler type: {scheduler_type}')
+
+
+    old_scheduler_type = config.get('lr_scheduler', None)
+    if old_scheduler_type:
+        print('Warning: lr_scheduler is deprecated. Use lr_scheduler_config instead.')
+    scheduler_config = config.get('lr_scheduler_config', {'type': old_scheduler_type or 'constant'})
+    total_steps_for_scheduler = config['epochs'] * steps_per_epoch
+    lr_scheduler = create_scheduler(optimizer, scheduler_config, total_steps_for_scheduler)
+
+    raw_warmup = config.get('warmup_steps', 0)
+    warmup_steps = 0
+
+    if raw_warmup > 0:
+        if raw_warmup <= 1.0:
+            # If the value is between 0 and 1, we treat it as a percentage of total steps.
+            warmup_steps = int(raw_warmup * total_steps_for_scheduler)
+            if is_main_process():
+                print(
+                    f'Warmup: calculated {warmup_steps} steps from percentage {raw_warmup} (Total steps: {total_steps_for_scheduler})')
+        else:
+            # If the value is > 1, we treat it as the literal number of steps
+            warmup_steps = int(raw_warmup)
+
+    # We apply warmup only if the calculated number of steps is > 0
+    if warmup_steps > 0:
+        # We use max(1, ...) to avoid division by zero in rare cases.
+        start_factor = 1.0 / max(1, warmup_steps)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=start_factor, total_iters=warmup_steps
+        )
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps]
+        )
     model_engine.lr_scheduler = lr_scheduler
 
     step = 1
@@ -786,7 +918,152 @@ if __name__ == '__main__':
     }
 
     epoch = train_dataloader.epoch
+
+    if args.lr_finder:
+        # We initialise the writer only for LR Finder
+        if is_main_process():
+            print("\n🔎 Launching Learning Rate Finder (TensorBoard version)...")
+            tb_writer = SummaryWriter(log_dir=run_dir)
+
+        # Configuration
+        start_lr = args.lr_finder_start
+        end_lr = args.lr_finder_end
+        num_steps = args.lr_finder_steps
+        lr_mult = (end_lr / start_lr) ** (1 / num_steps)
+
+        if is_main_process():
+            print(f"Scope of the test: {start_lr:.1e} -> {end_lr:.1e} ({num_steps} steps)")
+
+        model_engine.lr_scheduler = None
+        for pg in optimizer.param_groups:
+            pg['lr'] = start_lr
+
+        lrs = []
+        losses = []
+        best_loss = float('inf')
+        smoothed_loss = 0
+        beta = 0.98
+
+        model_engine.train()
+        pbar = tqdm(total=num_steps, desc="LR Finder", disable=not is_main_process())
+
+        try:
+            for step_i in range(num_steps):
+                model_engine.reset_activation_shape()
+                iterator = get_data_iterator_for_step(train_dataloader, model_engine)
+                loss_val = model_engine.train_batch(iterator).item()
+
+                # Smoothing
+                if step_i == 0:
+                    smoothed_loss = loss_val
+                else:
+                    smoothed_loss = beta * smoothed_loss + (1 - beta) * loss_val
+
+                current_lr = optimizer.param_groups[0]['lr']
+                lrs.append(current_lr)
+                losses.append(smoothed_loss)
+
+                # Live login to TB (to see if it works)
+                if is_main_process():
+                    tb_writer.add_scalar('lr_finder/raw_loss', loss_val, step_i)
+                    tb_writer.add_scalar('lr_finder/smoothed_loss', smoothed_loss, step_i)
+                    tb_writer.add_scalar('lr_finder/learning_rate', current_lr, step_i)
+
+                # Explosion protection
+                if smoothed_loss < best_loss:
+                    best_loss = smoothed_loss
+                if step_i > 20 and smoothed_loss > 4 * best_loss:
+                    if is_main_process():
+                        print(f"\n❌ The loss exploded in the crotch {step_i}.")
+                    break
+
+                # Update LR
+                new_lr = lrs[-1] * lr_mult
+                for pg in optimizer.param_groups:
+                    pg['lr'] = new_lr
+
+                pbar.update(1)
+
+        except Exception as e:
+            print(f"LR Finder interrupted: {e}")
+
+        pbar.close()
+
+        # Generate Matplotlib chart and save to TensorBoard
+        if is_main_process():
+            import matplotlib.pyplot as plt
+
+            # Create plot
+            fig, ax = plt.subplots(figsize=(10, 6))
+            ax.plot(lrs, losses)
+            ax.set_xscale('log')
+
+            # --- ADVANCED SCALING AND WARNING LOGIC ---
+            min_loss_val = min(losses)
+            min_idx = losses.index(min_loss_val)
+            num_points = len(losses)
+
+            # Default limits (fallback)
+            lower_limit = min_loss_val * 0.9
+            upper_limit = min_loss_val * 3.0
+
+            # CASE 1: Minimum at the very beginning (Start LR too high)
+            if min_idx == 0:
+                print(f"\n⚠️  WARNING: Lowest loss occurred at the VERY BEGINNING (step 0, lr={lrs[0]:.2e}).")
+                print("    This means 'lr_finder_start' is likely TOO HIGH for this model.")
+                print("    Loss is increasing from the start. Decrease --lr_finder_start (e.g., to 1e-10).")
+
+                # Show the plot to cut off the giant explosion but show that it's rising.
+                # Set top to 2x initial value.
+                upper_limit = losses[0] * 2.0
+
+            # CASE 2: Minimum at the very end (End LR too low, still dropping)
+            elif min_idx == num_points - 1:
+                print(f"\n⚠️  WARNING: Lowest loss occurred at the VERY END (step {min_idx}, lr={lrs[-1]:.2e}).")
+                print("    This means 'lr_finder_end' is TOO LOW or the model needs a huge LR.")
+                print("    The curve is still dropping. Increase --lr_finder_end.")
+
+                # Show the full Y range because loss kept dropping
+                upper_limit = max(losses) * 1.05
+
+            # CASE 3: Normal "valley" (Minimum somewhere in the middle)
+            else:
+                pre_min_losses = losses[:min_idx]
+                if pre_min_losses:
+                    median_pre_loss = np.median(pre_min_losses)
+                    # Cut off the top at 1.5x the median of the pre-valley phase.
+                    # This frames the "valley" perfectly, ignoring early instabilities.
+                    upper_limit = median_pre_loss * 1.5
+
+                    # Optional: Info for user
+                    optimal_lr_guess = lrs[min_idx] / 10.0
+                    print(f"\n✅ Found minimum at LR = {lrs[min_idx]:.2e}.")
+                    print(f"   Suggested start point (rule of thumb /10): {optimal_lr_guess:.2e}")
+
+            # Apply calculated limits
+            if upper_limit > lower_limit:
+                ax.set_ylim(bottom=lower_limit, top=upper_limit)
+            # ------------------------------------------------------
+
+            ax.set_xlabel('Learning Rate (log scale)')
+            ax.set_ylabel('Loss (smoothed)')
+            ax.set_title('Learning Rate Finder Result')
+            ax.grid(True, which="both", ls="-", alpha=0.5)
+
+            # Save the plot as an image in TensorBoard
+            tb_writer.add_figure('LR Finder/Chart', fig, 0)
+            tb_writer.flush()
+            tb_writer.close()
+
+            print(f"\n✅ Finished. Open TensorBoard (logdir: {run_dir}) and navigate to the “IMAGES” tab.")
+            print("Find the lowest point on the graph and select an LR value slightly to the left of it.")
+            print(f"\n✅ Completed.")
+
+        dist.barrier()
+        quit()
+
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
+
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
 
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
@@ -812,8 +1089,10 @@ if __name__ == '__main__':
 
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
+            tb_writer.add_scalar(f'train/lr', optimizer.param_groups[0]['lr'], x_axis)
             if wandb_enable:
                 wandb.log({'train/loss': loss, 'step': x_axis})
+                wandb.log({'train/lr': optimizer.param_groups[0]['lr'], 'step': x_axis})
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)
@@ -822,6 +1101,49 @@ if __name__ == '__main__':
                 if avg_lr > 0:
                     tb_writer.add_histogram(f'train/automagic_lrs', lrs, x_axis)
                     tb_writer.add_scalar(f'train/automagic_avg_lr', avg_lr, x_axis)
+
+            with torch.no_grad():
+                total_param_norm = 0.0
+                for p in parameters_to_train:
+                    if p.requires_grad:
+                        total_param_norm += p.norm(2).item()
+
+            tb_writer.add_scalar('train/total_param_norm', total_param_norm, x_axis)
+            if wandb_enable:
+                wandb.log({'train/total_param_norm': total_param_norm, 'step': x_axis})
+
+            # Conversion factor for bytes to gigabytes
+            gb_divisor = 1024 ** 3
+
+            # VRAM Metrics (GPU Memory)
+            if torch.cuda.is_available():
+                # Memory actively used by tensors
+                allocated_vram_gb = torch.cuda.memory_allocated() / gb_divisor
+                # Memory reserved by PyTorch
+                reserved_vram_gb = torch.cuda.memory_reserved() / gb_divisor
+                # Peak usage since the start of the script
+                peak_vram_gb = torch.cuda.max_memory_allocated() / gb_divisor
+
+                tb_writer.add_scalar('memory/vram_allocated_gb', allocated_vram_gb, x_axis)
+                tb_writer.add_scalar('memory/vram_reserved_gb', reserved_vram_gb, x_axis)
+                tb_writer.add_scalar('memory/vram_peak_gb', peak_vram_gb, x_axis)
+
+                if wandb_enable:
+                    wandb.log({
+                        'memory/vram_allocated_gb': allocated_vram_gb,
+                        'memory/vram_reserved_gb': reserved_vram_gb,
+                        'memory/vram_peak_gb': peak_vram_gb,
+                        'step': x_axis
+                    })
+
+            # RAM metrics (System Memory) - only for the main process
+            # Note: This does not track the memory of worker processes (dataloader workers).
+            process = psutil.Process(os.getpid())
+            ram_rss_gb = process.memory_info().rss / gb_divisor  # RSS = Resident Set Size
+
+            tb_writer.add_scalar('memory/ram_main_process_gb', ram_rss_gb, x_axis)
+            if wandb_enable:
+                wandb.log({'memory/ram_main_process_gb': ram_rss_gb, 'step': x_axis})
 
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
             evaluate(model, model_engine, eval_dataloaders, tb_writer, x_axis, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)

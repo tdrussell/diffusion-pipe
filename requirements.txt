@@ -27,3 +27,5 @@ ftfy
 pytorch-optimizer
 wandb
 optimum-quanto
+matplotlib
+psutil
