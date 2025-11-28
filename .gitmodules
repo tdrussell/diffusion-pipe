@@ -22,3 +22,6 @@
 [submodule "submodules/HunyuanImage-2.1"]
 	path = submodules/HunyuanImage-2.1
 	url = https://github.com/Tencent-Hunyuan/HunyuanImage-2.1
+[submodule "submodules/ComfyUI"]
+	path = submodules/ComfyUI
+	url = https://github.com/comfyanonymous/ComfyUI
