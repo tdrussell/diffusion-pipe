@@ -343,6 +343,9 @@ if __name__ == '__main__':
     elif model_type == 'auraflow':
         from models import auraflow
         model = auraflow.AuraFlowPipeline(config)
+    elif model_type == 'z_image':
+        from models import z_image
+        model = z_image.ZImagePipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 

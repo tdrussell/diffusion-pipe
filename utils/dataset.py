@@ -8,9 +8,12 @@ import hashlib
 import json
 import tarfile
 from inspect import signature
+import sys
+sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import numpy as np
 import torch
+from torch import nn
 from deepspeed.utils.logging import logger
 from deepspeed import comm as dist
 import datasets
@@ -22,6 +25,7 @@ from tqdm import tqdm
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
+import comfy.model_management as mm
 
 
 DEBUG = False
@@ -1147,11 +1151,14 @@ class DatasetManager:
             # Free memory in all unneeded submodels. This is easier than trying to delete every reference.
             # TODO: check if this is actually freeing memory.
             for model in self.submodels:
+                if not isinstance(model, nn.Module):
+                    continue
                 if self.model.name == 'sdxl' and model is self.vae:
                     # If full fine tuning SDXL, we need to keep the VAE weights around for saving the model.
                     model.to('cpu')
                 else:
                     model.to('meta')
+            mm.unload_all_models()  # Comfy managed models
 
         dist.barrier()
         if is_main_process():
@@ -1168,11 +1175,17 @@ class DatasetManager:
     def _handle_task(self, task):
         id = task[0]
         # moved needed submodel to cuda, and everything else to cpu
-        if next(self.submodels[id].parameters()).device.type != 'cuda':
-            for i, submodel in enumerate(self.submodels):
-                if i != id:
-                    submodel.to('cpu')
-            self.submodels[id].to('cuda')
+        submodel = self.submodels[id]
+        if isinstance(submodel, nn.Module):
+            if next(self.submodels[id].parameters()).device.type != 'cuda':
+                for i, submodel in enumerate(self.submodels):
+                    if i != id:
+                        submodel.to('cpu')
+                self.submodels[id].to('cuda')
+        else:
+            # ComfyUI model
+            # TODO: do anything here?
+            pass
         if id == 0:
             tensor, control_tensor, pipe = task[1:]
             if control_tensor is not None:

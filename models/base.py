@@ -1,6 +1,10 @@
 from pathlib import Path
 import re
 import tarfile
+import os
+import sys
+from collections import defaultdict
+sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import peft
 import torch
@@ -13,6 +17,8 @@ from torchvision import transforms
 import imageio
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple
+import comfy.utils
+import comfy.sd
 
 
 def make_contiguous(*tensors):
@@ -235,6 +241,207 @@ class BasePipeline:
 
     def get_call_text_encoder_fn(self, text_encoder):
         raise NotImplementedError()
+
+    def prepare_inputs(self, inputs, timestep_quantile=None):
+        raise NotImplementedError()
+
+    def to_layers(self):
+        raise NotImplementedError()
+
+    def model_specific_dataset_config_validation(self, dataset_config):
+        pass
+
+    # Get param groups that will be passed into the optimizer. Models can override this, e.g. SDXL
+    # supports separate learning rates for unet and text encoders.
+    def get_param_groups(self, parameters):
+        return [{'params': parameters}]
+
+    # Default loss_fn. MSE between output and target, with mask support.
+    def get_loss_fn(self):
+        def loss_fn(output, label):
+            target, mask = label
+            with torch.autocast('cuda', enabled=False):
+                output = output.to(torch.float32)
+                target = target.to(output.device, torch.float32)
+                if 'pseudo_huber_c' in self.config:
+                    c = self.config['pseudo_huber_c']
+                    loss = torch.sqrt((output-target)**2 + c**2) - c
+                else:
+                    loss = F.mse_loss(output, target, reduction='none')
+                # empty tensor means no masking
+                if mask.numel() > 0:
+                    mask = mask.to(output.device, torch.float32)
+                    loss *= mask
+                loss = loss.mean()
+            return loss
+        return loss_fn
+
+    def enable_block_swap(self, blocks_to_swap):
+        raise NotImplementedError('Block swapping is not implemented for this model')
+
+    def prepare_block_swap_training(self):
+        pass
+
+    def prepare_block_swap_inference(self, disable_block_swap=False):
+        pass
+
+
+class ComfyPipeline:
+    framerate = None
+    pixels_round_to_multiple = 16
+
+    def __init__(self, config):
+        self.config = config
+        self.model_config = self.config['model']
+
+        # VAE
+        sd = comfy.utils.load_torch_file(self.model_config['vae'])
+        self.vae = comfy.sd.VAE(sd=sd)
+        self.vae.throw_exception_if_invalid()
+
+        # Text encoders
+        self.text_encoders = []
+        for te_config in self.model_config['text_encoders']:
+            clip = comfy.sd.load_clip(ckpt_paths=[te_config['path']], clip_type=te_config['type'])
+            self.text_encoders.append(clip)
+
+    def load_diffusion_model(self):
+        dtype = self.model_config['dtype']
+        model_options = {}
+        model_options['dtype'] = dtype
+        self.model_patcher = comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options)
+
+        for adapter_path in self.model_config.get('merge_adapters', []):
+            if is_main_process():
+                print(f'Merging adapter {adapter_path}')
+            sd = comfy.utils.load_torch_file(adapter_path, safe_load=True)
+            self.model_patcher, _ = comfy.sd.load_lora_for_models(self.model_patcher, None, sd, 1.0, 0.0)
+
+        self.model_patcher.set_model_compute_dtype(dtype)
+        self.model_patcher.patch_model()
+        self.diffusion_model = self.model_patcher.model.diffusion_model
+
+    def get_vae(self):
+        return self.vae
+
+    def get_text_encoders(self):
+        return self.text_encoders
+
+    def configure_adapter(self, adapter_config):
+        target_linear_modules = set()
+        for name, module in self.diffusion_model.named_modules():
+            if module.__class__.__name__ not in self.adapter_target_modules:
+                continue
+            for full_submodule_name, submodule in module.named_modules(prefix=name):
+                if isinstance(submodule, nn.Linear):
+                    target_linear_modules.add(full_submodule_name)
+        target_linear_modules = list(target_linear_modules)
+
+        adapter_type = adapter_config['type']
+        if adapter_type == 'lora':
+            peft_config = peft.LoraConfig(
+                r=adapter_config['rank'],
+                lora_alpha=adapter_config['alpha'],
+                lora_dropout=adapter_config['dropout'],
+                bias='none',
+                target_modules=target_linear_modules
+            )
+        else:
+            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
+        self.peft_config = peft_config
+        self.lora_model = peft.get_peft_model(self.diffusion_model, peft_config)
+        if is_main_process():
+            self.lora_model.print_trainable_parameters()
+        for name, p in self.diffusion_model.named_parameters():
+            p.original_name = name
+            if p.requires_grad:
+                p.data = p.data.to(adapter_config['dtype'])
+
+    def save_adapter(self, save_dir, sd):
+        self.peft_config.save_pretrained(save_dir)
+        # ComfyUI format.
+        sd = {'diffusion_model.'+k: v for k, v in sd.items()}
+        safetensors.torch.save_file(sd, save_dir / 'adapter_model.safetensors', metadata={'format': 'pt'})
+
+    def load_adapter_weights(self, adapter_path):
+        if is_main_process():
+            print(f'Loading adapter weights from path {adapter_path}')
+        safetensors_files = list(Path(adapter_path).glob('*.safetensors'))
+        if len(safetensors_files) == 0:
+            raise RuntimeError(f'No safetensors file found in {adapter_path}')
+        if len(safetensors_files) > 1:
+            raise RuntimeError(f'Multiple safetensors files found in {adapter_path}')
+        adapter_state_dict = safetensors.torch.load_file(safetensors_files[0])
+        modified_state_dict = {}
+        model_parameters = set(name for name, p in self.diffusion_model.named_parameters())
+        for k, v in adapter_state_dict.items():
+            # Replace Diffusers or ComfyUI prefix
+            k = re.sub(r'^(transformer|diffusion_model)\.', '', k)
+            # Replace weight at end for LoRA format
+            k = re.sub(r'\.weight$', '.default.weight', k)
+            if k not in model_parameters:
+                raise RuntimeError(f'modified_state_dict key {k} is not in the model parameters')
+            modified_state_dict[k] = v
+        self.diffusion_model.load_state_dict(modified_state_dict, strict=False)
+
+    def load_and_fuse_adapter(self, path):
+        raise NotImplementedError()
+
+    def save_model(self, save_dir, sd):
+        safetensors.torch.save_file(sd, save_dir / 'model.safetensors', metadata={'format': 'pt'})
+
+    def get_preprocess_media_file_fn(self):
+        return PreprocessMediaFile(self.config, support_video=False)
+
+    def get_call_vae_fn(self, vae):
+        def fn(images):
+            assert images.ndim == 4  # TODO: video
+            images = images.to('cuda')
+            # [b, c, h, w] -> [b, h, w, c]
+            images = torch.permute(images, (0, 2, 3, 1))
+            # Pixels are in range [-1, 1], Comfy code expects [0, 1]
+            images = (images + 1) / 2
+            latents = vae.encode(images)
+            return {'latents': latents}
+        return fn
+
+    def get_call_text_encoder_fn(self, text_encoder):
+
+        def fn(captions: list[str], is_video: list[bool]):
+            tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
+            clip = text_encoder.cond_stage_model
+
+            max_length = 0
+            for text in captions:
+                tokens = text_encoder.tokenize(text)
+                # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
+                for v in tokens.values():
+                    max_length = max(max_length, len(v[0]))
+
+            # pad to max length in the batch
+            tokenizer.min_length = max_length
+            tokens_dict = defaultdict(list)
+            for text in captions:
+                tokens = text_encoder.tokenize(text)
+                for k, v in tokens.items():
+                    tokens_dict[k].extend(v)
+
+            # We have to use some lower-level methods because the top-level methods are designed for unbatched inference and will
+            # concat the embeddings in the batch along the sequence dimension (e.g. CLIP sections for SDXL).
+            text_encoder.load_model()
+            token_weight_pairs = tokens_dict[clip.clip_name]
+            to_encode = []
+            for x in token_weight_pairs:
+                tokens = list(map(lambda a: a[0], x))
+                to_encode.append(tokens)
+            o = getattr(clip, clip.clip).encode(to_encode)
+
+            text_embeds = o[0]
+            extra = o[2]
+            attention_mask = extra['attention_mask']
+            return {'text_embeds': text_embeds, 'attention_mask': attention_mask}
+
+        return fn
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         raise NotImplementedError()
