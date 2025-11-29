@@ -235,6 +235,7 @@ class GenericOptim(Optimizer):
             betas: Tuple[float, float] = (0.9, 0.999),
             eps: float = 1e-6,
             weight_decay: float = 0.0,
+            weight_decay_type: str = "default", # default_scheduled, cautious, cautious_scheduled
             correct_bias: bool = True,
             momentum_type: str = "ema",
             second_moment_type: str = "ema",
@@ -255,7 +256,11 @@ class GenericOptim(Optimizer):
         self.second_moment_type = second_moment_type
         assert self.second_moment_type in ["ema", "none", "sn", "factored"]
         self.skip_invalid_grads = skip_invalid_grads
-
+        
+        self.weight_decay_type = weight_decay_type
+        assert self.weight_decay_type in ["default", "default_scheduled", "cautious", "cautious_scheduled"]
+        self.start_lr = lr
+        
         require_version("torch>=1.5.0")  # add_ with alpha
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr} - should be >= 0.0")
@@ -384,7 +389,19 @@ class GenericOptim(Optimizer):
 
                 # Add weight decay at the end (fixed version)
                 if group["weight_decay"] > 0.0:
-                    update.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+                    
+                    # Allows WD to cooldown as we reach the end of training process, as it bound to scheduled lr
+                    if "scheduled" in self.weight_decay_type:
+                        effective_wd = group["lr"] * group["lr"] * group["weight_decay"] / self.start_lr
+                    else:
+                        effective_wd = group["lr"] * group["weight_decay"]
+                    
+                    if "cautious" in self.weight_decay_type:
+                        # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
+                        p.copy_(torch.where(update * p >= 0, p * (1.0 - effective_wd), p))
+                    else:
+                        # Vanilla AdamW's decay mechanism
+                        update.add_(p, alpha=-effective_wd)
 
                 synchronize |= cpu_offload
 
