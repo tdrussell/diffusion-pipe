@@ -6,6 +6,7 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 from models.base import ComfyPipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
@@ -123,16 +124,27 @@ class InitialLayer(nn.Module):
         return make_contiguous(x, mask, freqs_cis, adaln_input, img_size, cap_size)
 
     def patchify_and_embed(
-        self, x: List[torch.Tensor] | torch.Tensor, cap_feats: torch.Tensor, cap_mask: torch.Tensor, t: torch.Tensor, transformer_options={}
+        self, x: torch.Tensor, cap_feats: torch.Tensor, cap_mask: torch.Tensor, t: torch.Tensor, transformer_options={}
     ) -> Tuple[torch.Tensor, torch.Tensor, List[Tuple[int, int]], List[int], torch.Tensor]:
         bsz = len(x)
         pH = pW = self.patch_size
-        device = x[0].device
+        device = x.device
 
         if self.pad_tokens_multiple is not None:
-            pad_extra = (-cap_feats.shape[1]) % self.pad_tokens_multiple
-            cap_feats = torch.cat((cap_feats, self.cap_pad_token.to(device=cap_feats.device, dtype=cap_feats.dtype, copy=True).unsqueeze(0).repeat(cap_feats.shape[0], pad_extra, 1)), dim=1)
-            cap_mask = torch.cat((cap_mask, cap_mask.new_zeros((bsz, pad_extra))), dim=-1)
+            cap_feats_list = []
+            for cap_feats_single, cap_mask_single in zip(cap_feats, cap_mask):
+                cap_feats_single = cap_feats_single[cap_mask_single]
+                pad_extra = (-cap_feats_single.shape[0]) % self.pad_tokens_multiple
+                cap_feats_single = torch.cat((cap_feats_single, self.cap_pad_token.to(device=device, dtype=cap_feats.dtype, copy=True).repeat(pad_extra, 1)), dim=0)
+                cap_feats_list.append(cap_feats_single)
+
+            cap_item_seqlens = [len(_) for _ in cap_feats_list]
+            assert all(_ % self.pad_tokens_multiple == 0 for _ in cap_item_seqlens)
+            cap_max_item_seqlen = max(cap_item_seqlens)
+            cap_feats = pad_sequence(cap_feats_list, batch_first=True, padding_value=0.0)
+            cap_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
+            for i, seq_len in enumerate(cap_item_seqlens):
+                cap_mask[i, :seq_len] = 1
 
         cap_mask = cap_mask.view(bsz, 1, 1, -1)  # for PyTorch SDPA
 
