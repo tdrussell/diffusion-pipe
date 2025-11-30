@@ -15,6 +15,7 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 ## Recent changes
 - 2025-11-29
   - Change license to GPL-3 so I can use ComfyUI code. Going forward, model implementations will use ComfyUI backend code whenever possible.
+    - ComfyUI submodule has been added. Make sure to run ```git submodule update``` after pulling.
   - Support Z-Image.
 - 2025-11-28
   - Use new backend for caching latents and text embeddings. This allows near-instant loading of the cached dataset even for terabyte-scale datasets.
@@ -94,6 +95,16 @@ This dependency isn't in the requirements file. You probably need to set some en
 C_INCLUDE_PATH=/home/anon/miniconda3/envs/diffusion-pipe/lib/python3.12/site-packages/nvidia/cudnn/include:$C_INCLUDE_PATH CPLUS_INCLUDE_PATH=/home/anon/miniconda3/envs/diffusion-pipe/lib/python3.12/site-packages/nvidia/cudnn/include:$CPLUS_INCLUDE_PATH pip install --no-build-isolation transformer_engine[pytorch]
 ```
 Edit the paths above for your conda environment.
+
+## Updating
+```
+git pull
+git submodule update
+```
+This project uses git submodules. If a new submodule has been added, you need to run ```git submodule update``` once after pulling in order to clone the new submodule. This only needs to be done once when a new submodule is added.
+
+### Updating dependencies
+Most dependencies are intentionally left unpinned in the requirements.txt file. If you want to update them to the latest version, you can run ```pip install -r requirements.txt -U```.
 
 ## Dataset preparation
 A dataset consists of one or more directories containing image or video files, and corresponding captions. You can mix images and videos in the same directory, but it's probably a good idea to separate them in case you need to specify certain settings on a per-directory basis. Caption files should be .txt files with the same base name as the corresponding media file, e.g. image1.png should have caption file image1.txt in the same directory. If a media file doesn't have a matching caption file, a warning is printed, but training will proceed with an empty caption.
