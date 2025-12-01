@@ -84,7 +84,7 @@ def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerp
     if cache_file_prefix:
         cache_dir = cache_dir / cache_file_prefix.strip('_')
 
-    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=10)
+    cache = Cache(cache_dir, new_fingerprint, shard_size_gb=1)
 
     if map_fn is None:
         # loading directly from cache without mapping
@@ -611,7 +611,7 @@ class DirectoryDataset:
             mask_files = []
             control_files = []
             for file in tqdm(files):
-                if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz' or file.suffix == '.json' or file.suffix == '.parquet':
+                if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz' or file.suffix == '.json' or file.suffix == '.parquet' or file.suffix == '.bak':
                     continue
                 for image_spec in process_file(file):
                     image_file = Path(image_spec[1])
