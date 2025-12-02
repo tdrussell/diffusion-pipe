@@ -289,6 +289,7 @@ class BasePipeline:
 class ComfyPipeline:
     framerate = None
     pixels_round_to_multiple = 16
+    keep_in_high_precision = []
 
     def __init__(self, config):
         self.config = config
@@ -318,8 +319,15 @@ class ComfyPipeline:
             self.model_patcher, _ = comfy.sd.load_lora_for_models(self.model_patcher, None, sd, 1.0, 0.0)
 
         self.model_patcher.set_model_compute_dtype(dtype)
-        self.model_patcher.patch_model()
+        with torch.no_grad():
+            self.model_patcher.patch_model()
         self.diffusion_model = self.model_patcher.model.diffusion_model
+
+        diffusion_model_dtype = self.model_config.get('diffusion_model_dtype', dtype)
+        for name, p in self.diffusion_model.named_parameters():
+            if any(keyword in name for keyword in self.keep_in_high_precision) or p.ndim == 1:
+                continue
+            p.data = p.data.to(diffusion_model_dtype)
 
     def get_vae(self):
         return self.vae

@@ -10,6 +10,7 @@ from torch.nn.utils.rnn import pad_sequence
 
 from models.base import ComfyPipeline, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
+from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
 
 
@@ -19,12 +20,17 @@ class ZImagePipeline(ComfyPipeline):
     # This will also train the noise_refiner and context_refiner layers, which aren't part of the main stack of transformer
     # layers, since they also use this class.
     adapter_target_modules = ['JointTransformerBlock']
+    keep_in_high_precision = ['x_pad_token', 'cap_pad_token', 'x_embedder', 't_embedder', 'cap_embedder', 'final_layer']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
     def to_layers(self):
         diffusion_model = self.diffusion_model
         layers = [InitialLayer(diffusion_model)]
-        for block in diffusion_model.layers:
-            layers.append(TransformerLayer(block))
+        for i, block in enumerate(diffusion_model.layers):
+            layers.append(TransformerLayer(block, i, self.offloader))
         layers.append(FinalLayer(diffusion_model))
         return layers
 
@@ -84,6 +90,33 @@ class ZImagePipeline(ComfyPipeline):
         target = latents - noise
 
         return (noisy_latents, t, text_embeds, attention_mask), (target, mask)
+
+    def enable_block_swap(self, blocks_to_swap):
+        diffusion_model = self.diffusion_model
+        blocks = diffusion_model.layers
+        num_blocks = len(blocks)
+        assert (
+            blocks_to_swap <= num_blocks - 2
+        ), f'Cannot swap more than {num_blocks - 2} blocks. Requested {blocks_to_swap} blocks to swap.'
+        self.offloader = ModelOffloader(
+            'TransformerBlock', blocks, num_blocks, blocks_to_swap, True, torch.device('cuda'), self.config['reentrant_activation_checkpointing']
+        )
+        diffusion_model.layers = None
+        diffusion_model.to('cuda')
+        diffusion_model.layers = blocks
+        self.prepare_block_swap_training()
+        print(f'Block swap enabled. Swapping {blocks_to_swap} blocks out of {num_blocks} blocks.')
+
+    def prepare_block_swap_training(self):
+        self.offloader.enable_block_swap()
+        self.offloader.set_forward_only(False)
+        self.offloader.prepare_block_devices_before_forward()
+
+    def prepare_block_swap_inference(self, disable_block_swap=False):
+        if disable_block_swap:
+            self.offloader.disable_block_swap()
+        self.offloader.set_forward_only(True)
+        self.offloader.prepare_block_devices_before_forward()
 
 
 class InitialLayer(nn.Module):
@@ -183,14 +216,20 @@ class InitialLayer(nn.Module):
 
 
 class TransformerLayer(nn.Module):
-    def __init__(self, layer):
+    def __init__(self, layer, block_idx, offloader):
         super().__init__()
         self.layer = layer
+        self.block_idx = block_idx
+        self.offloader = offloader
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         x, mask, freqs_cis, adaln_input, img_size, cap_size = inputs
+
+        self.offloader.wait_for_block(self.block_idx)
         x = self.layer(x, mask, freqs_cis, adaln_input)
+        self.offloader.submit_move_blocks_forward(self.block_idx)
+
         return make_contiguous(x, mask, freqs_cis, adaln_input, img_size, cap_size)
 
 

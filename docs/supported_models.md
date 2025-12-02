@@ -20,7 +20,7 @@
 |Qwen-Image-Edit |✅    |✅              |✅                |
 |HunyuanImage-2.1|✅    |✅              |✅                |
 |AuraFlow        |✅    |❌              |✅                |
-|Z-Image         |✅    |✅              |❌                |
+|Z-Image         |✅    |✅              |✅                |
 
 
 ## SDXL
@@ -446,6 +446,8 @@ text_encoders = [
 # Use if training Z-Image-Turbo
 merge_adapters = ['/data2/imagegen_models/comfyui-models/zimage_turbo_training_adapter_v1.safetensors']
 dtype = 'bfloat16'
+# You can reduce VRAM by having most weights in fp8 (small quality loss).
+#diffusion_model_dtype = 'float8'
 ```
 
 All model files should be the [ComfyUI versions](https://huggingface.co/Comfy-Org/z_image_turbo). If training Z-Image-Turbo, make sure to merge the [adapter](https://huggingface.co/ostris/zimage_turbo_training_adapter). Credit to Ostris and [AI Toolkit](https://github.com/ostris/ai-toolkit) for making this adapter.
