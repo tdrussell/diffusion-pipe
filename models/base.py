@@ -329,6 +329,10 @@ class ComfyPipeline:
                 continue
             p.data = p.data.to(diffusion_model_dtype)
 
+        self.diffusion_model.train()
+        for name, p in self.diffusion_model.named_parameters():
+            p.original_name = name
+
     def get_vae(self):
         return self.vae
 
