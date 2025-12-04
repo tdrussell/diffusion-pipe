@@ -235,6 +235,7 @@ class GenericOptim(Optimizer):
             betas: Tuple[float, float] = (0.9, 0.999),
             eps: float = 1e-6,
             weight_decay: float = 0.0,
+            weight_decay_type: str = "default", # default_scheduled, cautious, cautious_scheduled
             correct_bias: bool = True,
             momentum_type: str = "ema",
             second_moment_type: str = "ema",
@@ -242,6 +243,7 @@ class GenericOptim(Optimizer):
             cpu_offload=False,
             muon=False,
             adamuon=False,
+            normuon=False,
             compile=False,
             automagic=False,
             min_lr=1e-7,
@@ -255,7 +257,11 @@ class GenericOptim(Optimizer):
         self.second_moment_type = second_moment_type
         assert self.second_moment_type in ["ema", "none", "sn", "factored"]
         self.skip_invalid_grads = skip_invalid_grads
-
+        
+        self.weight_decay_type = weight_decay_type
+        assert self.weight_decay_type in ["default", "default_scheduled", "cautious", "cautious_scheduled"]
+        self.start_lr = lr
+        
         require_version("torch>=1.5.0")  # add_ with alpha
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr} - should be >= 0.0")
@@ -265,18 +271,18 @@ class GenericOptim(Optimizer):
             raise ValueError(f"Invalid beta parameter: {betas[1]} - should be in [0.0, 1.0]")
         if not 0.0 <= eps:
             raise ValueError(f"Invalid epsilon value: {eps} - should be >= 0.0")
-        if muon and adamuon:
-            raise ValueError('Only one of muon, adamuon can be True')
+        if muon + adamuon + normuon > 1:
+            raise ValueError('Only one of muon, adamuon, normuon can be True')
 
         defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay, "correct_bias": correct_bias, 'correct_dim': correct_dim,
-                    'cpu_offload': cpu_offload, 'muon': muon, 'adamuon': adamuon, 'compile': compile, 'automagic': automagic, 'min_lr': min_lr,
+                    'cpu_offload': cpu_offload, 'muon': muon, 'adamuon': adamuon, 'normuon': normuon, 'compile': compile, 'automagic': automagic, 'min_lr': min_lr,
                     'max_lr': max_lr, 'lr_bump': lr_bump, 'lr_decrease_factor': lr_decrease_factor}
         super().__init__(params, defaults)
         self.check_params()
         # Print out all configurations
         print(f"GenericOptim Configuration: lr={lr}, betas={betas}, eps={eps}, weight_decay={weight_decay}, "
               f"correct_bias={correct_bias}, momentum_type={momentum_type}, second_moment_type={second_moment_type}, correct_dim={correct_dim}, "
-              f"cpu_offload={cpu_offload}, muon={muon}, adamuon={adamuon}, compile={compile}, automagic={automagic}, min_lr={min_lr}, "
+              f"cpu_offload={cpu_offload}, muon={muon}, adamuon={adamuon}, normuon={normuon}, compile={compile}, automagic={automagic}, min_lr={min_lr}, "
               f"max_lr={max_lr}, lr_bump={lr_bump}, lr_decrease_factor={lr_decrease_factor}")
 
     @torch.no_grad()
@@ -326,8 +332,9 @@ class GenericOptim(Optimizer):
                 can_use_muon = numerator.ndim > 1
                 muon = group['muon'] and can_use_muon
                 adamuon = group['adamuon'] and can_use_muon
+                normuon = group['normuon'] and can_use_muon
 
-                if muon or adamuon:
+                if muon or adamuon or normuon:
                     rows, cols = numerator.shape[-2:]
                     if numerator.ndim == 4: # for the case of conv filters
                         numerator = numerator.view(len(numerator), -1)
@@ -352,6 +359,38 @@ class GenericOptim(Optimizer):
                         bias_correction2 = 1.0 - beta2 ** state["step"]
                         numerator.mul_(math.sqrt(bias_correction2))
                     step_size /= math.sqrt(torch.mean(numerator**2).item()) + group['eps']
+                    denominator = None
+                elif normuon:
+                    # NorMuon specific normalization
+                    beta1, beta2 = group["betas"]
+                    
+                    # Compute norm before normalization
+                    vnorm = numerator.norm(dim=(-2, -1), keepdim=True)
+                    
+                    # Compute second moment (v_mean) - mean over the last dimension
+                    v_mean = torch.mean(numerator * numerator, dim=-1, keepdim=True)
+                    
+                    # Get or initialize second momentum buffer
+                    second_momentum = state["second_momentum_buffer"].to(numerator.device, non_blocking=True)
+                    
+                    # Update second momentum
+                    second_momentum.lerp_(v_mean, 1 - beta2)
+                    
+                    # Compute step size per element
+                    step_size_per_element = 1 / second_momentum.sqrt().add_(group["eps"])
+                    
+                    # Apply normalization
+                    numerator.mul_(step_size_per_element)
+                    
+                    # Compute new norm and rescale to maintain original norm
+                    vnorm_new = numerator.norm(dim=(-2, -1), keepdim=True)
+                    numerator.mul_(vnorm / (vnorm_new + group["eps"]))
+                    
+                    # Apply the same scaling as Muon
+                    step_size *= math.sqrt(max(rows, cols))
+                    
+                    # Store updated second momentum
+                    state['second_momentum_buffer'] = second_momentum.to(state_device)
                     denominator = None
                 else:
                     denominator = self.get_denominator(group, state, p.grad, state_device)
@@ -384,7 +423,19 @@ class GenericOptim(Optimizer):
 
                 # Add weight decay at the end (fixed version)
                 if group["weight_decay"] > 0.0:
-                    update.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
+                    
+                    # Allows WD to cooldown as we reach the end of training process, as it bound to scheduled lr
+                    if "scheduled" in self.weight_decay_type:
+                        effective_wd = group["lr"] * group["lr"] * group["weight_decay"] / self.start_lr
+                    else:
+                        effective_wd = group["lr"] * group["weight_decay"]
+                    
+                    if "cautious" in self.weight_decay_type:
+                        # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
+                        p.copy_(torch.where(update * p >= 0, p * (1.0 - effective_wd), p))
+                    else:
+                        # Vanilla AdamW's decay mechanism
+                        update.add_(p, alpha=-effective_wd)
 
                 synchronize |= cpu_offload
 
@@ -417,6 +468,15 @@ class GenericOptim(Optimizer):
         beta1, beta2 = group["betas"]
         if beta1 == 0 or self.momentum_type == "none":
             return grad
+        
+        # Initialize NorMuon second momentum buffer if needed
+        if group["normuon"] and p.ndim >= 2 and "second_momentum_buffer" not in state:
+            # For NorMuon, we need a second momentum buffer with shape [..., 0:1]
+            if p.ndim == 2:
+                state["second_momentum_buffer"] = torch.zeros_like(p[..., 0:1])
+            elif p.ndim == 4:  # conv case
+                # For conv layers, we'll use shape that matches the first dimension
+                state["second_momentum_buffer"] = torch.zeros_like(p[:, 0:1, 0, 0])
 
         if self.momentum_type == "sm":
             return get_and_update_subspace_momentum(group, state, p)
@@ -555,3 +615,6 @@ class GenericOptim(Optimizer):
                 # The projector is a class which contains tensors, so state needs to be explicitly moved to the correct device.
                 if 'projector' in state:
                     state['projector'].to(p.device)
+                # Handle second_momentum_buffer for NorMuon
+                if 'second_momentum_buffer' in state:
+                    state['second_momentum_buffer'] = state['second_momentum_buffer'].to(p.device)
