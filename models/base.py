@@ -419,6 +419,14 @@ class ComfyPipeline:
 
     def get_call_text_encoder_fn(self, text_encoder):
 
+        te_idx = None
+        for i, te in enumerate(self.text_encoders):
+            if text_encoder == te:
+                te_idx = i
+                break
+        if te_idx is None:
+            raise RuntimeError('Unknown text encoder')
+
         def fn(captions: list[str], is_video: list[bool]):
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
             clip = text_encoder.cond_stage_model
@@ -451,7 +459,10 @@ class ComfyPipeline:
             text_embeds = o[0]
             extra = o[2]
             attention_mask = extra['attention_mask']
-            return {'text_embeds': text_embeds, 'attention_mask': attention_mask}
+            return {
+                f'text_embeds_{te_idx}': text_embeds,
+                f'attention_mask_{te_idx}': attention_mask,
+            }
 
         return fn
 

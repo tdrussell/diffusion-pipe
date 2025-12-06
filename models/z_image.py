@@ -37,8 +37,8 @@ class ZImagePipeline(ComfyPipeline):
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
         latents = self.model_patcher.model.process_latent_in(latents)
-        text_embeds = inputs['text_embeds']
-        attention_mask = inputs['attention_mask']
+        text_embeds = inputs['text_embeds_0']
+        attention_mask = inputs['attention_mask_0']
         mask = inputs['mask']
 
         # text embeds are variable length
