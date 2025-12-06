@@ -163,7 +163,7 @@ class Saver:
             exclude_frozen_parameters=True
         )
 
-    def process_epoch(self, epoch, step):
+    def process_epoch(self, epoch, step, examples):
         checkpointed, saved = False, False
         if self.train_dataloader.epoch != epoch:
             if need_to_checkpoint(self.config, epoch):
