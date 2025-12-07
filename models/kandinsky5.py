@@ -74,8 +74,8 @@ class Kandinsky5Pipeline(ComfyPipeline):
             ret = {'latents': latents}
             
             if is_i2v:
-                width = images[3]
-                height = images[2]
+                width = images.shape[3]
+                height = images.shape[2]
                 start_image= images[:, 0, ...]    
                 start_image = comfy.utils.common_upscale(start_image.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
                 encoded = vae.encode(start_image[:, :, :, :3])
