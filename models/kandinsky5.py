@@ -67,7 +67,7 @@ class Kandinsky5Pipeline(ComfyPipeline):
             if len(images.shape) == 4:
                 latents = vae.encode(images[:, :, :, :3])
                 # Image is a "video" model
-                images = images.unsqueeze(2)
+                images = images.unsqueeze(1)
             else:
                 latents = vae.encode(images[:, :, :, :, :3])
 
