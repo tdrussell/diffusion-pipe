@@ -15,7 +15,7 @@ import comfy.ldm.common_dit
 
 class Kandinsky5Pipeline(ComfyPipeline):
     name = 'kandinsky5' # Note: t2i and t2v/i2v model are both "video" models
-    
+    framerate = 24
     checkpointable_layers = ['TransformerEncoderBlock', 'TransformerDecoderBlock']
     adapter_target_modules = ['TransformerEncoderBlock', 'TransformerDecoderBlock']
     keep_in_high_precision = ['time_embeddings', 'text_embeddings', 'pooled_text_embeddings', 'visual_embeddings', 'out_layer']
