@@ -82,7 +82,7 @@ class Kandinsky5Pipeline(ComfyPipeline):
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
         context = inputs['text_embeds'][0]
-        y = inputs['text_embeds'][1][0] # Clip l, Pooled
+        y = inputs['text_embeds'][1][1] # Clip l, Pooled
 
         attention_mask = inputs['attention_mask']
         mask = inputs.get("mask", inputs.get("concat_mask", None))
