@@ -54,14 +54,23 @@ class Kandinsky5Pipeline(ComfyPipeline):
         is_i2v = self.model_type in ('i2v',)
         def fn(images):
             images = images.to('cuda')
-            if len(images) == 4:
-                # Image is a "video" model
-                images = images.unsqueeze(2)
-            # [b, c, t, h, w] -> [b, t, h, w, c]
-            images = torch.permute(images, (0, 2, 3, 4, 1))
+            if len(images.shape) == 4:
+                # [b, c, h, w] -> [b, h, w, c]
+                images = torch.permute(images, (0, 2, 3, 1))
+            else:
+                # [b, c, t, h, w] -> [b, t, h, w, c]
+                images = torch.permute(images, (0, 2, 3, 4, 1))
+            
             # Pixels are in range [-1, 1], Comfy code expects [0, 1]
             images = (images + 1) / 2
-            latents = vae.encode(images[:, :, :, :, :3])
+            
+            if len(images.shape) == 4:
+                latents = vae.encode(images[:, :, :, :3])
+                # Image is a "video" model
+                images = images.unsqueeze(2)
+            else:
+                latents = vae.encode(images[:, :, :, :, :3])
+
             ret = {'latents': latents}
             
             if is_i2v:
