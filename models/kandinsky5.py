@@ -26,7 +26,7 @@ class Kandinsky5Pipeline(ComfyPipeline):
         self.config = args[0]
         self.model_config = self.config['model']
         
-        ckpt_path = self.model_config['ckpt_path']
+        ckpt_path = self.model_config['diffusion_model']
         
         if "i2v" in ckpt_path:
             self.model_type = "i2v"
