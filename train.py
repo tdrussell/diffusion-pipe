@@ -348,6 +348,9 @@ if __name__ == '__main__':
     elif model_type == 'z_image':
         from models import z_image
         model = z_image.ZImagePipeline(config)
+    elif model_type == 'kandinsky5':
+        from models import kandinsky5
+        model = kandinsky5.Kandinsky5Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
