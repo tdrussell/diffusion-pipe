@@ -24,6 +24,21 @@ class Kandinsky5Pipeline(ComfyPipeline):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
+        self.config = args[0]
+        self.model_config = self.config['model']
+        
+        ckpt_path = self.model_config['ckpt_path']
+        
+        if "i2v" in ckpt_path:
+            self.model_type = "i2v"
+        elif "t2v" in ckpt_path:
+            self.model_type = "t2v"
+        elif "t2i" in ckpt_path:
+            self.model_type = "t2i"
+        else:
+            raise NotImplementedError("Unsupported model type! Supported types: t2v, t2i, i2v")        
+        
+        self.patch_size=(1, 2, 2)
 
     def to_layers(self):
         diffusion_model = self.diffusion_model
@@ -36,31 +51,54 @@ class Kandinsky5Pipeline(ComfyPipeline):
         layers.append(FinalLayer(diffusion_model))
         return layers
 
+    def get_call_vae_fn(self, vae):
+        is_i2v = self.model_type in ('i2v',)
+        def fn(images):
+            images = images.to('cuda')
+            # [b, c, t, h, w] -> [b, t, h, w, c]
+            images = torch.permute(images, (0, 2, 3, 4, 1))
+            # Pixels are in range [-1, 1], Comfy code expects [0, 1]
+            images = (images + 1) / 2
+            latents = vae.encode(images[:, :, :, :3])
+            ret = {'latents': latents}
+            
+            if is_i2v:
+                width = images[3]
+                height = images[2]
+                start_image= images[:, 0, ...]    
+                start_image = comfy.utils.common_upscale(start_image.movedim(-1, 1), width, height, "bilinear", "center").movedim(1, -1)
+                encoded = vae.encode(start_image[:, :, :, :3])
+
+                mask = torch.ones((1, 1, latents.shape[2], latents.shape[-2], latents.shape[-1]), device=start_image.device, dtype=start_image.dtype)
+                mask[:, :, :((start_image.shape[0] - 1) // 4) + 1] = 0.0
+                
+                ret["time_dim_replace"] = encoded
+                ret["concat_mask"] = mask
+            return ret
+        return fn
+
     # TODO: rewrite from Z-Image
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
-        latents = self.model_patcher.model.process_latent_in(latents)
-        text_embeds = inputs['text_embeds']
+        context = inputs['text_embeds'][0]
+        y = inputs['text_embeds'][1][0] # Clip l, Pooled
+
         attention_mask = inputs['attention_mask']
-        mask = inputs['mask']
+        mask = inputs.get("mask", inputs.get("concat_mask", None))
 
-        # text embeds are variable length
-        max_seq_len = max([e.size(0) for e in text_embeds])
-        text_embeds = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in text_embeds]
-        )
-        attention_mask = torch.stack(
-            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attention_mask]
-        )
-        assert text_embeds.shape[:2] == attention_mask.shape[:2]
+        time_dim_replace = inputs.get('time_dim_replace', None)
 
+        if time_dim_replace is not None:
+            time_dim_replace = comfy.ldm.common_dit.pad_to_patch_size(time_dim_replace, self.patch_size)
+            latents[:, :time_dim_replace.shape[1], :time_dim_replace.shape[2]] = time_dim_replace
+        
         attention_mask = attention_mask.to(torch.bool)
 
-        bs, c, h, w = latents.shape
+        bs, c, t, h, w = latents.shape
 
         if mask is not None:
-            mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
-            mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
+            mask = mask.unsqueeze(1)  # make mask (bs, 1, img_t, img_h, img_w)
+            mask = F.interpolate(mask, size=(t, h, w), mode='nearest-exact')  # resize to latent spatial dimension
 
         timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
 
@@ -92,7 +130,7 @@ class Kandinsky5Pipeline(ComfyPipeline):
         noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
         target = latents - noise
 
-        return (noisy_latents, t, text_embeds, attention_mask), (target, mask)
+        return (noisy_latents, t, context, y, attention_mask), (target, mask)
 
     def enable_block_swap(self, blocks_to_swap):
         diffusion_model = self.diffusion_model
