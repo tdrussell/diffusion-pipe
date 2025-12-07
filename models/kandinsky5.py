@@ -85,6 +85,8 @@ class Kandinsky5Pipeline(ComfyPipeline):
 
         attention_mask = inputs['attention_mask']
         mask = inputs.get("mask", inputs.get("concat_mask", None))
+        
+        latents = comfy.ldm.common_dit.pad_to_patch_size(latents, (self.patch_size, self.patch_size))
 
         time_dim_replace = inputs.get('time_dim_replace', None)
 
@@ -161,3 +163,106 @@ class Kandinsky5Pipeline(ComfyPipeline):
             self.offloader.disable_block_swap()
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
+
+
+class InitialLayer(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = [model]
+        
+    def __getattr__(self, name):
+        return getattr(self.model[0], name)
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        for item in inputs:
+            if torch.is_floating_point(item):
+                item.requires_grad_(True)
+        x, timesteps, context, y, attention_mask = inputs
+        b, c, t_len, h, w = x.shape
+
+        t = 1.0 - timesteps
+        
+        freqs = self.rope_encode_3d(t_len, h, w, device=x.device, dtype=x.dtype)
+        freqs_text = self.rope_encode_1d(context.shape[1], device=x.device, dtype=x.dtype)
+        
+        context = self.text_embeddings(context)
+        t = self.time_embeddings(t * 1000, x.dtype) + self.pooled_text_embeddings(y)
+
+        return make_contiguous(x, t, context, y, attention_mask, freqs, freqs_text)
+
+class TextTransformerLayer(nn.Module):
+    def __init__(self, layer, block_idx, offloader):
+        super().__init__()
+        self.layer = layer
+        self.block_idx = block_idx
+        self.offloader = offloader
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        x, t, context, y, attention_mask, freqs, freqs_text = inputs
+
+        self.offloader.wait_for_block(self.block_idx)
+        context = self.layer(context, t, freqs_text)
+        self.offloader.submit_move_blocks_forward(self.block_idx)
+
+        return make_contiguous(x, t, context, y, attention_mask, freqs, freqs_text)
+
+# TODO:
+
+class TextVisualTransitionalLayer(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.final_layer = model.final_layer
+        self.model = [model]
+
+    def __getattr__(self, name):
+        return getattr(self.model[0], name)
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        x, mask, freqs_cis, adaln_input, img_size, cap_size = inputs
+        img_size = [(row[0].item(), row[1].item()) for row in img_size]
+        cap_size = [row.item() for row in cap_size]
+        x = self.final_layer(x, adaln_input)
+        h, w = img_size[0]  # same for all items in batch
+        x = self.unpatchify(x, img_size, cap_size, return_tensor=True)[:,:,:h,:w]
+        return x
+
+
+class VisualTransformerLayer(nn.Module):
+    def __init__(self, layer, block_idx, offloader):
+        super().__init__()
+        self.layer = layer
+        self.block_idx = block_idx
+        self.offloader = offloader
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        x, mask, freqs_cis, adaln_input, img_size, cap_size = inputs
+
+        self.offloader.wait_for_block(self.block_idx)
+        x = self.layer(x, mask, freqs_cis, adaln_input)
+        self.offloader.submit_move_blocks_forward(self.block_idx)
+
+        return make_contiguous(x, mask, freqs_cis, adaln_input, img_size, cap_size)
+
+
+class FinalLayer(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.final_layer = model.final_layer
+        self.model = [model]
+
+    def __getattr__(self, name):
+        return getattr(self.model[0], name)
+
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def forward(self, inputs):
+        x, mask, freqs_cis, adaln_input, img_size, cap_size = inputs
+        img_size = [(row[0].item(), row[1].item()) for row in img_size]
+        cap_size = [row.item() for row in cap_size]
+        x = self.final_layer(x, adaln_input)
+        h, w = img_size[0]  # same for all items in batch
+        x = self.unpatchify(x, img_size, cap_size, return_tensor=True)[:,:,:h,:w]
+        return x
