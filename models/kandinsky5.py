@@ -8,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
-from models.base import ComfyPipeline, make_contiguous
+from models.base import ComfyPipeline, PreprocessMediaFile, make_contiguous
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift
 from utils.offloading import ModelOffloader
 import comfy.ldm.common_dit
@@ -174,6 +174,12 @@ class Kandinsky5Pipeline(ComfyPipeline):
         self.offloader.set_forward_only(True)
         self.offloader.prepare_block_devices_before_forward()
 
+    def get_preprocess_media_file_fn(self):
+        return PreprocessMediaFile(
+            self.config,
+            support_video=True,
+            framerate=self.framerate,
+        )
 
 class InitialLayer(nn.Module):
     def __init__(self, model):
