@@ -461,6 +461,24 @@ class ComfyPipeline:
             # e.g. for CLIP and for LLM
             # also, this assumes model has clip_l, e.g. Kandinsky5
             if hasattr(clip, "clip_l"):
+                
+                tokenizer = text_encoder.tokenizer.clip_l
+                
+                max_length = 0
+                for text in captions:
+                    tokens = tokenizer.tokenize_with_weights(text)
+                    # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
+                    for v in tokens.values():
+                        max_length = max(max_length, len(v[0]))
+
+                # pad to max length in the batch
+                tokenizer.min_length = max_length
+                tokens_dict = defaultdict(list)
+                for text in captions:
+                    tokens = tokenizer.tokenize_with_weights(text)
+                    for k, v in tokens.items():
+                        tokens_dict[k].extend(v)
+                
                 _, l_pooled = clip.clip_l.encode(to_encode)
                 ret['pooled_text_embeds'] = l_pooled
             
