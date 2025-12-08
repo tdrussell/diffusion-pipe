@@ -424,11 +424,24 @@ class ComfyPipeline:
     def get_call_text_encoder_fn(self, text_encoder):
 
         def fn(captions: list[str], is_video: list[bool]):
+            
+            captions_llm = []
+            captions_clip = []
+            
+            for c in captions:
+                if "<CLIP>" in c:
+                    c = c.split("<CLIP>")
+                    captions_llm.append(c[0].strip())
+                    captions_clip.append(c[1].strip())
+                else:
+                    captions_llm.append(c)
+                    captions_clip.append(c)
+            
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
             clip = text_encoder.cond_stage_model
 
             max_length = 0
-            for text in captions:
+            for text in captions_llm:
                 tokens = text_encoder.tokenize(text)
                 # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
                 for v in tokens.values():
@@ -437,7 +450,7 @@ class ComfyPipeline:
             # pad to max length in the batch
             tokenizer.min_length = max_length
             tokens_dict = defaultdict(list)
-            for text in captions:
+            for text in captions_llm:
                 tokens = text_encoder.tokenize(text)
                 for k, v in tokens.items():
                     tokens_dict[k].extend(v)
@@ -465,7 +478,7 @@ class ComfyPipeline:
                 tokenizer = text_encoder.tokenizer.clip_l
                 
                 max_length = 0
-                for text in captions:
+                for text in captions_clip:
                     tokens = tokenizer.tokenize_with_weights(text)
                     # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
                     for v in tokens.values():
@@ -474,7 +487,7 @@ class ComfyPipeline:
                 # pad to max length in the batch
                 tokenizer.min_length = max_length
                 tokens_dict = defaultdict(list)
-                for text in captions:
+                for text in captions_clip:
                     tokens = tokenizer.tokenize_with_weights(text)
                     for k, v in tokens.items():
                         tokens_dict[k].extend(v)
