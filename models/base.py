@@ -456,9 +456,13 @@ class ComfyPipeline:
             extra = o[2]
             attention_mask = extra['attention_mask']
             ret = {'text_embeds': text_embeds, 'attention_mask': attention_mask}
-            
-            if o[1] is not None:
-                ret['pooled_text_embeds'] = o[1]
+
+            # TODO: separate prompts for encoders?
+            # e.g. for CLIP and for LLM
+            # also, this assumes model has clip_l, e.g. Kandinsky5
+            if hasattr(clip, "clip_l"):
+                _, l_pooled = clip.clip_l.encode(to_encode)
+                ret['pooled_text_embeds'] = l_pooled
             
             return ret
 
