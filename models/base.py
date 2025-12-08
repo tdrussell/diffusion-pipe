@@ -470,9 +470,8 @@ class ComfyPipeline:
             attention_mask = extra['attention_mask']
             ret = {'text_embeds': text_embeds, 'attention_mask': attention_mask}
 
-            # TODO: separate prompts for encoders?
-            # e.g. for CLIP and for LLM
-            # also, this assumes model has clip_l, e.g. Kandinsky5
+            # the code below assumes model has clip_l, e.g. Kandinsky5
+            # other models can have their "sub"clips
             if hasattr(clip, "clip_l"):
                 
                 tokenizer = text_encoder.tokenizer.clip_l
