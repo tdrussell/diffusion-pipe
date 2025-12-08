@@ -486,11 +486,15 @@ class ComfyPipeline:
 
                 # pad to max length in the batch
                 tokenizer.min_length = max_length
-                tokens_dict = defaultdict(list)
+                token_weight_pairs = []
                 for text in captions_clip:
                     tokens = tokenizer.tokenize_with_weights(text)
-                    for k, v in tokens.items():
-                        tokens_dict[k].extend(v)
+                    token_weight_pairs.append(tokens)
+                
+                to_encode = []
+                for x in token_weight_pairs:
+                    tokens = list(map(lambda a: a[0], x))
+                    to_encode.append(tokens)
                 
                 _, l_pooled = clip.clip_l.encode(to_encode)
                 ret['pooled_text_embeds'] = l_pooled
