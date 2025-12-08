@@ -462,8 +462,7 @@ type = 'kandinsky5'
 diffusion_model = '/data2/imagegen_models/comfyui-models/kandinsky5lite_i2v_5s.safetensors'
 vae = '/data2/imagegen_models/comfyui-models/hunyuan_video_vae_bf16.safetensors'
 text_encoders = [
-    {path = '/data2/imagegen_models/comfyui-models/qwen_2.5_vl_7b.safetensors', type = 'kandinsky5'},
-    {path = '/data2/imagegen_models/comfyui-models/clip_l.safetensors', type = 'kandinsky5'}
+    {path = ['/data2/imagegen_models/comfyui-models/qwen_2.5_vl_7b.safetensors', '/data2/imagegen_models/comfyui-models/clip_l.safetensors'], type = 'kandinsky5'}
 ]
 dtype = 'bfloat16'
 # You can use fp8 for the transformer when training LoRA.
@@ -478,8 +477,7 @@ type = 'kandinsky5'
 diffusion_model = '/data2/imagegen_models/comfyui-models/kandinsky5lite_t2i.safetensors '
 vae = '/data2/imagegen_models/comfyui-models/ae.safetensors' # Flux 1 VAE
 text_encoders = [
-    {path = '/data2/imagegen_models/comfyui-models/qwen_2.5_vl_7b.safetensors', type = 'kandinsky5'},
-    {path = '/data2/imagegen_models/comfyui-models/clip_l.safetensors', type = 'kandinsky5'}
+    {path = ['/data2/imagegen_models/comfyui-models/qwen_2.5_vl_7b.safetensors', '/data2/imagegen_models/comfyui-models/clip_l.safetensors'], type = 'kandinsky5_image'}
 ]
 dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'

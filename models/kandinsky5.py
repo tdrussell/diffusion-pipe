@@ -90,11 +90,23 @@ class Kandinsky5Pipeline(ComfyPipeline):
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
-        context = inputs['text_embeds'][0]
-        y = inputs['text_embeds'][1][1] # Clip l, Pooled
+        text_embeds = inputs['text_embeds']
+        y = inputs['pooled_text_embeds'] # Clip l, Pooled
 
         attention_mask = inputs['attention_mask']
         mask = inputs.get("mask", inputs.get("concat_mask", None))
+        
+        # text embeds are variable length
+        max_seq_len = max([e.size(0) for e in text_embeds])
+        text_embeds = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in text_embeds]
+        )
+        attention_mask = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attention_mask]
+        )
+        assert text_embeds.shape[:2] == attention_mask.shape[:2]
+
+        attention_mask = attention_mask.to(torch.bool)
         
         latents = comfy.ldm.common_dit.pad_to_patch_size(latents, (self.patch_size, self.patch_size))
 
@@ -103,8 +115,6 @@ class Kandinsky5Pipeline(ComfyPipeline):
         if time_dim_replace is not None:
             time_dim_replace = comfy.ldm.common_dit.pad_to_patch_size(time_dim_replace, self.patch_size)
             latents[:, :time_dim_replace.shape[1], :time_dim_replace.shape[2]] = time_dim_replace
-        
-        attention_mask = attention_mask.to(torch.bool)
 
         bs, c, t, h, w = latents.shape
 
@@ -142,7 +152,7 @@ class Kandinsky5Pipeline(ComfyPipeline):
         noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
         target = latents - noise
 
-        return (noisy_latents, t, context, y, attention_mask), (target, mask)
+        return (noisy_latents, t, text_embeds, y, attention_mask), (target, mask)
 
     def enable_block_swap(self, blocks_to_swap):
         diffusion_model = self.diffusion_model

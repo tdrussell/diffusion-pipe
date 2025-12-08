@@ -303,7 +303,9 @@ class ComfyPipeline:
         # Text encoders
         self.text_encoders = []
         for te_config in self.model_config['text_encoders']:
-            clip = comfy.sd.load_clip(ckpt_paths=[te_config['path']], clip_type=te_config['type'])
+            te_path_info = te_config['path']
+            te_paths = te_path_info if isinstance(te_path_info, list) else [te_path_info]
+            clip = comfy.sd.load_clip(ckpt_paths=te_paths, clip_type=te_config['type'])
             self.text_encoders.append(clip)
 
     def load_diffusion_model(self):
@@ -451,7 +453,12 @@ class ComfyPipeline:
             text_embeds = o[0]
             extra = o[2]
             attention_mask = extra['attention_mask']
-            return {'text_embeds': text_embeds, 'attention_mask': attention_mask}
+            ret = {'text_embeds': text_embeds, 'attention_mask': attention_mask}
+            
+            if o[1] is not None:
+                ret['pooled_text_embeds'] = o[1]
+            
+            return ret
 
         return fn
 
