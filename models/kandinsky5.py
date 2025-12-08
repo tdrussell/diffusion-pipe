@@ -108,7 +108,7 @@ class Kandinsky5Pipeline(ComfyPipeline):
 
         attention_mask = attention_mask.to(torch.bool)
         
-        latents = comfy.ldm.common_dit.pad_to_patch_size(latents, (self.patch_size, self.patch_size))
+        latents = comfy.ldm.common_dit.pad_to_patch_size(latents, self.patch_size)
 
         time_dim_replace = inputs.get('time_dim_replace', None)
 
