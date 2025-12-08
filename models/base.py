@@ -479,9 +479,8 @@ class ComfyPipeline:
                 max_length = 0
                 for text in captions_clip:
                     tokens = tokenizer.tokenize_with_weights(text)
-                    # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
-                    for v in tokens.values():
-                        max_length = max(max_length, len(v[0]))
+                    # tokens looks like [[(0, 1.0), (1, 1.0), (2, 1.0)]]
+                    max_length = max(max_length, len(tokens[0]))
 
                 # pad to max length in the batch
                 tokenizer.min_length = max_length
