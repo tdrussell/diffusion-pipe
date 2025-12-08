@@ -305,7 +305,9 @@ class ComfyPipeline:
         for te_config in self.model_config['text_encoders']:
             te_path_info = te_config['path']
             te_paths = te_path_info if isinstance(te_path_info, list) else [te_path_info]
-            clip = comfy.sd.load_clip(ckpt_paths=te_paths, clip_type=te_config['type'])
+            clip_type = te_config['type'].upper()
+            print(f"clip_type is {clip_type}")
+            clip = comfy.sd.load_clip(ckpt_paths=te_paths, clip_type=getattr(comfy.sd.CLIPType, clip_type))
             self.text_encoders.append(clip)
 
     def load_diffusion_model(self):
