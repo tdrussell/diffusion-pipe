@@ -487,7 +487,7 @@ class ComfyPipeline:
                 token_weight_pairs = []
                 for text in captions_clip:
                     tokens = tokenizer.tokenize_with_weights(text)
-                    token_weight_pairs.append(tokens)
+                    token_weight_pairs.append(tokens[0])
                 
                 to_encode = []
                 for x in token_weight_pairs:
