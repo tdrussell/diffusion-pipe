@@ -148,7 +148,7 @@ class Kandinsky5Pipeline(ComfyPipeline):
             t = time_shift(mu, 1.0, t)
 
         noise = torch.randn_like(latents)
-        t_expanded = t.view(-1, 1, 1, 1)
+        t_expanded = t.view(-1, 1, 1, 1, 1)
         noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
         target = latents - noise
 
