@@ -215,11 +215,12 @@ class Kandinsky5Pipeline(ComfyPipeline):
 class InitialLayer(nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.model = [model]
+        self.rope_encode_3d = model.rope_encode_3d
+        self.rope_encode_1d = model.rope_encode_1d
+        self.text_embeddings = model.text_embeddings
+        self.time_embeddings = model.time_embeddings
+        self.pooled_text_embeddings = model.pooled_text_embeddings
         
-    def __getattr__(self, name):
-        return getattr(self.model[0], name)
-
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         for item in inputs:
@@ -258,10 +259,7 @@ class TextTransformerLayer(nn.Module):
 class TextVisualTransitionalLayer(nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.model = [model]
-
-    def __getattr__(self, name):
-        return getattr(self.model[0], name)
+        self.visual_embeddings = model.visual_embeddings
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
@@ -293,10 +291,7 @@ class VisualTransformerLayer(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, model):
         super().__init__()
-        self.model = [model]
-
-    def __getattr__(self, name):
-        return getattr(self.model[0], name)
+        self.out_layer = model.out_layer
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
