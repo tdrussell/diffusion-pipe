@@ -111,15 +111,23 @@ class Kandinsky5Pipeline(ComfyPipeline):
         latents = comfy.ldm.common_dit.pad_to_patch_size(latents, self.patch_size)
 
         time_dim_replace = inputs.get('time_dim_replace', None)
-        latents_cond = torch.zeros_like(latents)
-        mask_cond = torch.zeros((latents.shape[0], 1, *latents.shape[2:]), device=latents.device, dtype=latents.dtype)
+        is_image = self.model_type in ('t2i',)
+        
+        if not is_image:
+            latents_cond = torch.zeros_like(latents)
+            mask_cond = torch.zeros((latents.shape[0], 1, *latents.shape[2:]), device=latents.device, dtype=latents.dtype)
+        else:
+            # Kandinsky t2i doesn't need cond concatenation
+            latents_cond = None
+            mask_cond = None
 
         if time_dim_replace is not None:
             time_dim_replace = comfy.ldm.common_dit.pad_to_patch_size(time_dim_replace, self.patch_size)
 
             latents[:, :time_dim_replace.shape[1], :time_dim_replace.shape[2]] = time_dim_replace
-            latents_cond[:, :time_dim_replace.shape[1], :time_dim_replace.shape[2]] = time_dim_replace
-            mask_cond[:, 0, :time_dim_replace.shape[2]] = 1
+            if latents_cond is not None and mask_cond is not None:
+                latents_cond[:, :time_dim_replace.shape[1], :time_dim_replace.shape[2]] = time_dim_replace
+                mask_cond[:, 0, :time_dim_replace.shape[2]] = 1
 
         bs, c, t, h, w = latents.shape
 
@@ -160,7 +168,10 @@ class Kandinsky5Pipeline(ComfyPipeline):
         # Concatentation for image2video
         # x_t = torch.cat([x_t, instruct_visual, instruct_mask], -1) # -- reference
 
-        noisy_latents = torch.cat([noisy_latents, latents_cond, mask_cond], dim=1)
+        if latents_cond is not None and mask_cond is not None:
+            noisy_latents = torch.cat([noisy_latents, latents_cond, mask_cond], dim=1)
+        else:
+            pass
 
         return (noisy_latents, t, text_embeds, y, attention_mask), (target, mask)
 
