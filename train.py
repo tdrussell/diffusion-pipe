@@ -707,6 +707,7 @@ if __name__ == '__main__':
             return gradient_release.GradientReleaseOptimizerWrapper(list(optimizer_dict.values()))
         elif optim_type_lower == 'genericoptim':
             kwargs['compile'] = config['compile']
+            kwargs['mpu'] = pipeline_model.mpu()
             new_param_groups = []
             param_groups = model.get_param_groups(model_parameters)
             for pg in param_groups:
@@ -847,8 +848,12 @@ if __name__ == '__main__':
 
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
+            if hasattr(optimizer, '_grad_norm'):
+                tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
             if wandb_enable:
                 wandb.log({'train/loss': loss, 'step': x_axis})
+                if hasattr(optimizer, '_grad_norm'):
+                    wandb.log({'train/grad_norm': optimizer._grad_norm, 'step': x_axis})
             if optimizer.__class__.__name__ == 'Prodigy':
                 prodigy_d = get_prodigy_d(optimizer)
                 tb_writer.add_scalar(f'train/prodigy_d', prodigy_d, x_axis)

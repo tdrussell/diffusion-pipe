@@ -13,6 +13,8 @@ import torch
 from torch.optim import Optimizer
 
 from transformers.utils.versions import require_version
+from deepspeed import comm as dist
+from deepspeed.accelerator import get_accelerator
 
 
 NS_STEPS = 5
@@ -249,12 +251,16 @@ class GenericOptim(Optimizer):
             lr_bump=1e-6, # amount to bump the lr when adjusting
             lr_decrease_factor=1.0, # how much more to decrease the LR vs increase
             skip_invalid_grads=False,
+            mpu=None,
     ):
         self.momentum_type = momentum_type
         assert self.momentum_type in ["ema", "sm", "none"]
         self.second_moment_type = second_moment_type
         assert self.second_moment_type in ["ema", "none", "sn", "factored"]
         self.skip_invalid_grads = skip_invalid_grads
+        self.compile = compile
+        self.cpu_offload = cpu_offload
+        self.mpu = mpu
 
         require_version("torch>=1.5.0")  # add_ with alpha
         if lr < 0.0:
@@ -293,6 +299,7 @@ class GenericOptim(Optimizer):
 
         synchronize = False
         skipped_parameter_names = []
+        total_norm = 0
 
         for group in self.param_groups:
             for p in group["params"]:
@@ -304,6 +311,9 @@ class GenericOptim(Optimizer):
                 if self.skip_invalid_grads and has_inf_or_nan(p.grad):
                     skipped_parameter_names.append(getattr(p, 'original_name', None))
                     continue
+
+                param_norm = p.grad.data.norm(2).float()
+                total_norm += param_norm.item()**2
 
                 # Setup
                 state = self.state[p]
@@ -409,6 +419,11 @@ class GenericOptim(Optimizer):
 
         if len(skipped_parameter_names) > 0:
             print(f'WARNING: {len(skipped_parameter_names)} parameter updates were skipped due to Inf or NaN.')
+
+        total_norm_cuda = get_accelerator().FloatTensor([float(total_norm)])
+        if self.mpu is not None:
+            dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.SUM, group=self.mpu.get_model_parallel_group())
+        self._grad_norm = total_norm_cuda[0].item()**(0.5)
 
         return loss
 
