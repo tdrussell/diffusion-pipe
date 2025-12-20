@@ -2,9 +2,10 @@ from typing import Optional
 import sys
 import os.path
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/HunyuanVideo'))
+sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import torch
-from torch import nn
+from torch import nn, Tensor
 import torch._inductor.runtime.triton_heuristics
 import peft
 from peft.tuners._buffer_dict import BufferDict
@@ -25,6 +26,9 @@ from deepspeed.accelerator import get_accelerator
 from . import reduction
 import hyvideo.text_encoder
 from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
+
+from comfy.ldm.flux.layers import DoubleStreamBlock, apply_mod
+from comfy.ldm.flux.math import attention
 
 
 def _move_adapter_to_device_of_base_layer(self, adapter_name: str, device: Optional[torch.device] = None) -> None:
@@ -290,6 +294,74 @@ def copy_args_to_cpu_if_needed(self, *args, **kwargs):
     return copies
 
 
+def double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims_img=None, modulation_dims_txt=None, transformer_options={}):
+    if self.modulation:
+        img_mod1, img_mod2 = self.img_mod(vec)
+        txt_mod1, txt_mod2 = self.txt_mod(vec)
+    else:
+        (img_mod1, img_mod2), (txt_mod1, txt_mod2) = vec
+
+    # prepare image for attention
+    img_modulated = self.img_norm1(img)
+    img_modulated = apply_mod(img_modulated, (1 + img_mod1.scale), img_mod1.shift, modulation_dims_img)
+    img_qkv = self.img_attn.qkv(img_modulated)
+    del img_modulated
+    img_q, img_k, img_v = img_qkv.view(img_qkv.shape[0], img_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    del img_qkv
+    img_q, img_k = self.img_attn.norm(img_q, img_k, img_v)
+
+    # prepare txt for attention
+    txt_modulated = self.txt_norm1(txt)
+    txt_modulated = apply_mod(txt_modulated, (1 + txt_mod1.scale), txt_mod1.shift, modulation_dims_txt)
+    txt_qkv = self.txt_attn.qkv(txt_modulated)
+    del txt_modulated
+    txt_q, txt_k, txt_v = txt_qkv.view(txt_qkv.shape[0], txt_qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    del txt_qkv
+    txt_q, txt_k = self.txt_attn.norm(txt_q, txt_k, txt_v)
+
+    if self.flipped_img_txt:
+        q = torch.cat((img_q, txt_q), dim=2)
+        del img_q, txt_q
+        k = torch.cat((img_k, txt_k), dim=2)
+        del img_k, txt_k
+        v = torch.cat((img_v, txt_v), dim=2)
+        del img_v, txt_v
+        # run actual attention
+        attn = attention(q, k, v,
+                            pe=pe, mask=attn_mask, transformer_options=transformer_options)
+        del q, k, v
+
+        img_attn, txt_attn = attn[:, : img.shape[1]], attn[:, img.shape[1]:]
+    else:
+        q = torch.cat((txt_q, img_q), dim=2)
+        del txt_q, img_q
+        k = torch.cat((txt_k, img_k), dim=2)
+        del txt_k, img_k
+        v = torch.cat((txt_v, img_v), dim=2)
+        del txt_v, img_v
+        # run actual attention
+        attn = attention(q, k, v,
+                            pe=pe, mask=attn_mask, transformer_options=transformer_options)
+        del q, k, v
+
+        txt_attn, img_attn = attn[:, : txt.shape[1]], attn[:, txt.shape[1]:]
+
+    # calculate the img bloks
+    img = img + apply_mod(self.img_attn.proj(img_attn), img_mod1.gate, None, modulation_dims_img)
+    del img_attn
+    img = img + apply_mod(self.img_mlp(apply_mod(self.img_norm2(img), (1 + img_mod2.scale), img_mod2.shift, modulation_dims_img)), img_mod2.gate, None, modulation_dims_img)
+
+    # calculate the txt bloks
+    txt = txt + apply_mod(self.txt_attn.proj(txt_attn), txt_mod1.gate, None, modulation_dims_txt)
+    del txt_attn
+    txt = txt + apply_mod(self.txt_mlp(apply_mod(self.txt_norm2(txt), (1 + txt_mod2.scale), txt_mod2.shift, modulation_dims_txt)), txt_mod2.gate, None, modulation_dims_txt)
+
+    if txt.dtype == torch.float16:
+        txt = torch.nan_to_num(txt, nan=0.0, posinf=65504, neginf=-65504)
+
+    return img, txt
+
+
 def apply_patches():
     # Prevent PEFT from downcasting LoRA weights to fp8 only for this script to upcast them again.
     # TODO: probably should send a PR to PEFT. Default behavior looks like a mistake to me.
@@ -318,3 +390,6 @@ def apply_patches():
 
     # Remove pin_memory=True which is causing failures in some cases when using torch compile.
     torch._inductor.runtime.triton_heuristics.CachingAutotuner.copy_args_to_cpu_if_needed = copy_args_to_cpu_if_needed
+
+    # Fix training issues caused by in-place tensor modification and backward pass (+= operations).
+    DoubleStreamBlock.forward = double_stream_forward

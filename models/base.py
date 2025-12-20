@@ -4,6 +4,7 @@ import tarfile
 import os
 import sys
 from collections import defaultdict
+import types
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import peft
@@ -19,6 +20,8 @@ import imageio
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple
 import comfy.utils
 import comfy.sd
+import comfy.sd1_clip
+from comfy import model_management
 
 
 def make_contiguous(*tensors):
@@ -286,6 +289,63 @@ class BasePipeline:
         pass
 
 
+def encode_token_weights(self, token_weight_pairs):
+    to_encode = list()
+    max_token_len = 0
+    has_weights = False
+    for x in token_weight_pairs:
+        tokens = list(map(lambda a: a[0], x))
+        max_token_len = max(len(tokens), max_token_len)
+        has_weights = has_weights or not all(map(lambda a: a[1] == 1.0, x))
+        to_encode.append(tokens)
+
+    sections = len(to_encode)
+    if has_weights or sections == 0:
+        if hasattr(self, "gen_empty_tokens"):
+            to_encode.append(self.gen_empty_tokens(self.special_tokens, max_token_len))
+        else:
+            to_encode.append(comfy.sd1_clip.gen_empty_tokens(self.special_tokens, max_token_len))
+
+    o = self.encode(to_encode)
+    out, pooled = o[:2]
+
+    # if pooled is not None:
+    #     first_pooled = pooled[0:1].to(model_management.intermediate_device())
+    # else:
+    #     first_pooled = pooled
+    assert pooled is None
+    first_pooled = None
+
+    output = []
+    for k in range(0, sections):
+        z = out[k:k+1]
+        if has_weights:
+            z_empty = out[-1]
+            for i in range(len(z)):
+                for j in range(len(z[i])):
+                    weight = token_weight_pairs[k][j][1]
+                    if weight != 1.0:
+                        z[i][j] = (z[i][j] - z_empty[j]) * weight + z_empty[j]
+        output.append(z)
+
+    if (len(output) == 0):
+        r = (out[-1:].to(model_management.intermediate_device()), first_pooled)
+    else:
+        r = (torch.cat(output, dim=0).to(model_management.intermediate_device()), first_pooled)
+
+    if len(o) > 2:
+        extra = {}
+        for k in o[2]:
+            v = o[2][k]
+            extra[k] = v
+
+        r = r + (extra,)
+    return r
+
+# Handle batch of different prompts.
+comfy.sd1_clip.ClipTokenWeightEncoder.encode_token_weights = encode_token_weights
+
+
 class ComfyPipeline:
     framerate = None
     pixels_round_to_multiple = 16
@@ -300,10 +360,36 @@ class ComfyPipeline:
         self.vae = comfy.sd.VAE(sd=sd)
         self.vae.throw_exception_if_invalid()
 
+        def vae_encode_crop_pixels(self, pixels):
+            if not self.crop_input:
+                return pixels
+
+            downscale_ratio = self.spacial_compression_encode()
+
+            dims = pixels.shape[-3:-1]
+            for d in range(len(dims)):
+                x = (dims[d] // downscale_ratio) * downscale_ratio
+                x_offset = (dims[d] % downscale_ratio) // 2
+                if x != dims[d]:
+                    pixels = pixels.narrow(d + 1, x_offset, x)
+            return pixels
+
+        # patch this to handle 5D video tensor (original code expects 4D even for video)
+        self.vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, self.vae)
+
         # Text encoders
         self.text_encoders = []
         for te_config in self.model_config['text_encoders']:
-            clip = comfy.sd.load_clip(ckpt_paths=[te_config['path']], clip_type=te_config['type'])
+            if 'paths' in te_config:
+                paths = te_config['paths']
+            elif 'path' in te_config:
+                paths = te_config['path']
+            else:
+                raise ValueError('need text encoder path in config')
+            if isinstance(paths, str):
+                paths = [paths]
+            clip_type = getattr(comfy.sd.CLIPType, te_config['type'].upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
+            clip = comfy.sd.load_clip(ckpt_paths=paths, clip_type=clip_type)
             self.text_encoders.append(clip)
 
     def load_diffusion_model(self):
@@ -407,10 +493,10 @@ class ComfyPipeline:
 
     def get_call_vae_fn(self, vae):
         def fn(images):
-            assert images.ndim == 4  # TODO: video
             images = images.to('cuda')
-            # [b, c, h, w] -> [b, h, w, c]
-            images = torch.permute(images, (0, 2, 3, 1))
+            # move channel dim to end
+            # works for both images (b c h w) and video (b c f h w)
+            images = images.movedim(1, -1)
             # Pixels are in range [-1, 1], Comfy code expects [0, 1]
             images = (images + 1) / 2
             latents = vae.encode(images)
@@ -418,7 +504,6 @@ class ComfyPipeline:
         return fn
 
     def get_call_text_encoder_fn(self, text_encoder):
-
         te_idx = None
         for i, te in enumerate(self.text_encoders):
             if text_encoder == te:
@@ -429,7 +514,6 @@ class ComfyPipeline:
 
         def fn(captions: list[str], is_video: list[bool]):
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
-            clip = text_encoder.cond_stage_model
 
             max_length = 0
             for text in captions:
@@ -438,7 +522,7 @@ class ComfyPipeline:
                 for v in tokens.values():
                     max_length = max(max_length, len(v[0]))
 
-            # pad to max length in the batch
+            # Pad to max length in the batch. We need to do this ourselves or the ComfyUI backend code will fail (it concats tensors assumed to be the same length).
             tokenizer.min_length = max_length
             tokens_dict = defaultdict(list)
             for text in captions:
@@ -446,18 +530,10 @@ class ComfyPipeline:
                 for k, v in tokens.items():
                     tokens_dict[k].extend(v)
 
-            # We have to use some lower-level methods because the top-level methods are designed for unbatched inference and will
-            # concat the embeddings in the batch along the sequence dimension (e.g. CLIP sections for SDXL).
-            text_encoder.load_model()
-            token_weight_pairs = tokens_dict[clip.clip_name]
-            to_encode = []
-            for x in token_weight_pairs:
-                tokens = list(map(lambda a: a[0], x))
-                to_encode.append(tokens)
-            o = getattr(clip, clip.clip).encode(to_encode)
+            o = text_encoder.encode_from_tokens_scheduled(tokens_dict)
 
-            text_embeds = o[0]
-            extra = o[2]
+            text_embeds = o[0][0]
+            extra = o[0][1]
             attention_mask = extra['attention_mask']
             return {
                 f'text_embeds_{te_idx}': text_embeds,

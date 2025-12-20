@@ -348,6 +348,9 @@ if __name__ == '__main__':
     elif model_type == 'z_image':
         from models import z_image
         model = z_image.ZImagePipeline(config)
+    elif model_type == 'hunyuan_video_15':
+        from models import hunyuan_video_15
+        model = hunyuan_video_15.HunyuanVideo15Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
