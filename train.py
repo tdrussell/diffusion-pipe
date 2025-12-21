@@ -643,6 +643,9 @@ if __name__ == '__main__':
         elif optim_type_lower == 'genericoptim':
             from optimizers import generic_optim
             klass = generic_optim.GenericOptim
+        elif optim_type_lower == 'prodigyplusschedulefree':
+            from prodigyplus.prodigy_plus_schedulefree import ProdigyPlusScheduleFree
+            klass = ProdigyPlusScheduleFree
         else:
             import pytorch_optimizer
             klass = getattr(pytorch_optimizer, optim_type)
@@ -827,6 +830,8 @@ if __name__ == '__main__':
 
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
     if config['eval_before_first_step'] and not resume_from_checkpoint:
+        if optimizer.__class__.__name__ == 'ProdigyPlusScheduleFree':
+            optimizer.eval()
         evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
     # TODO: this is state we need to save and resume when resuming from checkpoint. It only affects logging.
@@ -834,12 +839,17 @@ if __name__ == '__main__':
     num_steps = 0
     empty_cuda_cache()
     while True:
+        if optimizer.__class__.__name__ == 'ProdigyPlusScheduleFree':
+            optimizer.train()
         model_engine.reset_activation_shape()
         iterator = get_data_iterator_for_step(train_dataloader, model_engine)
         loss = model_engine.train_batch(iterator).item()
         epoch_loss += loss
         num_steps += 1
         train_dataloader.sync_epoch()
+
+        if optimizer.__class__.__name__ == 'ProdigyPlusScheduleFree':
+            optimizer.eval()
 
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step, examples)
         finished_epoch = True if new_epoch != epoch else False
