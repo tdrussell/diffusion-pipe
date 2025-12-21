@@ -28,3 +28,4 @@ wandb
 optimum-quanto
 wheel
 ninja
+prodigy-plus-schedule-free
