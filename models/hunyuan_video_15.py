@@ -278,8 +278,8 @@ class InitialLayer(nn.Module):
         img_len = img.shape[1]
 
         attn_mask_len = img_len + txt.shape[1]
-        attn_mask = torch.ones((1, 1, attn_mask_len), dtype=torch.bool, device=img.device)
-        attn_mask[:, 0, img_len:] = txt_mask
+        attn_mask = torch.ones((bs, 1, 1, attn_mask_len), dtype=torch.bool, device=img.device)
+        attn_mask[:, 0, 0, img_len:] = txt_mask
 
         return make_contiguous(img, txt, vec, pe, attn_mask, initial_shape)
 
@@ -312,6 +312,7 @@ class FinalLayer(nn.Module):
         return getattr(self.model[0], name)
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    @torch.compiler.disable
     def forward(self, inputs):
         img, txt, vec, pe, attn_mask, initial_shape = inputs
         initial_shape = initial_shape.tolist()
