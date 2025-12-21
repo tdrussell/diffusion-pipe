@@ -21,6 +21,7 @@
 |HunyuanImage-2.1|✅    |✅              |✅                |
 |AuraFlow        |✅    |❌              |✅                |
 |Z-Image         |✅    |✅              |✅                |
+|HunyuanVideo-1.5|✅    |✅              |✅                |
 
 
 ## SDXL
@@ -453,3 +454,24 @@ dtype = 'bfloat16'
 All model files should be the [ComfyUI versions](https://huggingface.co/Comfy-Org/z_image_turbo). If training Z-Image-Turbo, make sure to merge the [adapter](https://huggingface.co/ostris/zimage_turbo_training_adapter). Credit to Ostris and [AI Toolkit](https://github.com/ostris/ai-toolkit) for making this adapter.
 
 Z-Image LoRAs are saved in ComfyUI format. This is different from Diffusers format.
+
+## HunyuanVideo-1.5
+```
+[model]
+type = 'hunyuan_video_15'
+diffusion_model = '/data2/imagegen_models/comfyui-models/hunyuanvideo1.5_480p_t2v_fp16.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/hunyuanvideo15_vae_fp16.safetensors'
+text_encoders = [
+    {paths = [
+        '/data/imagegen_models/comfyui-models/qwen_2.5_vl_7b.safetensors',
+        '/data/imagegen_models/comfyui-models/byt5_small_glyphxl_fp16.safetensors',
+    ], type = 'hunyuan_video_15'},
+]
+dtype = 'bfloat16'
+diffusion_model_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+# Higher shift (default is 1) might be useful for video training.
+#shift = 3
+```
+
+All model files are the ComfyUI versions. LoRAs are saved in ComfyUI format.
