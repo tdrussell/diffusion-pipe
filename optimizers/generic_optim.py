@@ -149,7 +149,8 @@ def closest_smaller_divisor_of_n_to_k(n: int, k: int) -> int:
             return int(i)
 
 
-def zeropower_via_newtonschulz5(G, steps: int):
+@torch.compile(dynamic=True, fullgraph=True)
+def zeropower_via_newtonschulz5(G):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -168,7 +169,7 @@ def zeropower_via_newtonschulz5(G, steps: int):
     # Ensure spectral norm is at most 1
     X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-7)
     # Perform the NS iterations
-    for _ in range(steps):
+    for _ in range(NS_STEPS):
         A = X @ X.mT
         B = b * A + c * A @ A # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
         X = a * X + B @ X
@@ -178,7 +179,72 @@ def zeropower_via_newtonschulz5(G, steps: int):
     return X
 
 
-zeropower_via_newtonschulz5_compile = None
+# Computed for num_iters=5, safety_factor=2e-2, cushion=2
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+]
+
+@torch.compile(dynamic=True, fullgraph=True)
+def polar_express_fn(G: torch.Tensor, split_baddbmm: bool = False):
+    """
+    Polar Express Sign Method: https://arxiv.org/pdf/2505.16932
+    by Noah Amsel, David Persson, Christopher Musco, Robert M. Gower.
+    """
+    X = G.bfloat16()
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+
+    # Ensure spectral norm is at most 1
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1 + 2e-2) + 1e-6)
+
+    # Allocate buffers
+    X = X.contiguous()
+    C = torch.empty_like(X)
+
+    # Select batched vs unbatched
+    if split_baddbmm:
+        BX_matmul = torch.bmm if X.ndim > 2 else torch.mm
+    else:
+        aX_plus_BX = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+    # Perform the iterations
+    for a, b, c in polar_express_coeffs:
+        A = X @ X.mT
+        B = b * A + c * A @ A
+
+        # Referencing X twice causes pytorch to make a defensive copy,
+        # resulting in a cudaMemcpyAsync in baddbmm.
+        # For large matrices (i.e., the mlp weights), it's faster to split
+        # the operation into two kernels to avoid this.
+        if split_baddbmm:
+            BX_matmul(B, X, out=C)  # C = B @ X
+            C.add_(X, alpha=a)      # C = C + a*X  (in-place, X only read)
+        else:
+            aX_plus_BX(X, B, X, beta=a, out=C)  # C = a * X + B @ X
+
+        X, C = C, X  # Swap references to avoid unnecessary copies
+
+    if G.size(-2) > G.size(-1):
+        X = X.mT
+    return X
+
+
+def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red_dim):
+    """NorMuon variance reduction. Algebraically fuses the normalization steps to minimize memory ops."""
+    v_mean = v_chunk.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = v_chunk.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True).mul_(red_dim_size)
+    v_norm = v_norm_sq.sqrt_()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt_()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt_()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min_(1e-10))
+    return v_chunk.mul_(final_scale.type_as(v_chunk))
 
 
 class GenericOptim(Optimizer):
@@ -244,6 +310,8 @@ class GenericOptim(Optimizer):
             cpu_offload=False,
             muon=False,
             adamuon=False,
+            normuon=False,
+            polar_express=False,
             compile=False,
             automagic=False,
             min_lr=1e-7,
@@ -262,6 +330,11 @@ class GenericOptim(Optimizer):
         self.cpu_offload = cpu_offload
         self.mpu = mpu
 
+        if polar_express:
+            self.orthogonalize = polar_express_fn
+        else:
+            self.orthogonalize = zeropower_via_newtonschulz5
+
         require_version("torch>=1.5.0")  # add_ with alpha
         if lr < 0.0:
             raise ValueError(f"Invalid learning rate: {lr} - should be >= 0.0")
@@ -271,18 +344,18 @@ class GenericOptim(Optimizer):
             raise ValueError(f"Invalid beta parameter: {betas[1]} - should be in [0.0, 1.0]")
         if not 0.0 <= eps:
             raise ValueError(f"Invalid epsilon value: {eps} - should be >= 0.0")
-        if muon and adamuon:
-            raise ValueError('Only one of muon, adamuon can be True')
+        if muon + adamuon + normuon > 1:
+            raise ValueError('Only one of muon, adamuon, normuon can be True')
 
         defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay, "correct_bias": correct_bias, 'correct_dim': correct_dim,
-                    'cpu_offload': cpu_offload, 'muon': muon, 'adamuon': adamuon, 'compile': compile, 'automagic': automagic, 'min_lr': min_lr,
-                    'max_lr': max_lr, 'lr_bump': lr_bump, 'lr_decrease_factor': lr_decrease_factor}
+                    'muon': muon, 'adamuon': adamuon, 'normuon': normuon, 'automagic': automagic, 'min_lr': min_lr, 'max_lr': max_lr, 'lr_bump': lr_bump,
+                    'lr_decrease_factor': lr_decrease_factor}
         super().__init__(params, defaults)
         self.check_params()
         # Print out all configurations
         print(f"GenericOptim Configuration: lr={lr}, betas={betas}, eps={eps}, weight_decay={weight_decay}, "
               f"correct_bias={correct_bias}, momentum_type={momentum_type}, second_moment_type={second_moment_type}, correct_dim={correct_dim}, "
-              f"cpu_offload={cpu_offload}, muon={muon}, adamuon={adamuon}, compile={compile}, automagic={automagic}, min_lr={min_lr}, "
+              f"cpu_offload={cpu_offload}, muon={muon}, adamuon={adamuon}, normuon={normuon}, compile={compile}, automagic={automagic}, min_lr={min_lr}, "
               f"max_lr={max_lr}, lr_bump={lr_bump}, lr_decrease_factor={lr_decrease_factor}")
 
     @torch.no_grad()
@@ -320,7 +393,7 @@ class GenericOptim(Optimizer):
                 if "step" not in state:
                     state["step"] = 0
                 state["step"] += 1
-                cpu_offload = group['cpu_offload'] if p.ndim >= 2 else False
+                cpu_offload = self.cpu_offload if p.ndim >= 2 else False
                 state_device = 'cpu' if cpu_offload else p.device
 
                 # learning rate
@@ -336,19 +409,13 @@ class GenericOptim(Optimizer):
                 can_use_muon = numerator.ndim > 1
                 muon = group['muon'] and can_use_muon
                 adamuon = group['adamuon'] and can_use_muon
+                normuon = group.get('normuon', False) and can_use_muon
 
-                if muon or adamuon:
+                if muon or adamuon or normuon:
                     rows, cols = numerator.shape[-2:]
                     if numerator.ndim == 4: # for the case of conv filters
                         numerator = numerator.view(len(numerator), -1)
-                    if group['compile']:
-                        global zeropower_via_newtonschulz5_compile
-                        if zeropower_via_newtonschulz5_compile is None:
-                            zeropower_via_newtonschulz5_compile = torch.compile(zeropower_via_newtonschulz5)
-                        orthogonalize = zeropower_via_newtonschulz5_compile
-                    else:
-                        orthogonalize = zeropower_via_newtonschulz5
-                    numerator = orthogonalize(numerator, steps=NS_STEPS)
+                    numerator = self.orthogonalize(numerator)
                     step_size *= 0.2
 
                 if muon:
@@ -362,6 +429,16 @@ class GenericOptim(Optimizer):
                         bias_correction2 = 1.0 - beta2 ** state["step"]
                         numerator.mul_(math.sqrt(bias_correction2))
                     step_size /= math.sqrt(torch.mean(numerator**2).item()) + group['eps']
+                    denominator = None
+                elif normuon:
+                    red_dim = -1 if numerator.shape[-2] >= numerator.shape[-1] else -2
+                    if 'second_momentum_buffer' not in state:
+                        state['second_momentum_buffer'] = torch.zeros_like(numerator[..., :, :1]) if red_dim == -1 else torch.zeros_like(numerator[..., :1, :])
+                    second_momentum_buffer = state['second_momentum_buffer'].to(numerator.device, non_blocking=True)
+                    numerator = apply_normuon_variance_reduction(numerator, second_momentum_buffer, group['betas'][1], red_dim)
+                    state['second_momentum_buffer'] = second_momentum_buffer.to(state_device)
+                    # same scaling as Muon
+                    step_size *= math.sqrt(max(rows, cols))
                     denominator = None
                 else:
                     denominator = self.get_denominator(group, state, p.grad, state_device)
@@ -563,7 +640,7 @@ class GenericOptim(Optimizer):
                 # TODO: this kind of works but is suboptimal. It is still initially loading all state
                 # on GPU. This uses more VRAM than necessary, but it isn't too bad because it happens
                 # before any training steps.
-                cpu_offload = group['cpu_offload'] if p.ndim >= 2 else False
+                cpu_offload = self.cpu_offload if p.ndim >= 2 else False
                 for k, v in state.items():
                     if torch.is_tensor(v) and cpu_offload:
                         state[k] = v.to('cpu')
