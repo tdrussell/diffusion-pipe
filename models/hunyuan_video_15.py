@@ -274,6 +274,7 @@ class InitialLayer(nn.Module):
 
         ids = torch.cat((img_ids, txt_ids), dim=1)
         pe = self.pe_embedder(ids)
+        pe.requires_grad_(True)
 
         img_len = img.shape[1]
 
