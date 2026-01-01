@@ -154,6 +154,7 @@ class InitialLayer(nn.Module):
         img_size = torch.tensor(img_size).to(x.device)
         cap_size = torch.tensor(cap_size).to(x.device)
         freqs_cis = freqs_cis.to(x.device)
+        freqs_cis.requires_grad_(True)
         return make_contiguous(x, mask, freqs_cis, adaln_input, img_size, cap_size)
 
     def patchify_and_embed(
