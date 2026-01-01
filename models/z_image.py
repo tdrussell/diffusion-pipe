@@ -244,6 +244,7 @@ class FinalLayer(nn.Module):
         return getattr(self.model[0], name)
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    @torch.compiler.disable
     def forward(self, inputs):
         x, mask, freqs_cis, adaln_input, img_size, cap_size = inputs
         img_size = [(row[0].item(), row[1].item()) for row in img_size]
