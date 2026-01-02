@@ -1,4 +1,4 @@
-deepspeed==0.17.0
+deepspeed==0.18.2
 toml
 transformers
 diffusers>=0.35.1

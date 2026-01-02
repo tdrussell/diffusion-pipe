@@ -268,6 +268,7 @@ def _get_automagic_lrs(optimizer):
 
 
 if __name__ == '__main__':
+    deepspeed.utils.set_log_level_from_string('info')
     apply_patches()
 
     with open(args.config) as f:
