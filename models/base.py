@@ -418,6 +418,7 @@ class ComfyPipeline:
         self.diffusion_model.train()
         for name, p in self.diffusion_model.named_parameters():
             p.original_name = name
+            p.requires_grad_(True)
 
     def get_vae(self):
         return self.vae
