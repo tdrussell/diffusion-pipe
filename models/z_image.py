@@ -16,7 +16,7 @@ import comfy.ldm.common_dit
 
 class ZImagePipeline(ComfyPipeline):
     name = 'z_image'
-    checkpointable_layers = ['TransformerLayer']
+    checkpointable_layers = ['InitialLayer', 'TransformerLayer']
     # This will also train the noise_refiner and context_refiner layers, which aren't part of the main stack of transformer
     # layers, since they also use this class.
     adapter_target_modules = ['JointTransformerBlock']
@@ -54,6 +54,7 @@ class ZImagePipeline(ComfyPipeline):
         attention_mask = attention_mask.to(torch.bool)
 
         bs, c, h, w = latents.shape
+        device = latents.device
 
         if mask is not None:
             mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
@@ -69,9 +70,9 @@ class ZImagePipeline(ComfyPipeline):
             raise NotImplementedError()
 
         if timestep_quantile is not None:
-            t = dist.icdf(torch.full((bs,), timestep_quantile, device=latents.device))
+            t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
         else:
-            t = dist.sample((bs,)).to(latents.device)
+            t = dist.sample((bs,)).to(device)
 
         if timestep_sample_method == 'logit_normal':
             sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
@@ -138,11 +139,9 @@ class InitialLayer(nn.Module):
         for item in inputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
-        x, timesteps, context, attention_mask = inputs
+        x, timesteps, cap_feats, cap_mask = inputs
 
         t = 1.0 - timesteps
-        cap_feats = context
-        cap_mask = attention_mask
         x = comfy.ldm.common_dit.pad_to_patch_size(x, (self.patch_size, self.patch_size))
 
         t = self.t_embedder(t * self.time_scale, dtype=x.dtype)  # (N, D)
@@ -153,7 +152,8 @@ class InitialLayer(nn.Module):
         x, mask, img_size, cap_size, freqs_cis = self.patchify_and_embed(x, cap_feats, cap_mask, t)
         img_size = torch.tensor(img_size).to(x.device)
         cap_size = torch.tensor(cap_size).to(x.device)
-        freqs_cis = freqs_cis.to(x.device)
+        # freqs_cis must be same dtype as x, or training hangs but only when pipeline_stages>=3. (???)
+        freqs_cis = freqs_cis.to(x.device, x.dtype)
         freqs_cis.requires_grad_(True)
         return make_contiguous(x, mask, freqs_cis, adaln_input, img_size, cap_size)
 
@@ -164,21 +164,24 @@ class InitialLayer(nn.Module):
         pH = pW = self.patch_size
         device = x.device
 
-        if self.pad_tokens_multiple is not None:
-            cap_feats_list = []
-            for cap_feats_single, cap_mask_single in zip(cap_feats, cap_mask):
-                cap_feats_single = cap_feats_single[cap_mask_single]
-                pad_extra = (-cap_feats_single.shape[0]) % self.pad_tokens_multiple
-                cap_feats_single = torch.cat((cap_feats_single, self.cap_pad_token.to(device=device, dtype=cap_feats.dtype, copy=True).repeat(pad_extra, 1)), dim=0)
-                cap_feats_list.append(cap_feats_single)
+        # The dynamic padding breaks pipeline parallelism because tensor shapes are different between micro batches. So just
+        # disable it. It has no measureable effect on validation loss so I think this is okay to do.
 
-            cap_item_seqlens = [len(_) for _ in cap_feats_list]
-            assert all(_ % self.pad_tokens_multiple == 0 for _ in cap_item_seqlens)
-            cap_max_item_seqlen = max(cap_item_seqlens)
-            cap_feats = pad_sequence(cap_feats_list, batch_first=True, padding_value=0.0)
-            cap_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
-            for i, seq_len in enumerate(cap_item_seqlens):
-                cap_mask[i, :seq_len] = 1
+        # if self.pad_tokens_multiple is not None:
+        #     cap_feats_list = []
+        #     for cap_feats_single, cap_mask_single in zip(cap_feats, cap_mask):
+        #         cap_feats_single = cap_feats_single[cap_mask_single]
+        #         pad_extra = (-cap_feats_single.shape[0]) % self.pad_tokens_multiple
+        #         cap_feats_single = torch.cat((cap_feats_single, self.cap_pad_token.to(device=device, dtype=cap_feats.dtype, copy=True).repeat(pad_extra, 1)), dim=0)
+        #         cap_feats_list.append(cap_feats_single)
+
+        #     cap_item_seqlens = [len(_) for _ in cap_feats_list]
+        #     assert all(_ % self.pad_tokens_multiple == 0 for _ in cap_item_seqlens)
+        #     cap_max_item_seqlen = max(cap_item_seqlens)
+        #     cap_feats = pad_sequence(cap_feats_list, batch_first=True, padding_value=0.0)
+        #     cap_mask = torch.zeros((bsz, cap_max_item_seqlen), dtype=torch.bool, device=device)
+        #     for i, seq_len in enumerate(cap_item_seqlens):
+        #         cap_mask[i, :seq_len] = 1
 
         cap_mask = cap_mask.view(bsz, 1, 1, -1)  # for PyTorch SDPA
 
