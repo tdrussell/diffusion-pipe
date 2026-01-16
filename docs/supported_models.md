@@ -526,6 +526,7 @@ shift = 3
 
 Notes:
 - Use ComfyUI-compatible weights for all models.
+- For Klein, **use the base model**. Klein is step-distilled, and so the distilled version will not work well.
 - Only T2I training is supported. Edit datasets will not work currently.
 - Without block swapping, Dev needs at least 48GB VRAM for LoRA training and probably a lot of system RAM also.
 - The Flux2 VAE has more channels, so a timestep shift value above 1 is useful. I don't know the best value but 3 seems to work well.
