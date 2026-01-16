@@ -346,6 +346,22 @@ def encode_token_weights(self, token_weight_pairs):
 comfy.sd1_clip.ClipTokenWeightEncoder.encode_token_weights = encode_token_weights
 
 
+class ModelWrapper:
+    '''Simple wrapper that delays loading the model, since the model isn't needed if the training data is already cached.'''
+    def __init__(self, load_fn):
+        self._load_fn = load_fn
+        self._model = None
+
+    def __getattr__(self, name):
+        if self._model is None:
+            raise RuntimeError("Model wasn't loaded, this shouldn't ever happen.")
+        return getattr(self._model, name)
+
+    def load_model_if_needed(self):
+        if self._model is None:
+            self._model = self._load_fn()
+
+
 class ComfyPipeline:
     framerate = None
     pixels_round_to_multiple = 16
@@ -356,26 +372,30 @@ class ComfyPipeline:
         self.model_config = self.config['model']
 
         # VAE
-        sd = comfy.utils.load_torch_file(self.model_config['vae'])
-        self.vae = comfy.sd.VAE(sd=sd)
-        self.vae.throw_exception_if_invalid()
+        def load_fn():
+            sd = comfy.utils.load_torch_file(self.model_config['vae'])
+            vae = comfy.sd.VAE(sd=sd)
+            vae.throw_exception_if_invalid()
 
-        def vae_encode_crop_pixels(self, pixels):
-            if not self.crop_input:
+            def vae_encode_crop_pixels(self, pixels):
+                if not self.crop_input:
+                    return pixels
+
+                downscale_ratio = self.spacial_compression_encode()
+
+                dims = pixels.shape[-3:-1]
+                for d in range(len(dims)):
+                    x = (dims[d] // downscale_ratio) * downscale_ratio
+                    x_offset = (dims[d] % downscale_ratio) // 2
+                    if x != dims[d]:
+                        pixels = pixels.narrow(d + 1, x_offset, x)
                 return pixels
 
-            downscale_ratio = self.spacial_compression_encode()
+            # patch this to handle 5D video tensor (original code expects 4D even for video)
+            vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, self.vae)
+            return vae
 
-            dims = pixels.shape[-3:-1]
-            for d in range(len(dims)):
-                x = (dims[d] // downscale_ratio) * downscale_ratio
-                x_offset = (dims[d] % downscale_ratio) // 2
-                if x != dims[d]:
-                    pixels = pixels.narrow(d + 1, x_offset, x)
-            return pixels
-
-        # patch this to handle 5D video tensor (original code expects 4D even for video)
-        self.vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, self.vae)
+        self.vae = ModelWrapper(load_fn)
 
         # Text encoders
         self.text_encoders = []
@@ -389,8 +409,11 @@ class ComfyPipeline:
             if isinstance(paths, str):
                 paths = [paths]
             clip_type = getattr(comfy.sd.CLIPType, te_config['type'].upper(), comfy.sd.CLIPType.STABLE_DIFFUSION)
-            clip = comfy.sd.load_clip(ckpt_paths=paths, clip_type=clip_type)
-            self.text_encoders.append(clip)
+
+            def load_fn():
+                return comfy.sd.load_clip(ckpt_paths=paths, clip_type=clip_type)
+
+            self.text_encoders.append(ModelWrapper(load_fn))
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
@@ -493,6 +516,7 @@ class ComfyPipeline:
         return PreprocessMediaFile(self.config, support_video=False)
 
     def get_call_vae_fn(self, vae):
+        @torch.inference_mode()
         def fn(images):
             images = images.to('cuda')
             # move channel dim to end
@@ -513,6 +537,7 @@ class ComfyPipeline:
         if te_idx is None:
             raise RuntimeError('Unknown text encoder')
 
+        @torch.inference_mode()
         def fn(captions: list[str], is_video: list[bool]):
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
 

@@ -27,7 +27,7 @@ from . import reduction
 import hyvideo.text_encoder
 from hyvideo.constants import PRECISION_TO_TYPE, TEXT_ENCODER_PATH
 
-from comfy.ldm.flux.layers import DoubleStreamBlock, apply_mod
+from comfy.ldm.flux.layers import DoubleStreamBlock, SingleStreamBlock, apply_mod
 from comfy.ldm.flux.math import attention
 
 
@@ -362,6 +362,33 @@ def double_stream_forward(self, img: Tensor, txt: Tensor, vec: Tensor, pe: Tenso
     return img, txt
 
 
+def single_stream_forward(self, x: Tensor, vec: Tensor, pe: Tensor, attn_mask=None, modulation_dims=None, transformer_options={}) -> Tensor:
+    if self.modulation:
+        mod, _ = self.modulation(vec)
+    else:
+        mod = vec
+
+    qkv, mlp = torch.split(self.linear1(apply_mod(self.pre_norm(x), (1 + mod.scale), mod.shift, modulation_dims)), [3 * self.hidden_size, self.mlp_hidden_dim_first], dim=-1)
+
+    q, k, v = qkv.view(qkv.shape[0], qkv.shape[1], 3, self.num_heads, -1).permute(2, 0, 3, 1, 4)
+    del qkv
+    q, k = self.norm(q, k, v)
+
+    # compute attention
+    attn = attention(q, k, v, pe=pe, mask=attn_mask, transformer_options=transformer_options)
+    del q, k, v
+    # compute activation in mlp stream, cat again and run second linear layer
+    if self.yak_mlp:
+        mlp = self.mlp_act(mlp[..., self.mlp_hidden_dim_first // 2:]) * mlp[..., :self.mlp_hidden_dim_first // 2]
+    else:
+        mlp = self.mlp_act(mlp)
+    output = self.linear2(torch.cat((attn, mlp), 2))
+    x = x + apply_mod(output, mod.gate, None, modulation_dims)
+    if x.dtype == torch.float16:
+        x = torch.nan_to_num(x, nan=0.0, posinf=65504, neginf=-65504)
+    return x
+
+
 def apply_patches():
     # Prevent PEFT from downcasting LoRA weights to fp8 only for this script to upcast them again.
     # TODO: probably should send a PR to PEFT. Default behavior looks like a mistake to me.
@@ -393,3 +420,4 @@ def apply_patches():
 
     # Fix training issues caused by in-place tensor modification and backward pass (+= operations).
     DoubleStreamBlock.forward = double_stream_forward
+    SingleStreamBlock.forward = single_stream_forward

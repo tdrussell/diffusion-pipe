@@ -1183,9 +1183,8 @@ class DatasetManager:
                         submodel.to('cpu')
                 self.submodels[id].to('cuda')
         else:
-            # ComfyUI model
-            # TODO: do anything here?
-            pass
+            # ComfyUI model in a wrapper class that delays loading until the model is needed.
+            self.submodels[id].load_model_if_needed()
         if id == 0:
             tensor, control_tensor, pipe = task[1:]
             if control_tensor is not None:

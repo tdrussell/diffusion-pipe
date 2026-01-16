@@ -354,6 +354,9 @@ if __name__ == '__main__':
     elif model_type == 'hunyuan_video_15':
         from models import hunyuan_video_15
         model = hunyuan_video_15.HunyuanVideo15Pipeline(config)
+    elif model_type == 'flux2':
+        from models import flux2
+        model = flux2.Flux2Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 

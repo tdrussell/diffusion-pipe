@@ -3,6 +3,7 @@ import gc
 import time
 import math
 from pathlib import Path
+import os
 
 import torch
 import deepspeed.comm.comm as dist
@@ -39,6 +40,14 @@ def zero_first():
         dist.barrier()
     yield
     if is_main_process():
+        dist.barrier()
+
+
+@contextmanager
+def one_at_a_time():
+    for i in range(int(os.environ['LOCAL_SIZE'])):
+        if i == int(os.environ['LOCAL_RANK']):
+            yield
         dist.barrier()
 
 
