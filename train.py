@@ -1,6 +1,9 @@
 import argparse
 import os
 import wandb
+# Disable comfy_kitchen during training to avoid autograd errors
+import sys
+sys.modules["comfy_kitchen"] = None
 from datetime import datetime, timezone
 import shutil
 import glob
