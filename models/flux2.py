@@ -263,15 +263,14 @@ class InitialLayer(nn.Module):
         device = x.device
 
         img, img_ids = self.process_img(x)
-        img_len_orig = img.shape[1]  # Original image sequence length
 
         # Process control latents if present
         if has_control:
             control_latents = extra[0]
-            control_img, control_img_ids = self.process_img(control_latents)
+            control_img, control_img_ids = self.process_img(control_latents, index=self.params.ref_index_scale)
             control_img_len = control_img.shape[1]
-            assert control_img_len == img_len_orig, (
-                f"Control image sequence length {control_img_len} doesn't match noisy image {img_len_orig}"
+            assert control_img_len == img.shape[1], (
+                f"Control image sequence length {control_img_len} doesn't match noisy image {img.shape[1]}"
             )
 
         img_len = torch.tensor(img.shape[1], dtype=torch.int64, device=device)
@@ -325,10 +324,7 @@ class InitialLayer(nn.Module):
 
         attn_mask = torch.cat((txt_mask, torch.ones((bs, 1, 1, img.shape[1]), dtype=torch.bool, device=device)), dim=-1)
 
-        # Pass original image length to subsequent layers so FinalLayer can extract correct portion
-        extra_outputs = (torch.tensor(img_len_orig, dtype=torch.int64, device=device),) if has_control else ()
-
-        return make_contiguous(img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec) + extra_outputs
+        return make_contiguous(img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
 
 
 class DoubleTransformerLayer(nn.Module):
@@ -340,15 +336,7 @@ class DoubleTransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        # Handle optional extra outputs (e.g., img_len_orig for control)
-        if torch.is_tensor(inputs[-1]) and inputs[-1].numel() == 1 and inputs[-1].dtype == torch.int64:
-            # Last element is img_len_orig
-            *main_inputs, extra_output = inputs
-            img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = main_inputs
-            has_extra = True
-        else:
-            img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
-            has_extra = False
+        img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
 
         if len(vec) == 1:
             tmp_vec = vec[0]
@@ -363,10 +351,7 @@ class DoubleTransformerLayer(nn.Module):
         img, txt = self.layer(img=img, txt=txt, vec=tmp_vec, pe=pe, attn_mask=attn_mask)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        result = make_contiguous(img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
-        if has_extra:
-            result = result + (extra_output,)
-        return result
+        return make_contiguous(img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
 
 
 class ConcatenateTxtImg(nn.Module):
@@ -379,25 +364,14 @@ class ConcatenateTxtImg(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        # Handle optional extra outputs (e.g., img_len_orig for control)
-        if torch.is_tensor(inputs[-1]) and inputs[-1].numel() == 1 and inputs[-1].dtype == torch.int64:
-            # Last element is img_len_orig
-            *main_inputs, extra_output = inputs
-            img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = main_inputs
-            has_extra = True
-        else:
-            img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
-            has_extra = False
+        img, txt, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
 
         img = torch.cat((txt, img), 1)
         if self.single_stream_modulation is not None:
             mod_out, _ = self.single_stream_modulation(vec_orig)
             vec = [mod_out.shift, mod_out.scale, mod_out.gate]
 
-        result = make_contiguous(img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
-        if has_extra:
-            result = result + (extra_output,)
-        return result
+        return make_contiguous(img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
 
 
 class SingleTransformerLayer(nn.Module):
@@ -409,15 +383,7 @@ class SingleTransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        # Handle optional extra outputs (e.g., img_len_orig for control)
-        if torch.is_tensor(inputs[-1]) and inputs[-1].numel() == 1 and inputs[-1].dtype == torch.int64:
-            # Last element is img_len_orig
-            *main_inputs, extra_output = inputs
-            img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = main_inputs
-            has_extra = True
-        else:
-            img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
-            has_extra = False
+        img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
 
         if len(vec) == 1:
             tmp_vec = vec[0]
@@ -429,10 +395,7 @@ class SingleTransformerLayer(nn.Module):
         img = self.layer(img, vec=tmp_vec, pe=pe, attn_mask=attn_mask)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        result = make_contiguous(img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
-        if has_extra:
-            result = result + (extra_output,)
-        return result
+        return make_contiguous(img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec)
 
 
 class FinalLayer(nn.Module):
@@ -446,26 +409,15 @@ class FinalLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        # Handle optional extra outputs (e.g., img_len_orig for control)
-        if torch.is_tensor(inputs[-1]) and inputs[-1].numel() == 1 and inputs[-1].dtype == torch.int64:
-            # Last element is img_len_orig - control image present
-            *main_inputs, img_len_orig = inputs
-            img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = main_inputs
-            has_control = True
-        else:
-            img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
-            has_control = False
+        img, pe, attn_mask, txt_len, img_len, hw, vec_orig, *vec = inputs
 
         # Extract image portion (after text)
         img = img[:, txt_len.item():, ...]
-
-        if has_control:
-            # Only process the noisy image portion, exclude control image
-            # Control image was concatenated after noisy image in InitialLayer
-            img = img[:, :img_len_orig.item(), ...]
+        # Only process the noisy image portion (control image was concatenated after if present)
+        img = img[:, :img_len.item(), ...]
 
         out = self.final_layer(img, vec_orig)
-        out = out[:, :img_len.item() if not has_control else img_len_orig.item()]
+        out = out[:, :img_len.item()]
         h_orig = hw[0].item()
         w_orig = hw[1].item()
         patch_size = self.patch_size
