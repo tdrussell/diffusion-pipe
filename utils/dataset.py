@@ -711,16 +711,7 @@ class DirectoryDataset:
                 captions = example['caption'][0]
             if captions is None and caption_file:
                 with open(caption_file) as f:
-                    content = f.read().strip()
-                    # Support multi-line caption files: each line is a separate caption
-                    # This allows random caption selection during training
-                    lines = [line.strip() for line in content.split('\n') if line.strip()]
-                    if len(lines) > 1:
-                        # Multi-line file: treat each line as a separate caption
-                        captions = lines
-                    else:
-                        # Single line or single caption
-                        captions = [content]
+                    content = [f.read().strip()]
             if captions is None:
                 captions = ['']
                 logger.warning(f'Cound not find caption for {image_file}. Using empty caption.')

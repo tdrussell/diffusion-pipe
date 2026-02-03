@@ -3,7 +3,6 @@
 # Uses Qwen Image VAE (same architecture/normalization as Wan VAE)
 
 import math
-import random
 
 import torch
 from torch import nn
@@ -22,38 +21,6 @@ from utils.offloading import ModelOffloader
 
 
 KEEP_IN_HIGH_PRECISION = ['x_embedder', 't_embedder', 't_embedding_norm', 'final_layer', 'llm_adapter']
-
-
-def _shuffle_tags(caption, delimiter=', ', keep_first_n=0):
-    """
-    Shuffle tags in a caption string at training time.
-
-    Args:
-        caption: Caption string with tags separated by delimiter
-        delimiter: Tag separator (default ", " for danbooru-style tags)
-        keep_first_n: Keep the first N tags in place, shuffle the rest
-                     (useful for keeping trigger words at the start)
-
-    Returns:
-        Caption with tags shuffled
-    """
-    if not caption or delimiter not in caption:
-        return caption
-
-    tags = caption.split(delimiter)
-    if len(tags) <= 1:
-        return caption
-
-    # Keep first N tags in place, shuffle the rest
-    if keep_first_n > 0 and keep_first_n < len(tags):
-        prefix = tags[:keep_first_n]
-        suffix = tags[keep_first_n:]
-        random.shuffle(suffix)
-        tags = prefix + suffix
-    else:
-        random.shuffle(tags)
-
-    return delimiter.join(tags)
 
 
 def _tokenize_t5(tokenizer, prompts):
@@ -130,14 +97,6 @@ class AnimaPipeline(BasePipeline):
 
         # Load transformer directly to CUDA (faster init, single GPU only)
         self.load_to_cuda = self.model_config.get('load_to_cuda', False)
-
-        # Training-time tag shuffling (only works when cache_text_embeddings=false)
-        self.shuffle_tags = self.model_config.get('shuffle_tags', False)
-        self.tag_delimiter = self.model_config.get('tag_delimiter', ', ')
-        self.keep_first_n_tags = self.model_config.get('keep_first_n_tags', 0)
-        if self.shuffle_tags and self.cache_text_embeddings:
-            print("WARNING: shuffle_tags requires cache_text_embeddings=false to work at training time. "
-                  "With cache_text_embeddings=true, use cache_shuffle_num in your dataset config instead.")
 
         # VAE - Qwen Image VAE (16 channel, same architecture/normalization as Wan VAE)
         self.vae = WanVAE(
@@ -340,14 +299,6 @@ class AnimaPipeline(BasePipeline):
         else:
             # Compute on-the-fly
             captions = inputs['caption']
-
-            # Apply training-time tag shuffling if enabled
-            if self.shuffle_tags:
-                if isinstance(captions, list):
-                    captions = [_shuffle_tags(c, self.tag_delimiter, self.keep_first_n_tags) for c in captions]
-                else:
-                    captions = _shuffle_tags(captions, self.tag_delimiter, self.keep_first_n_tags)
-
             qwen_encoding = _tokenize_qwen(self.qwen_tokenizer, captions)
             qwen_inputs = (qwen_encoding.input_ids, qwen_encoding.attention_mask)
             t5_encoding = _tokenize_t5(self.t5_tokenizer, captions)
