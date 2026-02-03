@@ -711,7 +711,7 @@ class DirectoryDataset:
                 captions = example['caption'][0]
             if captions is None and caption_file:
                 with open(caption_file) as f:
-                    content = [f.read().strip()]
+                    captions = [f.read().strip()]
             if captions is None:
                 captions = ['']
                 logger.warning(f'Cound not find caption for {image_file}. Using empty caption.')
