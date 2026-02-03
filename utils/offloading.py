@@ -40,7 +40,7 @@ def synchronize_device(device: torch.device):
         torch.mps.synchronize()
 
 
-def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
+def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module, skip_lora: bool = True):
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     weight_swap_jobs = []
@@ -53,7 +53,9 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
 
     modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
     for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
-        if 'lora' in module_to_cuda_name:
+        # Skip LoRA modules when training LoRA (they need to stay on GPU for optimizer)
+        # For full-finetune, skip_lora should be False
+        if skip_lora and 'lora' in module_to_cuda_name:
             continue
         if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
             module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
@@ -86,34 +88,43 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
 
-def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
+def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module, skip_lora: bool = True):
     """
     not tested
     """
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     weight_swap_jobs = []
-    for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
-        if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
-            weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
+    modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
+    for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
+        # Skip LoRA modules when training LoRA (they need to stay on GPU for optimizer)
+        # For full-finetune, skip_lora should be False
+        if skip_lora and 'lora' in module_to_cuda_name:
+            continue
+        if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
+            module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
+            if module_to_cpu is not None and module_to_cpu.weight.shape == module_to_cuda.weight.shape:
+                weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
 
     # device to cpu
     for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
         module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
 
-    synchronize_device()
+    synchronize_device(device)
 
     # cpu to device
     for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
         cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
         module_to_cuda.weight.data = cuda_data_view
 
-    synchronize_device()
+    synchronize_device(device)
 
 
-def weights_to_device(layer: nn.Module, device: torch.device):
+def weights_to_device(layer: nn.Module, device: torch.device, skip_lora: bool = True):
     for name, module in layer.named_modules():
-        if device.type == 'cpu' and 'lora' in name:
+        # Skip LoRA modules when moving to CPU (they need to stay on GPU for optimizer)
+        # For full-finetune, skip_lora should be False
+        if skip_lora and device.type == 'cpu' and 'lora' in name:
             continue
         if hasattr(module, "weight") and module.weight is not None:
             module.weight.data = module.weight.data.to(device, non_blocking=True)
@@ -124,7 +135,7 @@ class Offloader:
     common offloading class
     """
 
-    def __init__(self, block_type: str, blocks: list[nn.Module], num_blocks: int, blocks_to_swap: int, device: torch.device, debug: bool = False):
+    def __init__(self, block_type: str, blocks: list[nn.Module], num_blocks: int, blocks_to_swap: int, device: torch.device, debug: bool = False, skip_lora: bool = True):
         self.block_type = block_type
         self.blocks = blocks
         self.num_blocks = num_blocks
@@ -132,6 +143,9 @@ class Offloader:
         self.blocks_to_swap_tmp = None
         self.device = device
         self.debug = debug
+        # skip_lora=True for LoRA training (keep LoRA weights on GPU)
+        # skip_lora=False for full-finetune (swap all weights)
+        self.skip_lora = skip_lora
 
         self.thread_pool = ThreadPoolExecutor(max_workers=1)
         self.futures = {}
@@ -139,9 +153,9 @@ class Offloader:
 
     def swap_weight_devices(self, block_to_cpu: nn.Module, block_to_cuda: nn.Module):
         if self.cuda_available:
-            swap_weight_devices_cuda(self.device, block_to_cpu, block_to_cuda)
+            swap_weight_devices_cuda(self.device, block_to_cpu, block_to_cuda, skip_lora=self.skip_lora)
         else:
-            swap_weight_devices_no_cuda(self.device, block_to_cpu, block_to_cuda)
+            swap_weight_devices_no_cuda(self.device, block_to_cpu, block_to_cuda, skip_lora=self.skip_lora)
 
     def _submit_move_blocks(self, block_idx_to_cpu, block_idx_to_cuda):
         def move_blocks(bidx_to_cpu, block_to_cpu, bidx_to_cuda, block_to_cuda):
@@ -196,8 +210,9 @@ class ModelOffloader(Offloader):
         device: torch.device,
         reentrant_activation_checkpointing: bool,
         debug: bool = False,
+        skip_lora: bool = True,
     ):
-        super().__init__(block_type, blocks, num_blocks, blocks_to_swap, device, debug)
+        super().__init__(block_type, blocks, num_blocks, blocks_to_swap, device, debug, skip_lora=skip_lora)
 
         self.supports_backward = supports_backward
         self.forward_only = not supports_backward  # forward only offloading: can be changed to True for inference
@@ -265,11 +280,11 @@ class ModelOffloader(Offloader):
 
         for b in self.blocks[0 : self.num_blocks - self.blocks_to_swap]:
             b.to(self.device)
-            weights_to_device(b, self.device)  # make sure weights are on device
+            weights_to_device(b, self.device, skip_lora=self.skip_lora)  # make sure weights are on device
 
         for b in self.blocks[self.num_blocks - self.blocks_to_swap :]:
             b.to(self.device)  # move block to device first
-            weights_to_device(b, torch.device('cpu'))  # make sure weights are on cpu
+            weights_to_device(b, torch.device('cpu'), skip_lora=self.skip_lora)  # make sure weights are on cpu
 
         synchronize_device(self.device)
         clean_memory_on_device(self.device)

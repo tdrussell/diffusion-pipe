@@ -339,6 +339,9 @@ if __name__ == '__main__':
     elif model_type == 'cosmos_predict2':
         from models import cosmos_predict2
         model = cosmos_predict2.CosmosPredict2Pipeline(config)
+    elif model_type == 'anima':
+        from models import anima
+        model = anima.AnimaPipeline(config)
     elif model_type == 'omnigen2':
         from models import omnigen2
         model = omnigen2.OmniGen2Pipeline(config)
@@ -543,10 +546,10 @@ if __name__ == '__main__':
             dir=logging_dir
         )
 
-    # Block swapping
+    # Block swapping (supports both LoRA and full-finetune)
     if blocks_to_swap := config.get('blocks_to_swap', 0):
         assert config['pipeline_stages'] == 1, 'Block swapping only works with pipeline_stages=1'
-        assert 'adapter' in config, 'Block swapping only works when training LoRA'
+        # Block swapping now supports both LoRA and full-finetune
         # Don't automatically move to GPU, we'll do that ourselves.
         def to(self, *args, **kwargs):
             pass

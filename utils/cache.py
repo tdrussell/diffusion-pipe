@@ -37,7 +37,9 @@ class Cache:
     def init(self):
         print('[CACHE] Initializing')
         # create database
-        self.con = sqlite3.connect(self.metadata_db, autocommit=False)
+        # Note: autocommit=False is Python 3.12+, use isolation_level for 3.11 compatibility
+        # Default isolation_level="" means transactions are used (equivalent to autocommit=False)
+        self.con = sqlite3.connect(self.metadata_db)
 
         # check fingerprint, clear cache if different
         self.con.execute('CREATE TABLE IF NOT EXISTS fingerprint(value)')

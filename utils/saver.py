@@ -54,6 +54,9 @@ class Saver:
         self.train_dataloader = train_dataloader
         self.model_engine = model_engine
         self.pipeline_model = pipeline_model
+        # Maximum number of checkpoints to keep (0 = unlimited)
+        self.max_checkpoints = config.get('max_checkpoints', 0)
+        self.checkpoint_history = []  # Track checkpoint directories for cleanup
 
     def save_adapter(self, name):
         dp_id = self.model_engine.grid.get_data_parallel_rank()
@@ -114,6 +117,9 @@ class Saver:
             self.save_adapter(name)
         else:
             self.save_full_model(name)
+        # Cleanup old saves if max_checkpoints is set
+        if self.max_checkpoints > 0 and is_main_process():
+            self._cleanup_old_checkpoints()
 
     def save_checkpoint(self, step, examples):
         self.model_engine.save_checkpoint(
@@ -126,6 +132,9 @@ class Saver:
             save_latest=True,
             exclude_frozen_parameters=True
         )
+        # Track and cleanup old checkpoints if max_checkpoints is set
+        if self.max_checkpoints > 0 and is_main_process():
+            self._cleanup_old_checkpoints()
 
     def process_epoch(self, epoch, step, examples):
         checkpointed, saved = False, False
@@ -175,3 +184,64 @@ class Saver:
             sys.exit()
 
         return checkpointed, saved
+
+    def _cleanup_old_checkpoints(self):
+        """Remove old checkpoints if we exceed max_checkpoints limit.
+
+        This handles both:
+        - global_step* directories (DeepSpeed checkpoints for resume)
+        - epoch* directories (saved model weights)
+        - step* directories (if save_every_n_steps is used)
+        """
+        if self.max_checkpoints <= 0:
+            return
+
+        import re
+
+        def extract_number(name, prefix):
+            """Extract number from directory name like 'epoch5' -> 5, 'global_step1000' -> 1000"""
+            match = re.search(rf'{prefix}(\d+)', name)
+            return int(match.group(1)) if match else 0
+
+        # Find all checkpoint directories (DeepSpeed uses global_step* pattern)
+        checkpoint_dirs = sorted(
+            [d for d in self.save_root.iterdir() if d.is_dir() and d.name.startswith('global_step')],
+            key=lambda x: extract_number(x.name, 'global_step')  # Sort by step number
+        )
+
+        # Remove oldest checkpoints if we exceed the limit
+        while len(checkpoint_dirs) > self.max_checkpoints:
+            oldest = checkpoint_dirs.pop(0)
+            try:
+                shutil.rmtree(oldest)
+                logger.info(f'Removed old checkpoint: {oldest}')
+            except Exception as e:
+                logger.warning(f'Failed to remove old checkpoint {oldest}: {e}')
+
+        # Also cleanup epoch* directories (saved model weights)
+        epoch_dirs = sorted(
+            [d for d in self.save_root.iterdir() if d.is_dir() and d.name.startswith('epoch')],
+            key=lambda x: extract_number(x.name, 'epoch')  # Sort by epoch number
+        )
+
+        while len(epoch_dirs) > self.max_checkpoints:
+            oldest = epoch_dirs.pop(0)
+            try:
+                shutil.rmtree(oldest)
+                logger.info(f'Removed old epoch save: {oldest}')
+            except Exception as e:
+                logger.warning(f'Failed to remove old epoch save {oldest}: {e}')
+
+        # Also cleanup step* directories (if save_every_n_steps is used)
+        step_dirs = sorted(
+            [d for d in self.save_root.iterdir() if d.is_dir() and d.name.startswith('step')],
+            key=lambda x: extract_number(x.name, 'step')  # Sort by step number
+        )
+
+        while len(step_dirs) > self.max_checkpoints:
+            oldest = step_dirs.pop(0)
+            try:
+                shutil.rmtree(oldest)
+                logger.info(f'Removed old step save: {oldest}')
+            except Exception as e:
+                logger.warning(f'Failed to remove old step save {oldest}: {e}')
