@@ -44,52 +44,16 @@ def shuffle_with_seed(l, seed=None):
     random.setstate(rng_state)
 
 
-TAG_SHUFFLE_PREFIX = 'special:'  # Case-insensitive prefix to mark captions for tag shuffling
-
-
 def shuffle_captions(captions: list[str], count: int = 0, delimiter: str = ', ', caption_prefix: str = '') -> list[str]:
-    """
-    Shuffle captions with special handling for tag-style vs natural language captions.
-
-    Captions starting with "Special:" (case-insensitive) are treated as tag-style:
-    - The "Special:" prefix is removed
-    - Tags are shuffled based on the delimiter
-
-    Captions without the prefix are kept as-is (natural language, no shuffling).
-
-    Args:
-        captions: List of caption strings
-        count: Number of shuffled variations to create (0 = no shuffle variations)
-        delimiter: Tag delimiter for shuffling (default ", ")
-        caption_prefix: Prefix to add to all captions after processing
-
-    Example:
-        "Special: 1girl, blue hair, smile" → shuffled: "blue hair, 1girl, smile"
-        "A beautiful anime girl" → kept as-is: "A beautiful anime girl"
-    """
-    def process_caption(caption: str, should_shuffle: bool) -> str:
-        # Check for special tag-shuffle prefix (case-insensitive)
-        if caption.lower().startswith(TAG_SHUFFLE_PREFIX):
-            # Remove the prefix and strip whitespace
-            caption = caption[len(TAG_SHUFFLE_PREFIX):].strip()
-            if should_shuffle:
-                # Shuffle tags
-                split = caption.split(delimiter)
-                random.shuffle(split)
-                caption = delimiter.join(split)
-        # Captions without prefix are kept as-is (no shuffling)
-        return caption_prefix + caption
-
     if count == 0:
-        # No shuffle variations requested - still process prefix but don't shuffle
-        return [process_caption(c, should_shuffle=False) for c in captions]
+        return [caption_prefix + c for c in captions]
 
-    # Create multiple shuffled variations
-    result = []
-    for caption in captions:
-        for _ in range(count):
-            result.append(process_caption(caption, should_shuffle=True))
-    return result
+    def shuffle_caption(caption: str, delimiter: str = ", ") -> str:
+        split = caption.split(delimiter)
+        random.shuffle(split)
+        return delimiter.join(split)
+
+    return [caption_prefix + shuffle_caption(caption, delimiter) for caption in captions for _ in range(count)]
 
 
 def bucket_suffix(key):
