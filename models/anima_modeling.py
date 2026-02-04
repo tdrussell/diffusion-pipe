@@ -213,33 +213,18 @@ class Anima(MiniTrainDIT):
             layer_norm=False,
         )
 
-    def preprocess_text_embeds(
-        self,
-        text_embeds,
-        text_ids,
-        t5_attention_mask=None,
-        qwen_attention_mask=None,
-    ):
+    def preprocess_text_embeds(self, text_embeds, text_ids):
         """
         Process text embeddings through the LLM adapter.
 
         Args:
-            text_embeds: Qwen3 embeddings (B, seq_len, 1024) - source for cross-attention
-            text_ids: T5 token IDs (B, seq_len) - target for embedding lookup
-            t5_attention_mask: Optional attention mask for T5 tokens (B, seq_len)
-                               True/1 = attend, False/0 = ignore (padding)
-            qwen_attention_mask: Optional attention mask for Qwen embeddings (B, seq_len)
-                                 True/1 = attend, False/0 = ignore (padding)
+            text_embeds: Qwen3 embeddings (B, seq_len, 1024)
+            text_ids: T5 token IDs (B, seq_len)
 
         Returns:
             Processed embeddings for cross-attention
         """
         if text_ids is not None:
-            return self.llm_adapter(
-                text_embeds,
-                text_ids,
-                target_attention_mask=t5_attention_mask,
-                source_attention_mask=qwen_attention_mask,
-            )
+            return self.llm_adapter(text_embeds, text_ids)
         else:
             return text_embeds

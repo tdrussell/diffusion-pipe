@@ -284,7 +284,6 @@ class AnimaPipeline(BasePipeline):
 
             return {
                 'qwen_embeds': qwen_embeds,
-                'qwen_attention_mask': qwen_encoding.attention_mask,
                 't5_input_ids': t5_encoding.input_ids,
                 't5_attention_mask': t5_encoding.attention_mask,
             }
@@ -296,18 +295,14 @@ class AnimaPipeline(BasePipeline):
 
         if self.cache_text_embeddings:
             qwen_inputs = (inputs['qwen_embeds'],)
-            qwen_attention_mask = inputs.get('qwen_attention_mask')
             t5_input_ids = inputs['t5_input_ids']
-            t5_attention_mask = inputs.get('t5_attention_mask')
         else:
             # Compute on-the-fly
             captions = inputs['caption']
             qwen_encoding = _tokenize_qwen(self.qwen_tokenizer, captions)
             qwen_inputs = (qwen_encoding.input_ids, qwen_encoding.attention_mask)
-            qwen_attention_mask = qwen_encoding.attention_mask
             t5_encoding = _tokenize_t5(self.t5_tokenizer, captions)
             t5_input_ids = t5_encoding.input_ids
-            t5_attention_mask = t5_encoding.attention_mask
 
         bs, channels, num_frames, h, w = latents.shape
 
@@ -346,7 +341,7 @@ class AnimaPipeline(BasePipeline):
         noisy_latents = (1 - t_expanded)*latents + t_expanded*noise
         target = noise - latents
 
-        return (noisy_latents, t.view(-1, 1), *qwen_inputs, qwen_attention_mask, t5_input_ids, t5_attention_mask), (target, mask)
+        return (noisy_latents, t.view(-1, 1), *qwen_inputs, t5_input_ids), (target, mask)
 
     def to_layers(self):
         transformer = self.transformer
@@ -410,13 +405,11 @@ class InitialLayer(nn.Module):
         # If qwen_model is not None, we need to compute embeddings on-the-fly.
         # In cached mode, qwen_embeds is already computed and passed through.
         if self.qwen_model is None:
-            # Cached mode: (qwen_embeds, qwen_attention_mask, t5_input_ids, t5_attention_mask)
-            assert len(text_inputs) == 4, f"Expected cached inputs (qwen_embeds, qwen_attention_mask, t5_input_ids, t5_attention_mask), got {len(text_inputs)} items."
-            qwen_embeds, qwen_attention_mask, t5_input_ids, t5_attention_mask = text_inputs
+            assert len(text_inputs) == 2, f"Expected cached inputs (qwen_embeds, t5_input_ids), got {len(text_inputs)} items."
+            qwen_embeds, t5_input_ids = text_inputs
         else:
-            # Non-cached mode: (qwen_input_ids, qwen_attention_mask, t5_input_ids, t5_attention_mask)
-            assert len(text_inputs) == 4, f"Expected non-cached inputs (qwen_input_ids, qwen_attention_mask, t5_input_ids, t5_attention_mask), got {len(text_inputs)} items."
-            qwen_input_ids, qwen_attention_mask, t5_input_ids, t5_attention_mask = text_inputs
+            assert len(text_inputs) == 3, f"Expected non-cached inputs (qwen_input_ids, qwen_attention_mask, t5_input_ids), got {len(text_inputs)} items."
+            qwen_input_ids, qwen_attention_mask, t5_input_ids = text_inputs
             with torch.no_grad():
                 qwen_embeds = _compute_qwen_embeddings(
                     self.qwen_model,
@@ -427,23 +420,13 @@ class InitialLayer(nn.Module):
         target_device = x_B_C_T_H_W.device
         if qwen_embeds.device != target_device:
             qwen_embeds = qwen_embeds.to(target_device)
-        if qwen_attention_mask is not None and qwen_attention_mask.device != target_device:
-            qwen_attention_mask = qwen_attention_mask.to(target_device)
         if t5_input_ids.device != target_device:
             t5_input_ids = t5_input_ids.to(target_device)
-        if t5_attention_mask is not None and t5_attention_mask.device != target_device:
-            t5_attention_mask = t5_attention_mask.to(target_device)
         if t5_input_ids.dtype != torch.long:
             t5_input_ids = t5_input_ids.long()
 
         # Process through LLM adapter to get final cross-attention embeddings
-        # Pass attention masks for proper masking of padding tokens
-        crossattn_emb = self.llm_adapter(
-            qwen_embeds,
-            t5_input_ids,
-            target_attention_mask=t5_attention_mask,
-            source_attention_mask=qwen_attention_mask,
-        )
+        crossattn_emb = self.llm_adapter(qwen_embeds, t5_input_ids)
 
         # Pad to 512 tokens if needed
         if crossattn_emb.shape[1] < 512:
