@@ -1,5 +1,7 @@
 import argparse
+import logging
 import os
+import signal
 import wandb
 # Disable comfy_kitchen during training to avoid autograd errors
 import sys
@@ -38,6 +40,21 @@ from utils.pipeline import ManualPipelineModule
 mp.current_process().authkey = b'afsaskgfdjh4'
 
 wandb_enable = False
+
+# Path for signal-triggered checkpoint: when SIGUSR1 is received, we touch this file
+# and the saver's process_step (same as checkpoint_every_n_minutes) will save on next step.
+_checkpoint_signal_path = None
+
+
+def _handle_checkpoint_signal(signum, frame):
+    """On SIGUSR1, create the 'save' file so the saver will checkpoint on the next step."""
+    global _checkpoint_signal_path
+    if _checkpoint_signal_path:
+        try:
+            Path(_checkpoint_signal_path).touch()
+        except Exception:
+            pass
+
 
 TIMESTEP_QUANTILES_FOR_EVAL = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
@@ -631,6 +648,8 @@ if __name__ == '__main__':
             # when Deepspeed tries to build the fused Adam extension.
             # klass = deepspeed.ops.adam.FusedAdam
             klass = torch.optim.AdamW
+        elif optim_type_lower == 'fused_adamw':
+            klass = deepspeed.ops.adam.FusedAdam
         elif optim_type_lower == 'adamw8bit':
             import bitsandbytes
             klass = bitsandbytes.optim.AdamW8bit
@@ -646,13 +665,18 @@ if __name__ == '__main__':
             from optimizers import adamw_8bit
             klass = adamw_8bit.AdamW8bitKahan
         elif optim_type_lower == 'offload':
-            from torchao.prototype.low_bit_optim import CPUOffloadOptimizer
+            from torchao.optim.cpu_offload import CPUOffloadOptimizer
             klass = CPUOffloadOptimizer
             args.append(torch.optim.AdamW)
             kwargs['fused'] = True
         elif optim_type_lower == 'automagic':
             from optimizers import automagic
             klass = automagic.Automagic
+        elif optim_type_lower == 'prodigy':
+            from optimizers import prodigy_8bit
+            klass = prodigy_8bit.Prodigy8bit
+        elif optim_type_lower == 'deepspeed_adamw':
+            klass = deepspeed.ops.adam.DeepSpeedCPUAdam
         elif optim_type_lower == 'genericoptim':
             from optimizers import generic_optim
             klass = generic_optim.GenericOptim
@@ -782,11 +806,40 @@ if __name__ == '__main__':
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
+    print(f'oooooooooooooooooooooo steps_per_epoch: ', steps_per_epoch)
+
+
     scheduler_type = config.get('lr_scheduler', 'constant')
     if scheduler_type == 'constant':
         lr_scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
     elif scheduler_type == 'linear':
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1.0, end_factor=0.0, total_iters=config['epochs'] * steps_per_epoch)
+    elif scheduler_type == 'cosine':
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=config['epochs'] * steps_per_epoch,
+            eta_min=config.get('lr_scheduler_eta_min', 0)
+        )
+    elif scheduler_type == 'cosine_with_restarts':
+        # T_0 is the number of steps until the first restart
+        # T_mult is the factor by which T_0 increases after each restart (default 1 = fixed period)
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=config.get('lr_scheduler_t0', steps_per_epoch),
+            T_mult=config.get('lr_scheduler_t_mult', 1),
+            eta_min=config.get('lr_scheduler_eta_min', 0)
+        )
+    elif scheduler_type == 'onecycle':
+        if config['warmup_steps'] > 0:
+            print(f'cannot use warmup_steps with onecycle scheduler')
+            exit()
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config.get('lr_max_onecycle', 1e-3),
+            total_steps=config['epochs'] * steps_per_epoch,
+            pct_start=config.get('lr_scheduler_pct_start', 0.3),
+            anneal_strategy=config.get('lr_scheduler_anneal_strategy', 'cos'),
+        )
     else:
         raise NotImplementedError(f'Unknown lr_scheduler: {scheduler_type}')
     if config['warmup_steps'] > 0:
@@ -837,6 +890,10 @@ if __name__ == '__main__':
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
+
+    # Allow checkpoint-on-signal (SIGUSR1): same behavior as checkpoint_every_n_minutes
+    _checkpoint_signal_path = str(Path(run_dir) / 'save')
+    signal.signal(signal.SIGUSR1, _handle_checkpoint_signal)
 
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
     if config['eval_before_first_step'] and not resume_from_checkpoint:
