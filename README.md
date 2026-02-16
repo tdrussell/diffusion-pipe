@@ -80,6 +80,11 @@ pip install -r requirements.txt
 pip install flash-attn
 ```
 
+### Fused AdamW
+If you plan to use the `fused_adamw` optimizer, you must set the `CUDA_HOME` environment variable to the path of your CUDA toolkit installation. This is required for DeepSpeed to compile the custom CUDA kernel.
+```
+export CUDA_HOME=/usr/local/cuda-12.8
+
 ### Cosmos requirements
 NVIDIA Cosmos (the original Cosmos video model, not Cosmos-Predict2) additionally requires TransformerEngine.
 

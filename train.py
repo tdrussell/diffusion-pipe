@@ -1,5 +1,4 @@
 import argparse
-import logging
 import os
 import signal
 import wandb
@@ -649,6 +648,7 @@ if __name__ == '__main__':
             # klass = deepspeed.ops.adam.FusedAdam
             klass = torch.optim.AdamW
         elif optim_type_lower == 'fused_adamw':
+            # Make sure to set CUDA_HOME to the path of your CUDA toolkit installation, and that it is the same version as pytorch.
             klass = deepspeed.ops.adam.FusedAdam
         elif optim_type_lower == 'adamw8bit':
             import bitsandbytes
@@ -806,7 +806,7 @@ if __name__ == '__main__':
     train_dataloader = dataset_util.PipelineDataLoader(train_data, model_engine, model_engine.gradient_accumulation_steps(), model)
     steps_per_epoch = len(train_dataloader) // model_engine.gradient_accumulation_steps()
 
-    print(f'oooooooooooooooooooooo steps_per_epoch: ', steps_per_epoch)
+    print(f'steps_per_epoch: ', steps_per_epoch)
 
 
     scheduler_type = config.get('lr_scheduler', 'constant')

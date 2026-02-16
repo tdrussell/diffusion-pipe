@@ -31,7 +31,8 @@ warmup_steps = 100
 # Force the learning rate to be this value, regardless of what the optimizer or anything else says.
 # Can be used to change learning rate even when resuming from checkpoint.
 #force_constant_lr = 1e-5
-# Can be 'constant' or 'linear'. If unset, will default to 'constant', i.e. no LR scheduler.
+# Can be 'constant', 'linear', 'cosine', 'cosine_with_restarts', 'onecycle'.
+# If unset, will default to 'constant', i.e. no LR scheduler.
 #lr_scheduler = 'linear'
 
 # Block swapping is supported for Wan, HunyuanVideo, Flux, and Chroma. This value controls the number
@@ -144,6 +145,21 @@ dtype = 'bfloat16'
 #]
 
 [optimizer]
+# Supported optimizers:
+# - adamw: standard AdamW
+# - fused_adamw: fast CUDA-fused AdamW from DeepSpeed (requires CUDA_HOME)
+# - adamw8bit: 8-bit AdamW from bitsandbytes
+# - adamw_optimi: AdamW from optimi library (supports Kahan summation)
+# - stableadamw: StableAdamW from optimi library
+# - sgd: standard SGD
+# - adamw8bitkahan: local implementation of 8-bit AdamW with Kahan summation
+# - offload: CPU offloaded optimizer (using torchao)
+# - automagic: Automagic optimizer (from AI-Toolkit)
+# - prodigy: Prodigy optimizer (8-bit)
+# - deepspeed_adamw: DeepSpeed CPU Adam
+# - genericoptim: Generic optimizer wrapper
+# - Any optimizer from pytorch-optimizer library (dynamically loaded)
+
 # AdamW from the optimi library is a good default since it automatically uses Kahan summation when training bfloat16 weights.
 # Look at train.py for other options. You could also easily edit the file and add your own.
 type = 'adamw_optimi'
@@ -167,12 +183,22 @@ eps = 1e-8
 # type = 'automagic'
 # weight_decay = 0.01
 
-# Any optimizer not explicitly supported will be dynamically loaded from the pytorch-optimizer library.
 # [optimizer]
-# type = 'Prodigy'
-# lr = 1
+# type = 'fused_adamw'
+# lr = 2e-5
 # betas = [0.9, 0.99]
 # weight_decay = 0.01
+# # You MUST set CUDA_HOME environment variable to your CUDA toolkit path for this to work.
+# # e.g. export CUDA_HOME=/usr/local/cuda-12.8
+
+# Prodigy optimizer (from pytorch-optimizer).
+# Default config based on prodigy authors diffusion model config example.
+# [optimizer]
+# type = "prodigy"
+# lr = 1
+# weight_decay = 0.01
+# use_bias_correction = true
+# safeguard_warmup = true
 
 [monitoring]
 # Set to true and fill in these fields to enable wandb
