@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima.
+Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein).
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -13,8 +13,6 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
-- 2026-02-04
-  - Support Anima.
 - 2026-01-16
   - Support Flux 2, both Dev and Klein.
   - Updated DeepSpeed version. Should probably update all requirements: `pip install -r requirements.txt -U`.
@@ -39,6 +37,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
   - Support Qwen-Image-Edit. Make sure to update dependencies. You will need the latest Diffusers.
 - 2025-08-07
   - Fix Flux training error caused by a breaking change in Diffusers. Make sure to update requirements.
+- 2025-08-06
+  - Support Qwen-Image.
+  - Slight speed improvement to Automagic optimizer.
 
 ## Windows support
 It will be difficult or impossible to make training work on native Windows. This is because Deepspeed only has [partial Windows support](https://github.com/microsoft/DeepSpeed/blob/master/blogs/windows/08-2024/README.md). Deepspeed is a hard requirement because the entire training script is built around Deepspeed pipeline parallelism. However, it will work on Windows Subsystem for Linux, specifically WSL 2. If you must use Windows I recommend trying WSL 2.
@@ -80,11 +81,6 @@ pip install -r requirements.txt
 pip install flash-attn
 ```
 
-### Fused AdamW
-If you plan to use the `fused_adamw` optimizer, you must set the `CUDA_HOME` environment variable to the path of your CUDA toolkit installation. This is required for DeepSpeed to compile the custom CUDA kernel.
-```
-export CUDA_HOME=/usr/local/cuda-12.8
-
 ### Cosmos requirements
 NVIDIA Cosmos (the original Cosmos video model, not Cosmos-Predict2) additionally requires TransformerEngine.
 
@@ -99,7 +95,7 @@ Edit the paths above for your conda environment.
 git pull
 git submodule update
 ```
-Make sure to run `git submodule update` in case any submodule has been updated to a new commit.
+This project uses git submodules. If a new submodule has been added, you need to run ```git submodule update``` once after pulling in order to clone the new submodule. This only needs to be done once when a new submodule is added.
 
 ### Updating dependencies
 Most dependencies are intentionally left unpinned in the requirements.txt file. If you want to update them to the latest version, you can run ```pip install -r requirements.txt -U```.
