@@ -743,10 +743,37 @@ if __name__ == '__main__':
                 pg_other = pg
                 pg_other['params'] = params_other
                 new_param_groups.append(pg_other)
-            return klass(new_param_groups, *args, **kwargs)
+            param_groups = new_param_groups
         else:
             param_groups = model.get_param_groups(model_parameters)
-            return klass(param_groups, *args, **kwargs)
+
+        # split weight decay and no weight decay params
+        new_param_groups = []
+        for pg in param_groups:
+            params_no_wd = []
+            params_wd = []
+            params = pg.pop('params')
+            for p in params:
+                if p.ndim == 1 or p.original_name.startswith('llm_adapter.embed'):
+                    params_no_wd.append(p)
+                else:
+                    params_wd.append(p)
+            pg_no_wd = pg.copy()
+            pg['params'] = params_wd
+            pg_no_wd['params'] = params_no_wd
+            pg_no_wd['weight_decay'] = 0
+            if optim_type_lower == 'genericoptim':
+                # If we aren't using weight decay, don't use Muon either (handles LLM adapter embed properly)
+                pg_no_wd['muon'] = False
+                pg_no_wd['adamuon'] = False
+                pg_no_wd['normuon'] = False
+            if len(params_wd) > 0:
+                new_param_groups.append(pg)
+            if len(params_no_wd) > 0:
+                new_param_groups.append(pg_no_wd)
+        param_groups = new_param_groups
+
+        return klass(param_groups, *args, **kwargs)
 
     model_engine._configure_optimizer(get_optimizer, parameters_to_train)
     optimizer = model_engine.optimizer
