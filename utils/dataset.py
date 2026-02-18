@@ -200,12 +200,13 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
 # The smallest unit of a dataset. Represents a single size bucket from a single folder of images
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
-    def __init__(self, metadata_dataset, directory_config, size_bucket, cache_base):
+    def __init__(self, metadata_dataset, directory_config, size_bucket, cache_base, directory_dataset):
         self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
         self.size_bucket = size_bucket
         self.path = Path(self.directory_config['path'])
         self.cache_dir = cache_base / f'cache_{bucket_suffix(size_bucket)}'
+        self.captions_dict = directory_dataset.captions_dict  # optional
 
         if len(size_bucket) == 4:
             # rename old folder name to the new one for convenience
@@ -303,7 +304,19 @@ class SizeBucketDataset:
         ret = self.latent_dataset[entry['latents_idx']]
 
         use_uncond = UNCOND_FRACTION > 0 and random.random() < UNCOND_FRACTION
-        caption = '' if use_uncond else entry['caption']
+        if use_uncond:
+            caption = ''
+        else:
+            if self.captions_dict:
+                spec = entry['image_spec']
+                key = spec[-1]
+                if key in self.captions_dict:
+                    caption = self.captions_dict[key][entry['caption_number']]
+                else:
+                    print(f'WARNING: image {key} did not have entry in captions_dict. Using empty caption.')
+                    caption = ''
+            else:
+                caption = entry['caption']
 
         for ds, uncond_ds in zip(self.text_embedding_datasets, self.uncond_text_embeddings):
             emb_dict = uncond_ds[0] if use_uncond else ds.get_text_embeddings(tuple(entry['image_spec']), entry['caption_number'])
@@ -375,7 +388,7 @@ class ConcatenatedBatchedDataset:
 
 
 class ARBucketDataset:
-    def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, cache_base, round_to_multiple):
+    def __init__(self, ar_frames, resolutions, metadata_dataset, directory_config, cache_base, round_to_multiple, directory_dataset):
         self.ar_frames = ar_frames
         self.resolutions = resolutions
         self.metadata_dataset = metadata_dataset
@@ -385,6 +398,7 @@ class ARBucketDataset:
         self.cache_base = cache_base
         self.cache_dir = cache_base / f'ar_frames_{bucket_suffix(self.ar_frames)}'
         self.round_to_multiple = round_to_multiple
+        self.directory_dataset = directory_dataset
         os.makedirs(self.cache_dir, exist_ok=True)
 
     def get_size_bucket_datasets(self):
@@ -409,7 +423,7 @@ class ARBucketDataset:
                 desc='Adding size bucket',
             )
             self.size_buckets.append(
-                SizeBucketDataset(metadata_with_size_bucket, self.directory_config, naming_size_bucket, self.cache_base)
+                SizeBucketDataset(metadata_with_size_bucket, self.directory_config, naming_size_bucket, self.cache_base, self.directory_dataset)
             )
 
         for ds in self.size_buckets:
@@ -448,6 +462,7 @@ class DirectoryDataset:
             self.resolutions = dedup_and_sort(self.resolutions)
             self.ar_bucket_datasets = []
         self.shuffle = directory_config.get('cache_shuffle_num', dataset_config.get('cache_shuffle_num', 0))
+        self.shuffle_metadata = directory_config['shuffle_metadata']
         self.directory_config['cache_shuffle_num'] = self.shuffle # Make accessible if it wasn't yet, for picking one out
         self.shuffle_delimiter = directory_config.get('cache_shuffle_delimiter', dataset_config.get('cache_shuffle_delimiter', ", "))
         self.path = Path(self.directory_config['path'])
@@ -486,6 +501,15 @@ class DirectoryDataset:
             frame_buckets.append(1)
         frame_buckets.sort()
         self.frame_buckets = np.array(frame_buckets)
+
+        online_captions = directory_config.get('online_captions', dataset_config.get('online_captions', False))
+        if online_captions:
+            captions_json = self.path / CAPTIONS_JSON_FILE
+            assert captions_json.exists()
+            with open(captions_json) as f:
+                self.captions_dict = json.load(f)
+        else:
+            self.captions_dict = None
 
     def validate(self):
         resolutions = self.directory_config.get('resolutions', self.dataset_config.get('resolutions', []))
@@ -536,6 +560,7 @@ class DirectoryDataset:
                         self.directory_config,
                         grouping_key,
                         self.cache_dir,
+                        self,
                     )
                 )
             else:
@@ -547,6 +572,7 @@ class DirectoryDataset:
                         self.directory_config,
                         self.cache_dir,
                         self.round_to_multiple,
+                        self,
                     )
                 )
 
@@ -668,7 +694,8 @@ class DirectoryDataset:
             # Shuffle the data. Use a deterministic seed, so the dataset is identical on all processes.
             # Seed is based on the hash of the directory path, so that if directories have the same set of images, they are shuffled differently.
             seed = int(hashlib.md5(str.encode(str(self.path))).hexdigest(), 16) % int(1e9)
-            metadata_dataset = metadata_dataset.shuffle(seed=seed)
+            if self.shuffle_metadata:
+                metadata_dataset = metadata_dataset.shuffle(seed=seed)
             print('Saving intermediate metadata dataset.')
             metadata_dataset.save_to_disk(str(metadata_cache_file_1))
             # Need to delete and load from disk, or else the map() call below is extremely slow to launch worker processes
@@ -696,6 +723,7 @@ class DirectoryDataset:
         directory_config.setdefault('shuffle_tags', dataset_config.get('shuffle_tags', False))
         directory_config.setdefault('caption_prefix', dataset_config.get('caption_prefix', ''))
         directory_config.setdefault('num_repeats', dataset_config.get('num_repeats', 1))
+        directory_config.setdefault('shuffle_metadata', dataset_config.get('shuffle_metadata', True))
 
     def _metadata_map_fn(self):
         tarfile_map = {}
