@@ -741,17 +741,17 @@ class DirectoryDataset:
             try:
                 if image_file.suffix in VIDEO_EXTENSIONS:
                     # 100% accurate frame count, but much slower.
-                    # frames = 0
-                    # for frame in imageio.v3.imiter(image_file):
-                    #     frames += 1
-                    #     height, width = frame.shape[:2]
+                    frames = 0
+                    for frame in imageio.v3.imiter(image_file):
+                        frames += 1
+                        height, width = frame.shape[:2]
                     # TODO: this is an estimate of frame count. What happens if variable frame rate? Is
                     # it still close enough?
-                    meta = imageio.v3.immeta(filepath_or_file)
-                    first_frame = next(imageio.v3.imiter(filepath_or_file))
-                    height, width = first_frame.shape[:2]
+                    # meta = imageio.v3.immeta(filepath_or_file)
+                    # first_frame = next(imageio.v3.imiter(filepath_or_file))
+                    # height, width = first_frame.shape[:2]
                     assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
-                    frames = int(self.framerate * meta['duration'])
+                    # frames = int(self.framerate * meta['duration'])
                 else:
                     pil_img = Image.open(filepath_or_file)
                     width, height = pil_img.size
