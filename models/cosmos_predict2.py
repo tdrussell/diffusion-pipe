@@ -154,7 +154,7 @@ def get_dit_config(state_dict, key_prefix=''):
 
 
 def _tokenize(tokenizer, prompts):
-    return tokenizer.batch_encode_plus(
+    return tokenizer(
         prompts,
         return_tensors="pt",
         truncation=True,
