@@ -308,6 +308,7 @@ class GenericOptim(Optimizer):
             second_moment_type: str = "ema",
             correct_dim=False,
             cpu_offload=False,
+            kahan_buffer_offload=False,
             muon=False,
             adamuon=False,
             normuon=False,
@@ -328,6 +329,7 @@ class GenericOptim(Optimizer):
         self.skip_invalid_grads = skip_invalid_grads
         self.compile = compile
         self.cpu_offload = cpu_offload
+        self.kahan_buffer_offload = kahan_buffer_offload
         self.mpu = mpu
 
         if polar_express:
@@ -393,8 +395,13 @@ class GenericOptim(Optimizer):
                 if "step" not in state:
                     state["step"] = 0
                 state["step"] += 1
-                cpu_offload = self.cpu_offload if p.ndim >= 2 else False
-                state_device = 'cpu' if cpu_offload else p.device
+
+                using_cpu_offload = (self.cpu_offload or self.kahan_buffer_offload) if p.ndim >= 2 else False
+                if using_cpu_offload:
+                    state_device = 'cpu' if self.cpu_offload else p.device
+                    kahan_buffer_device = 'cpu' if (self.cpu_offload or self.kahan_buffer_offload) else p.device
+                else:
+                    state_device = kahan_buffer_device = p.device
 
                 # learning rate
                 if group.get('automagic', False):
@@ -473,7 +480,7 @@ class GenericOptim(Optimizer):
                 if group["weight_decay"] > 0.0:
                     update.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
 
-                synchronize |= cpu_offload
+                synchronize |= using_cpu_offload
 
                 if p.dtype == torch.bfloat16:
                     # Kahan summation for bfloat16
@@ -486,7 +493,7 @@ class GenericOptim(Optimizer):
                     p.add_(shift)
                     shift.add_(p.grad.sub_(p))
                     # TODO: non_blocking=True here causes CUDA error on first step after checkpoint save.
-                    state['shift'] = shift.to(state_device)
+                    state['shift'] = shift.to(kahan_buffer_device)
                 else:
                     p.add_(update)
 
@@ -640,7 +647,7 @@ class GenericOptim(Optimizer):
                 # TODO: this kind of works but is suboptimal. It is still initially loading all state
                 # on GPU. This uses more VRAM than necessary, but it isn't too bad because it happens
                 # before any training steps.
-                cpu_offload = self.cpu_offload if p.ndim >= 2 else False
+                cpu_offload = (self.cpu_offload or self.kahan_buffer_offload) if p.ndim >= 2 else False
                 for k, v in state.items():
                     if torch.is_tensor(v) and cpu_offload:
                         state[k] = v.to('cpu')
