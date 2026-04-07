@@ -266,9 +266,10 @@ class BasePipeline:
             with torch.autocast('cuda', enabled=False):
                 output = output.to(torch.float32)
                 target = target.to(output.device, torch.float32)
-                if 'pseudo_huber_c' in self.config:
-                    c = self.config['pseudo_huber_c']
-                    loss = torch.sqrt((output-target)**2 + c**2) - c
+                if 'huber_delta' in self.config:
+                    loss = F.huber_loss(output, target, reduction='none', delta=self.config['huber_delta'])
+                elif 'smooth_l1_beta' in self.config:
+                    loss = F.smooth_l1_loss(output, target, reduction='none', beta=self.config['smooth_l1_beta'])
                 else:
                     loss = F.mse_loss(output, target, reduction='none')
                 # empty tensor means no masking
@@ -589,9 +590,10 @@ class ComfyPipeline:
             with torch.autocast('cuda', enabled=False):
                 output = output.to(torch.float32)
                 target = target.to(output.device, torch.float32)
-                if 'pseudo_huber_c' in self.config:
-                    c = self.config['pseudo_huber_c']
-                    loss = torch.sqrt((output-target)**2 + c**2) - c
+                if 'huber_delta' in self.config:
+                    loss = F.huber_loss(output, target, reduction='none', delta=self.config['huber_delta'])
+                elif 'smooth_l1_beta' in self.config:
+                    loss = F.smooth_l1_loss(output, target, reduction='none', beta=self.config['smooth_l1_beta'])
                 else:
                     loss = F.mse_loss(output, target, reduction='none')
                 # empty tensor means no masking
