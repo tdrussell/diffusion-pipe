@@ -77,6 +77,10 @@ def dedup_and_sort(values):
     return np.array(values)
 
 
+def seed_from_hash(item):
+    return int(hashlib.md5(str.encode(str(item))).hexdigest(), 16) % int(1e9)
+
+
 def _map_and_cache(dataset, map_fn, cache_dir, cache_file_prefix='', new_fingerprint_args=None, regenerate_cache=False, caching_batch_size=1):
     new_fingerprint_args = [] if new_fingerprint_args is None else new_fingerprint_args
     new_fingerprint_args.append(dataset._fingerprint)
@@ -201,6 +205,10 @@ def _cache_text_embeddings(metadata_dataset, map_fn, i, cache_dir, regenerate_ca
 # and captions on disk. Not batched; returns individual items.
 class SizeBucketDataset:
     def __init__(self, metadata_dataset, directory_config, size_bucket, cache_base, directory_dataset):
+        # Shuffle deterministically based on size bucket, so that two resolutions of the same aspect ratio get different
+        # orders, which mixes data better when training on multiple resolutions at once.
+        seed = seed_from_hash(size_bucket)
+        metadata_dataset = metadata_dataset.shuffle(seed=seed)
         self.metadata_dataset = metadata_dataset
         self.directory_config = directory_config
         self.size_bucket = size_bucket
@@ -693,7 +701,7 @@ class DirectoryDataset:
 
             # Shuffle the data. Use a deterministic seed, so the dataset is identical on all processes.
             # Seed is based on the hash of the directory path, so that if directories have the same set of images, they are shuffled differently.
-            seed = int(hashlib.md5(str.encode(str(self.path))).hexdigest(), 16) % int(1e9)
+            seed = seed_from_hash(self.path)
             if self.shuffle_metadata:
                 metadata_dataset = metadata_dataset.shuffle(seed=seed)
             print('Saving intermediate metadata dataset.')
