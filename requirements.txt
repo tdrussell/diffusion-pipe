@@ -28,3 +28,6 @@ wandb
 optimum-quanto
 wheel
 ninja
+comfy-kitchen
+comfy-aimdo
+scipy
