@@ -505,7 +505,7 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
     ):
         del kwargs
         super().__init__()
-        self.register_buffer("seq", torch.arange(max(len_h, len_w, len_t), dtype=torch.float))
+        self.register_buffer("seq", torch.arange(max(len_h, len_w, len_t), dtype=torch.float), persistent=False)
         self.base_fps = base_fps
         self.max_h = len_h
         self.max_w = len_w
@@ -519,12 +519,12 @@ class VideoRopePosition3DEmb(VideoPositionEmb):
         self.register_buffer(
             "dim_spatial_range",
             torch.arange(0, dim_h, 2)[: (dim_h // 2)].float() / dim_h,
-            persistent=True,
+            persistent=False,
         )
         self.register_buffer(
             "dim_temporal_range",
             torch.arange(0, dim_t, 2)[: (dim_t // 2)].float() / dim_t,
-            persistent=True,
+            persistent=False,
         )
         self._dim_h = dim_h
         self._dim_t = dim_t

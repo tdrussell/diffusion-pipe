@@ -105,8 +105,8 @@ def vae_encode(tensor, vae):
 
 def get_dit_config(state_dict, key_prefix=''):
     dit_config = {}
-    dit_config["max_img_h"] = 512
-    dit_config["max_img_w"] = 512
+    dit_config["max_img_h"] = 1024
+    dit_config["max_img_w"] = 1024
     dit_config["max_frames"] = 128
     concat_padding_mask = True
     dit_config["in_channels"] = (state_dict['{}x_embedder.proj.1.weight'.format(key_prefix)].shape[1] // 4) - int(concat_padding_mask)
