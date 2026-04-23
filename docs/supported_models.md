@@ -561,3 +561,21 @@ Notes:
   - If you are uploading the lora somewhere, specify that it is trained on preview, so that users aren't confused if it doesn't work well on the final version.
 
 Anima LoRAs are saved in ComfyUI format.
+
+
+## Ernie-Image
+```
+[model]
+type = 'ernie_image'
+diffusion_model = '/data2/imagegen_models/comfyui-models/ernie-image.safetensors'
+vae = '/home/anon/ComfyUI/models/vae/flux2-vae.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/ministral-3-3b.safetensors', type = 'flux2'}
+]
+dtype = 'bfloat16'
+diffusion_model_dtype = 'float8'  # can remove if you have a lot of VRAM
+timestep_sample_method = 'logit_normal'
+shift = 3  # probably good for any model with Flux2 VAE
+```
+
+Use ComfyUI-compatible model files. LoRAs are saved in ComfyUI format.

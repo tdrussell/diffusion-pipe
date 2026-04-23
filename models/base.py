@@ -21,6 +21,7 @@ from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_mul
 import comfy.utils
 import comfy.sd
 import comfy.sd1_clip
+from comfy.sd1_clip import SD1Tokenizer
 from comfy import model_management
 # Avoids using comfy_kitchen RoPE implementations that don't have backward defined
 model_management.in_training = True
@@ -365,6 +366,11 @@ class ModelWrapper:
             self._model = self._load_fn()
 
 
+def tokenize(text_encoder, text):
+    # to make sure we force disable_weights=True even if the child class doesn't set it
+    return SD1Tokenizer.tokenize_with_weights(text_encoder.tokenizer, text, disable_weights=True)
+
+
 class ComfyPipeline:
     framerate = None
     pixels_round_to_multiple = 16
@@ -546,7 +552,7 @@ class ComfyPipeline:
 
             max_length = 0
             for text in captions:
-                tokens = text_encoder.tokenize(text)
+                tokens = tokenize(text_encoder, text)
                 # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
                 for v in tokens.values():
                     max_length = max(max_length, len(v[0]))
@@ -555,7 +561,7 @@ class ComfyPipeline:
             tokenizer.min_length = max_length
             tokens_dict = defaultdict(list)
             for text in captions:
-                tokens = text_encoder.tokenize(text)
+                tokens = tokenize(text_encoder, text)
                 for k, v in tokens.items():
                     tokens_dict[k].extend(v)
 

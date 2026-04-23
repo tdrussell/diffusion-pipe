@@ -357,6 +357,9 @@ if __name__ == '__main__':
     elif model_type == 'flux2':
         from models import flux2
         model = flux2.Flux2Pipeline(config)
+    elif model_type == 'ernie_image':
+        from models import ernie_image
+        model = ernie_image.ErnieImagePipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -515,7 +518,7 @@ if __name__ == '__main__':
             run_dir_container[0] = os.path.join(config['output_dir'], resume_from_checkpoint)
         else:
             run_dir_container[0] = os.path.join(config['output_dir'], datetime.now(timezone.utc).strftime('%Y%m%d_%H-%M-%S'))
-    
+
     torch.distributed.broadcast_object_list(run_dir_container, src=0, group=dist.get_world_group())
     run_dir = run_dir_container[0]
 
