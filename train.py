@@ -658,6 +658,9 @@ if __name__ == '__main__':
         elif optim_type_lower == 'genericoptim':
             from optimizers import generic_optim
             klass = generic_optim.GenericOptim
+        elif optim_type_lower == 'rose':
+            from rose_opt import Rose
+            klass = Rose
         else:
             import pytorch_optimizer
             klass = getattr(pytorch_optimizer, optim_type)
