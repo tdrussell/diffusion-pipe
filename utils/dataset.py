@@ -737,6 +737,7 @@ class DirectoryDataset:
         tarfile_map = {}
 
         def fn(example):
+            empty_return = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
             # batch size always 1
             caption_file = example['caption_file'][0]
             image_spec = example['image_spec'][0]
@@ -749,12 +750,11 @@ class DirectoryDataset:
                 with open(caption_file) as f:
                     captions = [f.read().strip()]
             if captions is None:
-                captions = ['']
-                logger.warning(f'Cound not find caption for {image_file}. Using empty caption.')
+                logger.warning(f'Cound not find caption for {image_file}. Skipping image.')
+                return empty_return
             if self.directory_config['shuffle_tags'] and self.shuffle == 0: # backwards compatibility
                 self.shuffle = 1
             captions = shuffle_captions(captions, self.shuffle, self.shuffle_delimiter, self.directory_config['caption_prefix'])
-            empty_return = {'image_spec': [], 'mask_file': [], 'caption': [], 'ar_bucket': [], 'size_bucket': [], 'is_video': []}
             if self.control_path:
                 empty_return['control_file'] = []
 
