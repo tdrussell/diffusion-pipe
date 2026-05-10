@@ -360,6 +360,9 @@ if __name__ == '__main__':
     elif model_type == 'ernie_image':
         from models import ernie_image
         model = ernie_image.ErnieImagePipeline(config)
+    elif model_type == 'ltx2':
+        from models import ltx2
+        model = ltx2.LTX2Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -589,7 +592,7 @@ if __name__ == '__main__':
     parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
 
     if config['compile']:
-        pipeline_model.compile()
+        pipeline_model.compile(dynamic=True)
 
     model_engine, optimizer, _, _ = deepspeed.initialize(
         args=args,
@@ -784,8 +787,6 @@ if __name__ == '__main__':
     if model_engine.is_pipe_parallel:
          grid = model_engine.grid
          model_engine.first_last_stage_group = dist.new_group(ranks=[grid.pp_group[0], grid.pp_group[-1]])
-
-
 
     train_data.post_init(
         model_engine.grid.get_data_parallel_rank(),

@@ -379,6 +379,7 @@ class ComfyPipeline:
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
+        self.latent_format = None
 
         # VAE
         def load_fn():
@@ -428,18 +429,20 @@ class ComfyPipeline:
         dtype = self.model_config['dtype']
         model_options = {}
         model_options['dtype'] = dtype
-        self.model_patcher = comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options)
+        model_patcher = comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options)
 
         for adapter_path in self.model_config.get('merge_adapters', []):
             if is_main_process():
                 print(f'Merging adapter {adapter_path}')
             sd = comfy.utils.load_torch_file(adapter_path, safe_load=True)
-            self.model_patcher, _ = comfy.sd.load_lora_for_models(self.model_patcher, None, sd, 1.0, 0.0)
+            model_patcher, _ = comfy.sd.load_lora_for_models(model_patcher, None, sd, 1.0, 0.0)
+            del sd
 
-        self.model_patcher.set_model_compute_dtype(dtype)
+        model_patcher.set_model_compute_dtype(dtype)
         with torch.no_grad():
-            self.model_patcher.patch_model()
-        self.diffusion_model = self.model_patcher.model.diffusion_model
+            model_patcher.patch_model()
+        self.diffusion_model = model_patcher.model.diffusion_model
+        del model_patcher
 
         diffusion_model_dtype = self.model_config.get('diffusion_model_dtype', dtype)
         for name, p in self.diffusion_model.named_parameters():
@@ -525,6 +528,7 @@ class ComfyPipeline:
         return PreprocessMediaFile(self.config, support_video=False)
 
     def get_call_vae_fn(self, vae):
+        latent_format = self.latent_format
         @torch.inference_mode()
         def fn(images):
             images = images.to('cuda')
@@ -534,6 +538,9 @@ class ComfyPipeline:
             # Pixels are in range [-1, 1], Comfy code expects [0, 1]
             images = (images + 1) / 2
             latents = vae.encode(images)
+            if latent_format is not None:
+                # some older models do this in prepare_inputs() so it can be None
+                latents = latent_format.process_in(latents)
             return {'latents': latents}
         return fn
 
@@ -549,6 +556,7 @@ class ComfyPipeline:
         @torch.inference_mode()
         def fn(captions: list[str], is_video: list[bool]):
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
+            tokenizer.min_length = 1
 
             max_length = 0
             for text in captions:

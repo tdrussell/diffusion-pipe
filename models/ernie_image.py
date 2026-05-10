@@ -34,20 +34,22 @@ class ErnieImagePipeline(ComfyPipeline):
         latents = inputs['latents'].float()
         latents = self.model_patcher.model.process_latent_in(latents)
         text_embeds = inputs['text_embeds_0']
+        attention_mask = inputs['attention_mask_0']
         mask = inputs['mask']
 
         bs, c, h, w = latents.shape
         device = latents.device
 
         # text embeds are variable length
-        max_seq_len = max([e.shape[0] for e in text_embeds])
-        text_embeds_tensor = torch.zeros((bs, max_seq_len, text_embeds[0].shape[-1]), device=device, dtype=text_embeds[0].dtype)
-        attention_mask_tensor = torch.zeros((bs, max_seq_len), device=device, dtype=torch.bool)
-        for i, e in enumerate(text_embeds):
-            seq_len = e.shape[0]
-            text_embeds_tensor[i, :seq_len, :] = e
-            attention_mask_tensor[i, :seq_len] = 1
-        assert text_embeds_tensor.shape[:2] == attention_mask_tensor.shape[:2]
+        max_seq_len = max([e.size(0) for e in text_embeds])
+        text_embeds = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0), u.size(1))]) for u in text_embeds]
+        )
+        attention_mask = torch.stack(
+            [torch.cat([u, u.new_zeros(max_seq_len - u.size(0))]) for u in attention_mask]
+        )
+        attention_mask = attention_mask.bool()
+        assert text_embeds.shape[:2] == attention_mask.shape[:2]
 
         if mask is not None:
             mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
@@ -84,7 +86,7 @@ class ErnieImagePipeline(ComfyPipeline):
         target = noise - latents
         t = t*1000
 
-        return (noisy_latents, t, text_embeds_tensor, attention_mask_tensor), (target, mask)
+        return (noisy_latents, t, text_embeds, attention_mask), (target, mask)
 
     def enable_block_swap(self, blocks_to_swap):
         diffusion_model = self.diffusion_model
