@@ -24,6 +24,7 @@
 |HunyuanVideo-1.5|✅    |✅              |✅                |
 |Flux 2          |✅    |✅              |✅                |
 |Anima           |✅    |✅              |✅                |
+|LTX 2.3         |✅    |❌              |✅                |
 
 
 ## SDXL
@@ -579,3 +580,25 @@ shift = 3  # probably good for any model with Flux2 VAE
 ```
 
 Use ComfyUI-compatible model files. LoRAs are saved in ComfyUI format.
+
+## LTX 2.3
+```
+[model]
+type = 'ltx2'
+diffusion_model = '/data2/imagegen_models/comfyui-models/ltx-2.3-22b-dev.safetensors'
+text_encoder = '/data2/imagegen_models/comfyui-models/gemma_3_12B_it_fp4_mixed.safetensors'
+dtype = 'bfloat16'
+diffusion_model_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+shift = 1
+```
+
+Only LTX2.3 is supported. Currently, only T2I and T2V training with no audio is supported. Audio / I2V will be added later.
+
+Use ComfyUI-compatible model files. Text encoder can be any safetensors weight format (e.g. the fp4_mixed). The diffusion model needs to be the full bf16 undistilled checkpoint.
+
+I don't know what the shift value should be. I did one test run with shift=1 and got okay results, but maybe it should be greater than 1.
+
+`blocks_to_swap = 46` is the maximum for this model, and with that, it might barely fit in 24GB VRAM if the resolution, video length, and LoRA rank are all low enough. More VRAM or multiple GPUs + pipeline parallelism is better for this model though.
+
+LoRAs are saved in ComfyUI format. Full finetune is technically possible, but it would save only the diffusion model and not the packed checkpoint (which includes things like VAE, audio vocoder, etc). I can't test full finetune because I don't have enough VRAM.
