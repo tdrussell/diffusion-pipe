@@ -366,9 +366,13 @@ class ModelWrapper:
             self._model = self._load_fn()
 
 
-def tokenize(text_encoder, text):
-    # to make sure we force disable_weights=True even if the child class doesn't set it
-    return SD1Tokenizer.tokenize_with_weights(text_encoder.tokenizer, text, disable_weights=True)
+def tokenize_with_weights(self, text:str, return_word_ids=False, **kwargs):
+    kwargs['disable_weights'] = True
+    out = {}
+    out[self.clip_name] = getattr(self, self.clip).tokenize_with_weights(text, return_word_ids, **kwargs)
+    return out
+# patch to always disable weights, even if the child class doesn't
+SD1Tokenizer.tokenize_with_weights = tokenize_with_weights
 
 
 class ComfyPipeline:
@@ -560,7 +564,7 @@ class ComfyPipeline:
 
             max_length = 0
             for text in captions:
-                tokens = tokenize(text_encoder, text)
+                tokens = text_encoder.tokenize(text)
                 # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
                 for v in tokens.values():
                     max_length = max(max_length, len(v[0]))
@@ -569,7 +573,7 @@ class ComfyPipeline:
             tokenizer.min_length = max_length
             tokens_dict = defaultdict(list)
             for text in captions:
-                tokens = tokenize(text_encoder, text)
+                tokens = text_encoder.tokenize(text)
                 for k, v in tokens.items():
                     tokens_dict[k].extend(v)
 
