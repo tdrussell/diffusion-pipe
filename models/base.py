@@ -442,7 +442,7 @@ class ComfyPipeline:
         with torch.no_grad():
             model_patcher.patch_model()
         self.diffusion_model = model_patcher.model.diffusion_model
-        del model_patcher
+        self.model_patcher = model_patcher
 
         diffusion_model_dtype = self.model_config.get('diffusion_model_dtype', dtype)
         for name, p in self.diffusion_model.named_parameters():
