@@ -114,15 +114,20 @@ def set_config_defaults(config):
     if 'adapter' in config:
         adapter_config = config['adapter']
         adapter_type = adapter_config['type']
+        if 'alpha' in adapter_config:
+            raise NotImplementedError(
+                'This script forces alpha=rank to make the saved adapter format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
+            )
+        adapter_config['alpha'] = adapter_config['rank']
+        adapter_config.setdefault('dtype', model_dtype_str)
+        adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
+
+        # per-adapter defaults
         if adapter_config['type'] == 'lora':
-            if 'alpha' in adapter_config:
-                raise NotImplementedError(
-                    'This script forces alpha=rank to make the saved LoRA format simpler and more predictable with downstream inference programs. Please remove alpha from the config.'
-                )
-            adapter_config['alpha'] = adapter_config['rank']
             adapter_config.setdefault('dropout', 0.0)
-            adapter_config.setdefault('dtype', model_dtype_str)
-            adapter_config['dtype'] = DTYPE_MAP[adapter_config['dtype']]
+        elif adapter_config['type'] == 'lokr':
+            adapter_config.setdefault('decompose_factor', -1)
+            adapter_config.setdefault('rank_dropout', 0.0)
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
 

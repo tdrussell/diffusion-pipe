@@ -163,22 +163,11 @@ class PreprocessMediaFile:
             return [(video, mask) for video in videos]
 
 
-class BasePipeline:
-    framerate = None
-    pixels_round_to_multiple = 16
-
-    def load_diffusion_model(self):
-        pass
-
-    def get_vae(self):
-        raise NotImplementedError()
-
-    def get_text_encoders(self):
-        raise NotImplementedError()
-
-    def configure_adapter(self, adapter_config):
+# shared functionality between BasePipeline and ComfyPipeline
+class CommonPipeline:
+    def configure_adapter(self, target_model, adapter_config):
         target_linear_modules = set()
-        for name, module in self.transformer.named_modules():
+        for name, module in target_model.named_modules():
             if module.__class__.__name__ not in self.adapter_target_modules:
                 continue
             for full_submodule_name, submodule in module.named_modules(prefix=name):
@@ -193,18 +182,43 @@ class BasePipeline:
                 lora_alpha=adapter_config['alpha'],
                 lora_dropout=adapter_config['dropout'],
                 bias='none',
-                target_modules=target_linear_modules
+                target_modules=target_linear_modules,
+            )
+        elif adapter_type == 'lokr':
+            peft_config = peft.LoKrConfig(
+                r=adapter_config['rank'],
+                decompose_factor=adapter_config['decompose_factor'],
+                alpha=adapter_config['alpha'],
+                rank_dropout=adapter_config['rank_dropout'],
+                target_modules=target_linear_modules,
             )
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
         self.peft_config = peft_config
-        self.lora_model = peft.get_peft_model(self.transformer, peft_config)
+        self.lora_model = peft.get_peft_model(target_model, peft_config)
         if is_main_process():
             self.lora_model.print_trainable_parameters()
-        for name, p in self.transformer.named_parameters():
+        for name, p in target_model.named_parameters():
             p.original_name = name
             if p.requires_grad:
                 p.data = p.data.to(adapter_config['dtype'])
+
+
+class BasePipeline(CommonPipeline):
+    framerate = None
+    pixels_round_to_multiple = 16
+
+    def load_diffusion_model(self):
+        pass
+
+    def get_vae(self):
+        raise NotImplementedError()
+
+    def get_text_encoders(self):
+        raise NotImplementedError()
+
+    def configure_adapter(self, adapter_config):
+        super().configure_adapter(self.transformer, adapter_config)
 
     def save_adapter(self, save_dir, peft_state_dict):
         raise NotImplementedError()
@@ -375,7 +389,7 @@ def tokenize_with_weights(self, text:str, return_word_ids=False, **kwargs):
 SD1Tokenizer.tokenize_with_weights = tokenize_with_weights
 
 
-class ComfyPipeline:
+class ComfyPipeline(CommonPipeline):
     framerate = None
     pixels_round_to_multiple = 16
     keep_in_high_precision = []
@@ -466,34 +480,7 @@ class ComfyPipeline:
         return self.text_encoders
 
     def configure_adapter(self, adapter_config):
-        target_linear_modules = set()
-        for name, module in self.diffusion_model.named_modules():
-            if module.__class__.__name__ not in self.adapter_target_modules:
-                continue
-            for full_submodule_name, submodule in module.named_modules(prefix=name):
-                if isinstance(submodule, nn.Linear):
-                    target_linear_modules.add(full_submodule_name)
-        target_linear_modules = list(target_linear_modules)
-
-        adapter_type = adapter_config['type']
-        if adapter_type == 'lora':
-            peft_config = peft.LoraConfig(
-                r=adapter_config['rank'],
-                lora_alpha=adapter_config['alpha'],
-                lora_dropout=adapter_config['dropout'],
-                bias='none',
-                target_modules=target_linear_modules
-            )
-        else:
-            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
-        self.peft_config = peft_config
-        self.lora_model = peft.get_peft_model(self.diffusion_model, peft_config)
-        if is_main_process():
-            self.lora_model.print_trainable_parameters()
-        for name, p in self.diffusion_model.named_parameters():
-            p.original_name = name
-            if p.requires_grad:
-                p.data = p.data.to(adapter_config['dtype'])
+        super().configure_adapter(self.diffusion_model, adapter_config)
 
     def save_adapter(self, save_dir, sd):
         self.peft_config.save_pretrained(save_dir)
