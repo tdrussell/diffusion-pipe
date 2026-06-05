@@ -16,8 +16,11 @@ import torchvision
 from PIL import Image, ImageOps
 from torchvision import transforms
 import imageio
+import accelerate
+from diffusers import FlowMatchEulerDiscreteScheduler
+from tqdm import tqdm
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple
+from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE
 import comfy.utils
 import comfy.sd
 import comfy.sd1_clip
@@ -393,11 +396,21 @@ class ComfyPipeline(CommonPipeline):
     framerate = None
     pixels_round_to_multiple = 16
     keep_in_high_precision = []
+    spatial_compression = 8
+    channels = 16
 
     def __init__(self, config):
         self.config = config
         self.model_config = self.config['model']
         self.latent_format = None
+
+        # sampling only
+        self.sample_steps = 20
+        self.sample_shift = 3
+        self.sample_cfg = 5
+        self.scheduler = FlowMatchEulerDiscreteScheduler(shift=self.sample_shift)
+        sigmas = torch.linspace(1.0, 1 / self.sample_steps, self.sample_steps)
+        self.scheduler.set_timesteps(sigmas=sigmas, device='cuda')
 
         # VAE
         def load_fn():
@@ -547,7 +560,6 @@ class ComfyPipeline(CommonPipeline):
         @torch.inference_mode()
         def fn(captions: list[str], is_video: list[bool]):
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
-            tokenizer.min_length = 1
 
             max_length = 0
             for text in captions:
@@ -581,6 +593,40 @@ class ComfyPipeline(CommonPipeline):
 
     def to_layers(self):
         raise NotImplementedError()
+
+    @torch.no_grad()
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def sample(self, prompt, negative_prompt='', w=512, h=512, cfg=None):
+        cfg = cfg or self.sample_cfg
+        inputs = {}
+        inputs_uncond = {}
+        for te in self.get_text_encoders():
+            te.load_model_if_needed()
+            call_text_encoder_fn = self.get_call_text_encoder_fn(te)
+            inputs.update(call_text_encoder_fn([prompt], is_video=[False]))
+            if cfg > 1:
+                inputs_uncond.update(call_text_encoder_fn([negative_prompt], is_video=[False]))
+            model_management.unload_all_models()
+        conds = tuple(tensor.cuda() for tensor in self.get_conds(inputs))
+        if cfg > 1:
+            unconds = tuple(tensor.cuda() for tensor in self.get_conds(inputs_uncond))
+        x = torch.randn((1, self.channels, h//self.spatial_compression, w//self.spatial_compression), device='cuda')
+        timesteps = self.scheduler.timesteps
+        for step in tqdm(timesteps, desc='Sampling'):
+            t = step / 1000
+            t = t.view(1)
+            inputs = (x, t, *conds)
+            v = self.pipeline_model(inputs).float()
+            if cfg > 1:
+                inputs_uncond = (x, t, *unconds)
+                v_uncond = self.pipeline_model(inputs_uncond).float()
+                v = v_uncond + cfg*(v - v_uncond)
+            x = self.scheduler.step(v, step, x, return_dict=False)[0]
+        vae = self.vae
+        vae.load_model_if_needed()
+        img = vae.decode(x)
+        model_management.unload_all_models()
+        return img
 
     def model_specific_dataset_config_validation(self, dataset_config):
         pass

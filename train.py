@@ -53,6 +53,7 @@ parser.add_argument('--trust_cache', action='store_true', help='Load from metada
 parser.add_argument('--i_know_what_i_am_doing', action='store_true', help="Skip certain checks and overrides. You may end up using settings that won't work.")
 parser.add_argument('--master_port', type=int, default=29500, help='Master port for distributed training')
 parser.add_argument('--dump_dataset', type=Path, default=None, help='Decode cached latents and dump the dataset to this directory.')
+parser.add_argument('--test_sample', action='store_true', help='Generate and write an image to example.png and then quit.')
 parser = deepspeed.add_config_arguments(parser)
 args = parser.parse_args()
 
@@ -594,6 +595,7 @@ if __name__ == '__main__':
         loss_fn=model.get_loss_fn(),
         **additional_pipeline_module_kwargs
     )
+    model.pipeline_model = pipeline_model
     parameters_to_train = [p for p in pipeline_model.parameters() if p.requires_grad]
 
     if config['compile']:
@@ -610,6 +612,14 @@ if __name__ == '__main__':
     model_engine._support_torch_style_backward = True
     global_batch_size = model_engine.train_micro_batch_size_per_gpu() * model_engine.gradient_accumulation_steps() * model_engine.grid.get_data_parallel_world_size()
     print(f'Global batch size = {global_batch_size}')
+
+    if args.test_sample:
+        import torchvision
+        img = model.sample('a golden retriever running through a grassy field', cfg=5)
+        img = img.squeeze(0).movedim(-1, 0)
+        print(img.shape, img.min().item(), img.max().item())
+        torchvision.utils.save_image(img, 'example.png')
+        quit()
 
     if save_every_n_examples := config.pop('save_every_n_examples', None):
         config['save_every_n_steps'] = save_every_n_examples // global_batch_size
