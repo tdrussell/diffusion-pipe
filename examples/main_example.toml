@@ -143,6 +143,13 @@ dtype = 'bfloat16'
 #    {path = '/data2/imagegen_models/loras/some_lora.safetensors', weight = 1.0}
 #]
 
+# LoKr is supported. Setting very high rank makes it do full-matrix LoKr rather than low-rank decomposition.
+# [adapter]
+# type = 'lokr'
+# rank = 1e6
+# decompose_factor = 4
+# dtype = 'bfloat16'
+
 [optimizer]
 # AdamW from the optimi library is a good default since it automatically uses Kahan summation when training bfloat16 weights.
 # Look at train.py for other options. You could also easily edit the file and add your own.

@@ -25,6 +25,7 @@
 |Flux 2          |✅    |✅              |✅                |
 |Anima           |✅    |✅              |✅                |
 |LTX 2.3         |✅    |❌              |✅                |
+|Ideogram4       |✅    |✅              |✅                |
 
 
 ## SDXL
@@ -533,7 +534,6 @@ Notes:
 - Without block swapping, Dev needs at least 48GB VRAM for LoRA training and probably a lot of system RAM also.
 - The Flux2 VAE has more channels, so a timestep shift value above 1 is useful. I don't know the best value but 3 seems to work well.
 - Make sure you're using the right text encoder. Each version uses a different TE. If you use the wrong one, the caching will still run but you will get shape mismatch errors when it tries to train.
-- The text encoder can be an fp8 version. The diffusion model should be the full one though. fp8 diffusion model might work if it is a plain format one (the Kleins, maybe) but fp8_scaled / fp8_mixed definitely will not work.
 
 LoRAs are saved in ComfyUI format.
 
@@ -556,10 +556,6 @@ Notes:
 - You can control the llm_adapter learning rate separately. This is an adapter that processes the Qwen3 embeddings before feeding into the diffusion model.
   - Setting `llm_adapter_lr=0` disables training it entirely. This probably makes training more stable for small datasets.
   - If you have a larger dataset or a lot of brand-new concepts, you can try training the llm_adapter and see if it helps.
-- **Assume that any lora trained on the preview version won't work well on the final version**
-  - Consider it to be a "throwaway lora" that you likely will need to retrain.
-  - The underlying model is still training and it will diverge from the preview weights.
-  - If you are uploading the lora somewhere, specify that it is trained on preview, so that users aren't confused if it doesn't work well on the final version.
 
 Anima LoRAs are saved in ComfyUI format.
 
@@ -595,10 +591,26 @@ shift = 1
 
 Only LTX2.3 is supported. Currently, only T2I and T2V training with no audio is supported. Audio / I2V will be added later.
 
-Use ComfyUI-compatible model files. Text encoder can be any safetensors weight format (e.g. the fp4_mixed). The diffusion model needs to be the full bf16 undistilled checkpoint.
+Use ComfyUI-compatible model files. Text encoder can be any safetensors weight format (e.g. the fp4_mixed).
 
 I don't know what the shift value should be. I did one test run with shift=1 and got okay results, but maybe it should be greater than 1.
 
 `blocks_to_swap = 46` is the maximum for this model, and with that, it might barely fit in 24GB VRAM if the resolution, video length, and LoRA rank are all low enough. More VRAM or multiple GPUs + pipeline parallelism is better for this model though.
 
 LoRAs are saved in ComfyUI format. Full finetune is technically possible, but it would save only the diffusion model and not the packed checkpoint (which includes things like VAE, audio vocoder, etc). I can't test full finetune because I don't have enough VRAM.
+
+## Ideogram4
+```
+[model]
+type = 'ideogram4'
+diffusion_model = '/data2/imagegen_models/comfyui-models/ideogram4_fp8_scaled.safetensors'
+vae = '/home/anon/ComfyUI/models/vae/flux2-vae.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_8b_fp8_scaled.safetensors', type = 'ideogram4'}
+]
+dtype = 'bfloat16'
+diffusion_model_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+shift = 3
+```
+This configuration should train a LoRA with 24GB VRAM. Models are saved in ComfyUI format.

@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3.
+Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4.
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -13,6 +13,12 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2025-06-07
+  - Remove attention masking from Flux2. The model is supposed to take the full 512 length text embeds even with padding.
+    - This gives slightly lower starting loss, but seems to make almost no difference to the final trained result. Still, it should theoretically be better now.
+    - Delete cache folder or use `--regenerate_cache` or else you might get Tensor shape errors from the old cached files.
+  - For ComfyUI-based models (Z-Image and later), support training directly from Comfy quantized weights, e.g. fp8_scaled.
+  - Support Ideogram4.
 - 2026-05-15
   - Initial LTX 2.3 support. Only T2I and T2V training for now, and no audio.
 - 2026-04-23
@@ -33,12 +39,6 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
   - Use new backend for caching latents and text embeddings. This allows near-instant loading of the cached dataset even for terabyte-scale datasets.
     - It's recommended to manually delete the cache folder inside your dataset folders. You don't need to do this, but the old cached files will stay around and take up space.
     - This is a fairly big change, if it causes problems for you, raise an issue.
-- 2025-10-27
-  - Add AuraFlow / Pony-V7 support.
-  - Remove multiple_overlapping setting for video clip mode. This didn't even work right (it would always use a single clip from the video). And future changes I have planned won't work with it either.
-  - Use float16 for cached files. Previously it was always float32 on disk. This shouldn't impact quality and will cut disk usage of cached files in half.
-- 2025-09-13
-  - Support HunyuanImage-2.1. This adds a new submodule; make sure to run ```git submodule update``` after pull.
 
 ## Windows support
 It will be difficult or impossible to make training work on native Windows. This is because Deepspeed only has [partial Windows support](https://github.com/microsoft/DeepSpeed/blob/master/blogs/windows/08-2024/README.md). Deepspeed is a hard requirement because the entire training script is built around Deepspeed pipeline parallelism. However, it will work on Windows Subsystem for Linux, specifically WSL 2. If you must use Windows I recommend trying WSL 2.
