@@ -1130,7 +1130,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
 # Helper class to make caching multiple datasets more efficient by moving
 # models to GPU as few times as needed.
 class DatasetManager:
-    def __init__(self, model, regenerate_cache=False, trust_cache=False, caching_batch_size=1):
+    def __init__(self, model, regenerate_cache=False, trust_cache=False, caching_batch_size=1, keep_models_loaded=False):
         self.model = model
         self.vae = self.model.get_vae()
         self.text_encoders = self.model.get_text_encoders()
@@ -1144,6 +1144,7 @@ class DatasetManager:
         self.regenerate_cache = regenerate_cache
         self.trust_cache = trust_cache
         self.caching_batch_size = caching_batch_size
+        self.keep_models_loaded = keep_models_loaded
         self.datasets = []
 
     def register(self, dataset):
@@ -1194,7 +1195,7 @@ class DatasetManager:
             for model in self.submodels:
                 if not isinstance(model, nn.Module):
                     continue
-                if self.model.name == 'sdxl' and model is self.vae:
+                if (self.model.name == 'sdxl' and model is self.vae) or self.keep_models_loaded:
                     # If full fine tuning SDXL, we need to keep the VAE weights around for saving the model.
                     model.to('cpu')
                 else:

@@ -369,6 +369,9 @@ if __name__ == '__main__':
     elif model_type == 'ltx2':
         from models import ltx2
         model = ltx2.LTX2Pipeline(config)
+    elif model_type == 'ideogram4':
+        from models import ideogram4
+        model = ideogram4.Ideogram4Pipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
@@ -419,7 +422,7 @@ if __name__ == '__main__':
         'steps_per_print': config.get('steps_per_print', 1),
     }
     caching_batch_size = config.get('caching_batch_size', 1)
-    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size)
+    dataset_manager = dataset_util.DatasetManager(model, regenerate_cache=regenerate_cache, trust_cache=args.trust_cache, caching_batch_size=caching_batch_size, keep_models_loaded=args.test_sample)
 
     train_data = dataset_util.Dataset(dataset_config, model, skip_dataset_validation=args.i_know_what_i_am_doing)
     dataset_manager.register(train_data)
@@ -507,6 +510,9 @@ if __name__ == '__main__':
     dataset_manager.cache()
     if args.cache_only:
         quit()
+
+    if args.test_sample:
+        model.prepare_sample_test('a golden retriever running through a grassy field', cfg=1)
 
     model.load_diffusion_model()
 
@@ -615,7 +621,7 @@ if __name__ == '__main__':
 
     if args.test_sample:
         import torchvision
-        img = model.sample('a golden retriever running through a grassy field', cfg=5)
+        img = model.sample(w=512, h=512)
         img = img.squeeze(0).movedim(-1, 0)
         print(img.shape, img.min().item(), img.max().item())
         torchvision.utils.save_image(img, 'example.png')

@@ -168,6 +168,44 @@ class PreprocessMediaFile:
 
 # shared functionality between BasePipeline and ComfyPipeline
 class CommonPipeline:
+    def __init__(self, *args, **kwargs):
+        # sampling only
+        self.sample_steps = 20
+        self.sample_shift = 3
+        self.scheduler = FlowMatchEulerDiscreteScheduler(shift=self.sample_shift)
+        sigmas = torch.linspace(1.0, 1 / self.sample_steps, self.sample_steps)
+        self.scheduler.set_timesteps(sigmas=sigmas, device='cuda')
+
+    @torch.no_grad()
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    def prepare_sample_test(self, prompt, negative_prompt='', cfg=1):
+        inputs = {}
+        inputs_uncond = {}
+        for te in self.get_text_encoders():
+            if isinstance(te, nn.Module):
+                te = te.to('cuda')
+            else:
+                te.load_model_if_needed()
+            call_text_encoder_fn = self.get_call_text_encoder_fn(te)
+            inputs.update(call_text_encoder_fn([prompt], is_video=[False]))
+            if cfg > 1:
+                inputs_uncond.update(call_text_encoder_fn([negative_prompt], is_video=[False]))
+            if isinstance(te, nn.Module):
+                te = te.to('cpu')
+            else:
+                model_management.unload_all_models()
+        self.conds = tuple(tensor.cuda() for tensor in self.get_conds(inputs))
+        if cfg > 1:
+            self.unconds = tuple(tensor.cuda() for tensor in self.get_conds(inputs_uncond))
+        self.sample_cfg = cfg
+
+    def get_call_vae_fn(self, vae):
+        def fn(images):
+            images = images.to('cuda', self.dtype)
+            latents = self.vae_encode(images)
+            return {'latents': latents}
+        return fn
+
     def configure_adapter(self, target_model, adapter_config):
         target_linear_modules = set()
         for name, module in target_model.named_modules():
@@ -206,10 +244,39 @@ class CommonPipeline:
             if p.requires_grad:
                 p.data = p.data.to(adapter_config['dtype'])
 
+    @torch.no_grad()
+    def sample(self, w=512, h=512):
+        x = torch.randn((1, self.channels, h//self.spatial_compression, w//self.spatial_compression), device='cuda')
+        timesteps = self.scheduler.timesteps
+        for i, step in enumerate(tqdm(timesteps, desc='Sampling')):
+            t = step / 1000
+            t = t.float().view(1)
+            inputs = (x, t, *self.conds)
+            v = self.pipeline_model(inputs).float()
+            if self.sample_cfg > 1:
+                inputs_uncond = (x, t, *self.unconds)
+                v_uncond = self.pipeline_model(inputs_uncond).float()
+                v = v_uncond + self.sample_cfg*(v - v_uncond)
+            x = self.scheduler.step(v, step, x, return_dict=False)[0]
+        vae = self.get_vae()
+        if isinstance(vae, nn.Module):
+            vae = vae.to('cuda')
+        else:
+            vae.load_model_if_needed()
+        img = self.vae_decode(x)
+        if isinstance(vae, nn.Module):
+            vae = vae.to('cpu')
+        else:
+            model_management.unload_all_models()
+        return img
+
 
 class BasePipeline(CommonPipeline):
     framerate = None
     pixels_round_to_multiple = 16
+
+    def __init__(self, *args, **kwargs):
+        super().__init__()
 
     def load_diffusion_model(self):
         pass
@@ -258,9 +325,6 @@ class BasePipeline(CommonPipeline):
 
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(self.config, support_video=False)
-
-    def get_call_vae_fn(self, vae):
-        raise NotImplementedError()
 
     def get_call_text_encoder_fn(self, text_encoder):
         raise NotImplementedError()
@@ -400,17 +464,11 @@ class ComfyPipeline(CommonPipeline):
     channels = 16
 
     def __init__(self, config):
+        super().__init__()
         self.config = config
         self.model_config = self.config['model']
+        self.dtype = self.model_config['dtype']
         self.latent_format = None
-
-        # sampling only
-        self.sample_steps = 20
-        self.sample_shift = 3
-        self.sample_cfg = 5
-        self.scheduler = FlowMatchEulerDiscreteScheduler(shift=self.sample_shift)
-        sigmas = torch.linspace(1.0, 1 / self.sample_steps, self.sample_steps)
-        self.scheduler.set_timesteps(sigmas=sigmas, device='cuda')
 
         # VAE
         def load_fn():
@@ -456,11 +514,39 @@ class ComfyPipeline(CommonPipeline):
 
             self.text_encoders.append(ModelWrapper(load_fn))
 
+    def dequantize(self, model, diffusion_model_dtype):
+        operations = comfy.ops.disable_weight_init
+        for mod_name, module in model.named_children():
+            is_quantized = False
+            for p_name, p in module.named_parameters(recurse=False):
+                if p.__class__.__name__ == 'QuantizedTensor':
+                    module.register_parameter(p_name, nn.Parameter(p.dequantize()))
+                    p = getattr(module, p_name)
+                    is_quantized = True
+
+                name = f'{mod_name}.{p_name}'
+                if any(keyword in name for keyword in self.keep_in_high_precision) or p.ndim == 1:
+                    continue
+                p.data = p.data.to(diffusion_model_dtype)
+
+            if is_quantized:
+                bias = module.bias is not None
+                with accelerate.init_empty_weights():
+                    new_linear = operations.Linear(module.in_features, module.out_features, bias=bias)
+                    new_linear.comfy_cast_weights = True  # model_patcher.set_model_compute_dtype() would normally set this
+                new_linear.weight = module.weight
+                if bias:
+                    new_linear.bias = module.bias
+                model._modules[mod_name] = new_linear
+
+            if len(list(module.children())) > 0:
+                self.dequantize(module, diffusion_model_dtype)
+
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
         model_options = {}
         model_options['dtype'] = dtype
-        model_patcher = comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options)
+        model_patcher = comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options, disable_dynamic=True)
 
         for adapter_path in self.model_config.get('merge_adapters', []):
             if is_main_process():
@@ -476,10 +562,7 @@ class ComfyPipeline(CommonPipeline):
         self.model_patcher = model_patcher
 
         diffusion_model_dtype = self.model_config.get('diffusion_model_dtype', dtype)
-        for name, p in self.diffusion_model.named_parameters():
-            if any(keyword in name for keyword in self.keep_in_high_precision) or p.ndim == 1:
-                continue
-            p.data = p.data.to(diffusion_model_dtype)
+        self.dequantize(self.diffusion_model, diffusion_model_dtype)
 
         self.diffusion_model.train()
         for name, p in self.diffusion_model.named_parameters():
@@ -491,6 +574,21 @@ class ComfyPipeline(CommonPipeline):
 
     def get_text_encoders(self):
         return self.text_encoders
+
+    def vae_encode(self, img):
+        # move channel dim to end
+        # works for both images (b c h w) and video (b c f h w)
+        img = img.movedim(1, -1)
+        # Pixels are in range [-1, 1], Comfy code expects [0, 1]
+        img = (img + 1) / 2
+        latents = self.vae.encode(img)
+        if self.latent_format is not None:
+            # some older models do this in prepare_inputs() so it can be None
+            latents = self.latent_format.process_in(latents)
+        return latents
+
+    def vae_decode(self, latents):
+        return self.vae.decode(latents)
 
     def configure_adapter(self, adapter_config):
         super().configure_adapter(self.diffusion_model, adapter_config)
@@ -531,23 +629,6 @@ class ComfyPipeline(CommonPipeline):
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(self.config, support_video=False)
 
-    def get_call_vae_fn(self, vae):
-        latent_format = self.latent_format
-        @torch.inference_mode()
-        def fn(images):
-            images = images.to('cuda')
-            # move channel dim to end
-            # works for both images (b c h w) and video (b c f h w)
-            images = images.movedim(1, -1)
-            # Pixels are in range [-1, 1], Comfy code expects [0, 1]
-            images = (images + 1) / 2
-            latents = vae.encode(images)
-            if latent_format is not None:
-                # some older models do this in prepare_inputs() so it can be None
-                latents = latent_format.process_in(latents)
-            return {'latents': latents}
-        return fn
-
     def get_call_text_encoder_fn(self, text_encoder):
         te_idx = None
         for i, te in enumerate(self.text_encoders):
@@ -578,7 +659,7 @@ class ComfyPipeline(CommonPipeline):
 
             o = text_encoder.encode_from_tokens_scheduled(tokens_dict)
 
-            text_embeds = o[0][0]
+            text_embeds = o[0][0].to(self.dtype)
             extra = o[0][1]
             attention_mask = extra['attention_mask']
             return {
@@ -593,40 +674,6 @@ class ComfyPipeline(CommonPipeline):
 
     def to_layers(self):
         raise NotImplementedError()
-
-    @torch.no_grad()
-    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
-    def sample(self, prompt, negative_prompt='', w=512, h=512, cfg=None):
-        cfg = cfg or self.sample_cfg
-        inputs = {}
-        inputs_uncond = {}
-        for te in self.get_text_encoders():
-            te.load_model_if_needed()
-            call_text_encoder_fn = self.get_call_text_encoder_fn(te)
-            inputs.update(call_text_encoder_fn([prompt], is_video=[False]))
-            if cfg > 1:
-                inputs_uncond.update(call_text_encoder_fn([negative_prompt], is_video=[False]))
-            model_management.unload_all_models()
-        conds = tuple(tensor.cuda() for tensor in self.get_conds(inputs))
-        if cfg > 1:
-            unconds = tuple(tensor.cuda() for tensor in self.get_conds(inputs_uncond))
-        x = torch.randn((1, self.channels, h//self.spatial_compression, w//self.spatial_compression), device='cuda')
-        timesteps = self.scheduler.timesteps
-        for step in tqdm(timesteps, desc='Sampling'):
-            t = step / 1000
-            t = t.view(1)
-            inputs = (x, t, *conds)
-            v = self.pipeline_model(inputs).float()
-            if cfg > 1:
-                inputs_uncond = (x, t, *unconds)
-                v_uncond = self.pipeline_model(inputs_uncond).float()
-                v = v_uncond + cfg*(v - v_uncond)
-            x = self.scheduler.step(v, step, x, return_dict=False)[0]
-        vae = self.vae
-        vae.load_model_if_needed()
-        img = vae.decode(x)
-        model_management.unload_all_models()
-        return img
 
     def model_specific_dataset_config_validation(self, dataset_config):
         pass
