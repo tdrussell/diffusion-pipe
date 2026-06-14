@@ -413,7 +413,8 @@ class GenericOptim(Optimizer):
 
                 # get momentum
                 numerator = self.get_numerator(group, state, p, state_device)
-                can_use_muon = numerator.ndim > 1
+                # exclude very low-rank weights from Muon
+                can_use_muon = (numerator.ndim > 1) and min(numerator.shape[-2:]) >= 32
                 muon = group['muon'] and can_use_muon
                 adamuon = group['adamuon'] and can_use_muon
                 normuon = group.get('normuon', False) and can_use_muon
