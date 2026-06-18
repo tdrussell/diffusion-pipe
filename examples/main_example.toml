@@ -77,6 +77,10 @@ activation_checkpointing = true
 # Use reentrant activation checkpointing method (set this in addition to `activation_checkpointing`). Might be required for some models
 # when using pipeline parallelism (pipeline_stages>1). Otherwise recommended to not use it.
 #reentrant_activation_checkpointing = true
+# Only upload to Hugging Face starting from this epoch (optional, defaults to 0)
+# upload_hf_from_epoch = 2
+# Your existing HF repo setting
+# huggingface_repo = 'lyogavin/godmodeai_game_ui_gray_out_kontext'
 
 # Controls how Deepspeed decides how to divide layers across GPUs. Probably don't change this.
 partition_method = 'parameters'
