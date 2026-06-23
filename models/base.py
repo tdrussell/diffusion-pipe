@@ -245,11 +245,12 @@ class CommonPipeline:
                 p.data = p.data.to(adapter_config['dtype'])
 
         # Better init for LoKr, avoids very small starting gradients that takes a long time to recover from.
-        for name, p in self.lora_model.named_parameters():
-            if 'lokr_w1.' in name:
-                nn.init.ones_(p)
-            elif 'lokr_w2.' in name:
-                nn.init.zeros_(p)
+        # TODO: decide if we want to do this
+        # for name, p in self.lora_model.named_parameters():
+        #     if 'lokr_w1.' in name:
+        #         nn.init.ones_(p)
+        #     elif 'lokr_w2.' in name:
+        #         nn.init.zeros_(p)
 
     @torch.no_grad()
     def sample(self, w=512, h=512):
