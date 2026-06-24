@@ -1,7 +1,7 @@
 # diffusion-pipe
 A pipeline parallel training script for diffusion models.
 
-Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4.
+Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Image 2.0, Wan2.1 (t2v and i2v), Chroma, HiDream, Stable Diffusion 3, Cosmos-Predict2, OmniGen2, Flux Kontext, Wan2.2, Qwen-Image, Qwen-Image-Edit, HunyuanImage-2.1, AuraFlow, Z-Image, HunyuanVideo-1.5, Flux 2 (Dev and Klein), Anima, Ernie-Image, LTX 2.3, Ideogram4, Krea 2.
 
 ## Features
 - Pipeline parallelism, for training models larger than can fit on a single GPU
@@ -13,7 +13,9 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
-- 2025-06-07
+- 2026-06-24
+  - Support Krea 2.
+- 2026-06-07
   - Remove attention masking from Flux2. The model is supposed to take the full 512 length text embeds even with padding.
     - This gives slightly lower starting loss, but seems to make almost no difference to the final trained result. Still, it should theoretically be better now.
     - Delete cache folder or use `--regenerate_cache` or else you might get Tensor shape errors from the old cached files.
@@ -35,10 +37,6 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
   - Change license to GPL-3 so I can use ComfyUI code. Going forward, model implementations will use ComfyUI backend code whenever possible.
     - ComfyUI submodule has been added. Make sure to run ```git submodule update``` after pulling.
   - Support Z-Image.
-- 2025-11-28
-  - Use new backend for caching latents and text embeddings. This allows near-instant loading of the cached dataset even for terabyte-scale datasets.
-    - It's recommended to manually delete the cache folder inside your dataset folders. You don't need to do this, but the old cached files will stay around and take up space.
-    - This is a fairly big change, if it causes problems for you, raise an issue.
 
 ## Windows support
 It will be difficult or impossible to make training work on native Windows. This is because Deepspeed only has [partial Windows support](https://github.com/microsoft/DeepSpeed/blob/master/blogs/windows/08-2024/README.md). Deepspeed is a hard requirement because the entire training script is built around Deepspeed pipeline parallelism. However, it will work on Windows Subsystem for Linux, specifically WSL 2. If you must use Windows I recommend trying WSL 2.

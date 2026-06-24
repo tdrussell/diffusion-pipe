@@ -240,7 +240,7 @@ class SizeBucketDataset:
             regenerate_cache=regenerate_cache,
             caching_batch_size=caching_batch_size,
         )
-        assert len(self.latent_dataset) == len(self.metadata_dataset)
+        assert len(self.latent_dataset) == len(self.metadata_dataset), (len(self.latent_dataset), len(self.metadata_dataset))
 
         iteration_order_cache_dir = self.cache_dir / 'iteration_order'
 

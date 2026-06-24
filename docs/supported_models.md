@@ -26,6 +26,7 @@
 |Anima           |✅    |✅              |✅                |
 |LTX 2.3         |✅    |❌              |✅                |
 |Ideogram4       |✅    |✅              |✅                |
+|Krea 2          |✅    |✅              |✅                |
 
 
 ## SDXL
@@ -614,3 +615,18 @@ timestep_sample_method = 'logit_normal'
 shift = 3
 ```
 This configuration should train a LoRA with 24GB VRAM. Models are saved in ComfyUI format.
+
+## Krea 2
+```
+[model]
+type = 'krea2'
+diffusion_model = '/data2/imagegen_models/comfyui-models/krea2_raw.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/qwen_image_vae.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_4b_bf16.safetensors', type = 'krea2'}
+]
+dtype = 'bfloat16'
+diffusion_model_dtype = 'float8'
+timestep_sample_method = 'logit_normal'
+```
+This configuration can train a rank 32 LoRA at 512 resolution with 24GB VRAM.

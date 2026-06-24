@@ -168,6 +168,13 @@ class PreprocessMediaFile:
 
 # shared functionality between BasePipeline and ComfyPipeline
 class CommonPipeline:
+    framerate = None
+    pixels_round_to_multiple = 16
+    keep_in_high_precision = []
+    spatial_compression = 8
+    channels = 16
+    is_video_vae = False
+
     def __init__(self, *args, **kwargs):
         # sampling only
         self.sample_steps = 20
@@ -255,6 +262,8 @@ class CommonPipeline:
     @torch.no_grad()
     def sample(self, w=512, h=512):
         x = torch.randn((1, self.channels, h//self.spatial_compression, w//self.spatial_compression), device='cuda')
+        if self.is_video_vae:
+            x = x.unsqueeze(2)
         timesteps = self.scheduler.timesteps
         for i, step in enumerate(tqdm(timesteps, desc='Sampling')):
             t = step / 1000
@@ -276,13 +285,13 @@ class CommonPipeline:
             vae = vae.to('cpu')
         else:
             model_management.unload_all_models()
+        if img.ndim == 5:
+            # in case of video VAE
+            img = img.squeeze(1)
         return img
 
 
 class BasePipeline(CommonPipeline):
-    framerate = None
-    pixels_round_to_multiple = 16
-
     def __init__(self, *args, **kwargs):
         super().__init__()
 
@@ -465,12 +474,6 @@ SD1Tokenizer.tokenize_with_weights = tokenize_with_weights
 
 
 class ComfyPipeline(CommonPipeline):
-    framerate = None
-    pixels_round_to_multiple = 16
-    keep_in_high_precision = []
-    spatial_compression = 8
-    channels = 16
-
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -596,6 +599,8 @@ class ComfyPipeline(CommonPipeline):
         return latents
 
     def vae_decode(self, latents):
+        if self.latent_format is not None:
+            latents = self.latent_format.process_out(latents)
         return self.vae.decode(latents)
 
     def configure_adapter(self, adapter_config):
@@ -649,6 +654,7 @@ class ComfyPipeline(CommonPipeline):
         @torch.inference_mode()
         def fn(captions: list[str], is_video: list[bool]):
             tokenizer = getattr(text_encoder.tokenizer, text_encoder.tokenizer.clip)
+            original_min_length = tokenizer.min_length
 
             max_length = 0
             for text in captions:
@@ -669,7 +675,13 @@ class ComfyPipeline(CommonPipeline):
 
             text_embeds = o[0][0].to(self.dtype)
             extra = o[0][1]
-            attention_mask = extra['attention_mask']
+            if 'attention_mask' in extra:
+                attention_mask = extra['attention_mask']
+            else:
+                # Krea2 (maybe others) removes attention_mask if it is all 1s (e.g. batch size 1)
+                attention_mask = torch.ones(text_embeds.shape[:2], dtype=torch.int64, device=text_embeds.device)
+
+            tokenizer.min_length = original_min_length
             return {
                 f'text_embeds_{te_idx}': text_embeds,
                 f'attention_mask_{te_idx}': attention_mask,
