@@ -152,9 +152,6 @@ class InitialLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        for item in inputs:
-            if torch.is_floating_point(item):
-                item.requires_grad_(True)
         x, timesteps, context, attention_mask = inputs
         b5, c5, t5, h5, w5 = x.shape
         x = x.reshape(b5 * t5, c5, h5, w5)
@@ -198,7 +195,12 @@ class InitialLayer(nn.Module):
 
         freqs = self.pe_embedder(pos)
 
-        return make_contiguous(combined, t, tvec, freqs, attention_mask, sizes)
+        outputs = make_contiguous(combined, t, tvec, freqs, attention_mask, sizes)
+        for item in outputs:
+            if torch.is_floating_point(item):
+                item.requires_grad_(True)
+
+        return outputs
 
 
 class TransformerLayer(nn.Module):
