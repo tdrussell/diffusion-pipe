@@ -193,7 +193,7 @@ class InitialLayer(nn.Module):
         x = x * output_image_mask
         h = self.input_proj(x) * output_image_mask
 
-        t_cond = self.t_embedding(t)
+        t_cond = self.t_embedding(t, dtype=x.dtype)
         if t.dim() == 1:
             t_cond = t_cond.unsqueeze(1)
         adaln_input = F.silu(self.adaln_proj(t_cond))
