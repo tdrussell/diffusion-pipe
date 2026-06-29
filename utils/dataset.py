@@ -646,7 +646,7 @@ class DirectoryDataset:
             mask_files = []
             control_files = []
             for file in tqdm(files):
-                if not file.is_file() or file.suffix == '.txt' or file.suffix == '.npz' or file.suffix == '.json' or file.suffix == '.parquet' or file.suffix == '.bak':
+                if not file.is_file() or file.suffix in ('.txt', '.npz', '.json', '.parquet', '.bak', '.db'):
                     continue
                 for image_spec in process_file(file):
                     image_file = Path(image_spec[1])
