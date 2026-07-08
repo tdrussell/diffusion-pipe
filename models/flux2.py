@@ -93,10 +93,15 @@ class Flux2Pipeline(ComfyPipeline):
             elif len(args) == 2:
                 # Control image provided (for reference conditioning)
                 tensor, control_tensor = args
-                # Encode both using parent's method
                 result = parent_vae_fn(tensor)
-                control_result = parent_vae_fn(control_tensor)
-                result['control_latents'] = control_result['latents']
+                if control_tensor.ndim == tensor.ndim + 1:
+                    bs, num_controls = control_tensor.shape[:2]
+                    control_tensor = control_tensor.flatten(0, 1)
+                    control_result = parent_vae_fn(control_tensor)
+                    result['control_latents'] = control_result['latents'].unflatten(0, (bs, num_controls))
+                else:
+                    control_result = parent_vae_fn(control_tensor)
+                    result['control_latents'] = control_result['latents']
                 return result
             else:
                 raise RuntimeError(f'Unexpected number of args: {len(args)}')
@@ -173,10 +178,19 @@ class Flux2Pipeline(ComfyPipeline):
         extra_inputs = ()
         if 'control_latents' in inputs:
             control_latents = inputs['control_latents'].float()
-            control_latents = self.model_patcher.model.process_latent_in(control_latents)
-            assert control_latents.shape == latents.shape, (
-                f"Control latents shape {control_latents.shape} doesn't match latents shape {latents.shape}"
-            )
+            if control_latents.ndim == latents.ndim + 1:
+                control_latents = torch.stack([
+                    self.model_patcher.model.process_latent_in(control_latents[:, i])
+                    for i in range(control_latents.shape[1])
+                ], dim=1)
+                assert control_latents.shape[0] == bs and control_latents.shape[2:] == latents.shape[1:], (
+                    f"Control latents shape {control_latents.shape} doesn't match latents shape {latents.shape}"
+                )
+            else:
+                control_latents = self.model_patcher.model.process_latent_in(control_latents)
+                assert control_latents.shape == latents.shape, (
+                    f"Control latents shape {control_latents.shape} doesn't match latents shape {latents.shape}"
+                )
             extra_inputs = (control_latents,)
 
         return (noisy_latents, t, *conds) + extra_inputs, (target, mask)
@@ -266,13 +280,21 @@ class InitialLayer(nn.Module):
         img, img_ids = self.process_img(x)
 
         # Process control latents if present
+        control_imgs = []
+        control_img_ids = []
         if has_control:
             control_latents = extra[0]
-            control_img, control_img_ids = self.process_img(control_latents, index=self.params.ref_index_scale)
-            control_img_len = control_img.shape[1]
-            assert control_img_len == img.shape[1], (
-                f"Control image sequence length {control_img_len} doesn't match noisy image {img.shape[1]}"
-            )
+            if control_latents.ndim == x.ndim:
+                control_latents = control_latents.unsqueeze(1)
+            for i in range(control_latents.shape[1]):
+                index = self.params.ref_index_scale * (i + 1)
+                control_img, control_ids = self.process_img(control_latents[:, i], index=index)
+                control_img_len = control_img.shape[1]
+                assert control_img_len == img.shape[1], (
+                    f"Control image sequence length {control_img_len} doesn't match noisy image {img.shape[1]}"
+                )
+                control_imgs.append(control_img)
+                control_img_ids.append(control_ids)
 
         img_len = torch.tensor(img.shape[1], dtype=torch.int64, device=device)
 
@@ -284,13 +306,11 @@ class InitialLayer(nn.Module):
 
         img = self.img_in(img)
 
-        # Process control image with same img_in projection if present
+        # Process control images with same img_in projection if present
         if has_control:
-            control_img = self.img_in(control_img)
-            # Concatenate noisy image and control image along sequence dimension
-            img = torch.cat([img, control_img], dim=1)
-            # Update img_ids to include control image positions
-            img_ids = torch.cat([img_ids, control_img_ids], dim=1)
+            control_imgs = [self.img_in(control_img) for control_img in control_imgs]
+            img = torch.cat([img, *control_imgs], dim=1)
+            img_ids = torch.cat([img_ids, *control_img_ids], dim=1)
         vec = self.time_in(timestep_embedding(timesteps, 256).to(img.dtype))
         if self.params.guidance_embed:
             if guidance is not None:

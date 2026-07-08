@@ -13,6 +13,12 @@ path = '/home/anon/data/images/kontext/target'
 # The control/context images go in here, with the same name as the corresponding target images.
 # Every target image must have a corresponding control image or it will fail.
 control_path = '/home/anon/data/images/kontext/control'
+# For multi-image edit models, use control_paths instead. Every listed directory must
+# contain one matching control image for each target image.
+# control_paths = [
+#     '/home/anon/data/images/kontext/person_ref',
+#     '/home/anon/data/images/kontext/style_ref',
+# ]
 
 # You can train on normal t2i datasets at the same time. But they have to be in a different directory.
 
