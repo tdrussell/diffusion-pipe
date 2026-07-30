@@ -198,6 +198,7 @@ class LTX2Pipeline(ComfyPipeline):
         self.config = config
         self.model_config = self.config['model']
         self.latent_format = comfy.latent_formats.LTXAV()
+        self.dtype = self.model_config['dtype']
         self.framerate = 24  # TODO: configurable
 
         # VAE
