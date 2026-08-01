@@ -301,9 +301,16 @@ class QwenImagePipeline(BasePipeline):
             result = {'latents': latents}
             if len(args) == 2:
                 control_image = args[1]
-                control_latents = vae.encode(control_image.to(vae.device, vae.dtype)).latent_dist.mode()
-                control_latents = (control_latents - vae.latents_mean_tensor) / vae.latents_std_tensor
-                result['control_latents'] = control_latents
+                if control_image.ndim == image.ndim + 1:
+                    bs, num_controls = control_image.shape[:2]
+                    control_image = control_image.flatten(0, 1)
+                    control_latents = vae.encode(control_image.to(vae.device, vae.dtype)).latent_dist.mode()
+                    control_latents = (control_latents - vae.latents_mean_tensor) / vae.latents_std_tensor
+                    result['control_latents'] = control_latents.unflatten(0, (bs, num_controls))
+                else:
+                    control_latents = vae.encode(control_image.to(vae.device, vae.dtype)).latent_dist.mode()
+                    control_latents = (control_latents - vae.latents_mean_tensor) / vae.latents_std_tensor
+                    result['control_latents'] = control_latents
             return result
         return fn
 
@@ -351,13 +358,31 @@ class QwenImagePipeline(BasePipeline):
                 output_hidden_states=True,
             )
         else:
-            template = self.prompt_template_encode_edit
             drop_idx = self.prompt_template_encode_start_idx_edit
-            txt = [template.format(e) for e in prompt]
-            images = [
-                self.load_image_for_vlm(file)
-                for file in control_files
-            ]
+            if len(control_files) > 0 and isinstance(control_files[0], (list, tuple)):
+                control_files_per_prompt = control_files
+            else:
+                control_files_per_prompt = [[file] for file in control_files]
+            assert len(control_files_per_prompt) == len(prompt), (len(control_files_per_prompt), len(prompt))
+            if all(len(files) == 1 for files in control_files_per_prompt):
+                txt = [self.prompt_template_encode_edit.format(e) for e in prompt]
+                images = [
+                    self.load_image_for_vlm(files[0])
+                    for files in control_files_per_prompt
+                ]
+            else:
+                vision_tokens = [
+                    ''.join('<|vision_start|><|image_pad|><|vision_end|>' for _ in files)
+                    for files in control_files_per_prompt
+                ]
+                txt = [
+                    self.prompt_template_encode_edit.replace('<|vision_start|><|image_pad|><|vision_end|>', vision_token).format(e)
+                    for e, vision_token in zip(prompt, vision_tokens)
+                ]
+                images = [
+                    [self.load_image_for_vlm(file) for file in files]
+                    for files in control_files_per_prompt
+                ]
             model_inputs = self.processor(
                 text=txt,
                 images=images,
@@ -454,12 +479,21 @@ class QwenImagePipeline(BasePipeline):
 
         if 'control_latents' in inputs:
             control_latents = inputs['control_latents'].float()
-            control_latents = self._pack_latents(control_latents, bs, num_channels_latents, h, w)
-            assert control_latents.shape == latents.shape, (control_latents.shape, latents.shape)
+            if control_latents.ndim == latents.ndim:
+                control_latents = control_latents.unsqueeze(1)
+            assert control_latents.shape[0] == bs and control_latents.shape[2:] == inputs['latents'].shape[1:], (
+                control_latents.shape, inputs['latents'].shape
+            )
+            packed_control_latents = [
+                self._pack_latents(control_latents[:, i], bs, num_channels_latents, h, w)
+                for i in range(control_latents.shape[1])
+            ]
+            for control_latents_i in packed_control_latents:
+                assert control_latents_i.shape == latents.shape, (control_latents_i.shape, latents.shape)
             img_seq_len = torch.tensor(x_t.shape[1], device=x_t.device).repeat((bs,))
             extra = (img_seq_len,)
-            x_t = torch.cat([x_t, control_latents], dim=1)
-            img_shapes.append((1, h // 2, w // 2))
+            x_t = torch.cat([x_t, *packed_control_latents], dim=1)
+            img_shapes.extend([(1, h // 2, w // 2)] * len(packed_control_latents))
         else:
             extra = tuple()
 

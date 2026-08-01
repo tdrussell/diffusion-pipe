@@ -305,6 +305,8 @@ See the [Flux Kontext example dataset config](../examples/flux_kontext_dataset.t
 
 **IMPORTANT**: The control/context images should be approximately the same aspect ratio as the target images. All of the aspect ratio and size bucketing is done with respect to the target images. Then, the control image is resized and cropped to match the target image size. If the aspect ratio of the control image is very different from the target image, it will be cropping away a lot of the control image.
 
+For models that support multiple reference images per target, use ```control_paths``` instead of ```control_path```. Each directory in the list must contain files with stems matching the target images, and the images are passed to the model in list order.
+
 Flux Kontext LoRAs are saved in Diffusers format, which will work in ComfyUI.
 
 ## Wan2.2

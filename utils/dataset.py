@@ -476,6 +476,12 @@ class DirectoryDataset:
         self.path = Path(self.directory_config['path'])
         self.mask_path = Path(self.directory_config['mask_path']) if 'mask_path' in self.directory_config else None
         self.control_path = Path(self.directory_config['control_path']) if 'control_path' in self.directory_config else None
+        if self.control_path is not None and 'control_paths' in self.directory_config:
+            raise RuntimeError('control_path and control_paths are mutually exclusive')
+        control_paths = self.directory_config.get('control_paths', [])
+        if isinstance(control_paths, str):
+            raise RuntimeError('control_paths must be a list of directories, not a string')
+        self.control_paths = [Path(path) for path in control_paths]
         # For testing. Default if a mask is missing.
         self.default_mask_file = Path(self.directory_config['default_mask_file']) if 'default_mask_file' in self.directory_config else None
         self.cache_dir = self.path / 'cache' / self.model_name
@@ -488,6 +494,9 @@ class DirectoryDataset:
             raise RuntimeError(f'Invalid mask_path: {self.mask_path}')
         if self.control_path is not None and (not self.control_path.exists() or not self.control_path.is_dir()):
             raise RuntimeError(f'Invalid control_path: {self.control_path}')
+        for control_path in self.control_paths:
+            if not control_path.exists() or not control_path.is_dir():
+                raise RuntimeError(f'Invalid control_paths entry: {control_path}')
         if self.default_mask_file is not None and (not self.default_mask_file.exists() or not self.default_mask_file.is_file()):
             raise RuntimeError(f'Invalid default_mask_file: {self.default_mask_file}')
 
@@ -631,6 +640,10 @@ class DirectoryDataset:
             # Mask can have any extension, it just needs to have the same stem as the image.
             mask_file_stems = {path.stem: path for path in self.mask_path.glob('*') if path.is_file()} if self.mask_path is not None else {}
             control_file_stems = {path.stem: path for path in self.control_path.glob('*') if path.is_file()} if self.control_path is not None else {}
+            control_file_stems_list = [
+                {path.stem: path for path in control_path.glob('*') if path.is_file()}
+                for control_path in self.control_paths
+            ]
 
             def process_file(file):
                 if file.suffix != '.tar':
@@ -669,10 +682,17 @@ class DirectoryDataset:
                         if image_file.stem not in control_file_stems:
                             raise RuntimeError(f'No control file exists for image {image_file}')
                         control_files.append(str(control_file_stems[image_file.stem]))
+                    elif self.control_paths:
+                        control_files_for_image = []
+                        for control_path, stems in zip(self.control_paths, control_file_stems_list):
+                            if image_file.stem not in stems:
+                                raise RuntimeError(f'No control file exists for image {image_file} in {control_path}')
+                            control_files_for_image.append(str(stems[image_file.stem]))
+                        control_files.append(control_files_for_image)
             assert len(image_specs) > 0, f'Directory {self.path} had no images/videos!'
 
             d = {'image_spec': image_specs, 'caption_file': caption_files, 'mask_file': mask_files}
-            if self.control_path:
+            if self.control_path or self.control_paths:
                 d['control_file'] = control_files
             metadata_dataset = datasets.Dataset.from_dict(d)
 
@@ -760,7 +780,7 @@ class DirectoryDataset:
             if self.directory_config['shuffle_tags'] and self.shuffle == 0: # backwards compatibility
                 self.shuffle = 1
             captions = shuffle_captions(captions, self.shuffle, self.shuffle_delimiter, self.directory_config['caption_prefix'])
-            if self.control_path:
+            if self.control_path or self.control_paths:
                 empty_return['control_file'] = []
 
             if image_spec[0] is None:
@@ -828,7 +848,7 @@ class DirectoryDataset:
                 'size_bucket': [size_bucket],
                 'is_video': [is_video],
             }
-            if self.control_path:
+            if self.control_path or self.control_paths:
                 ret['control_file'] = [example['control_file'][0]]
             return ret
 
@@ -1076,10 +1096,17 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
             captions.extend([caption] * len(items))
             if is_edit_dataset:
                 control_file = example['control_file'][i]
-                control_items = preprocess_media_file_fn((None, control_file), None, size_bucket)
-                assert len(control_items) == 1
+                control_files = control_file if isinstance(control_file, list) else [control_file]
+                control_tensors = []
+                for file in control_files:
+                    control_items = preprocess_media_file_fn((None, file), None, size_bucket)
+                    assert len(control_items) == 1
+                    control_tensors.append(control_items[0][0])
                 assert len(items) == 1
-                control_tensors_and_masks.append(control_items[0])
+                if len(control_tensors) == 1:
+                    control_tensors_and_masks.append(control_tensors[0])
+                else:
+                    control_tensors_and_masks.append(torch.stack(control_tensors))
             else:
                 control_tensors_and_masks.append(None)
 
@@ -1091,7 +1118,7 @@ def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, rege
         results = defaultdict(list)
         for i in range(0, len(tensors_and_masks), caching_batch_size):
             tensor = torch.stack([t[0] for t in tensors_and_masks[i:i+caching_batch_size]])
-            c_tensor = torch.stack([t[0] for t in control_tensors_and_masks[i:i+caching_batch_size]]) if is_edit_dataset else None
+            c_tensor = torch.stack(control_tensors_and_masks[i:i+caching_batch_size]) if is_edit_dataset else None
             if rank not in pipes:
                 pipes[rank] = mp.Pipe(duplex=False)
             parent_conn, child_conn = pipes[rank]
