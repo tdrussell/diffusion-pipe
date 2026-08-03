@@ -550,8 +550,20 @@ class ComfyPipeline(CommonPipeline):
                     new_linear.bias = module.bias
                 model._modules[mod_name] = new_linear
 
-            if len(list(module.children())) > 0:
-                self.dequantize(module, diffusion_model_dtype)
+            self.dequantize(module, diffusion_model_dtype)
+
+    def patch_model(self, model):
+        # For every class that acts like a Linear but isn't a nn.Linear (e.g. quant linear), force it to be a nn.Linear
+        # subclass so that we can target it with LoRA.
+        linear_classes = set()
+        for module in model.modules():
+            if module.__class__.__name__ == 'Linear' and not isinstance(module, nn.Linear):
+                linear_classes.add(module.__class__)
+        for klass in linear_classes:
+            bases = klass.__bases__
+            assert bases[0] == nn.Module
+            klass.__bases__ = (nn.Linear, *bases[1:])
+        return len(linear_classes) > 0
 
     def load_diffusion_model(self):
         dtype = self.model_config['dtype']
@@ -572,13 +584,17 @@ class ComfyPipeline(CommonPipeline):
         self.diffusion_model = model_patcher.model.diffusion_model
         self.model_patcher = model_patcher
 
-        diffusion_model_dtype = self.model_config.get('diffusion_model_dtype', dtype)
-        self.dequantize(self.diffusion_model, diffusion_model_dtype)
+        if diffusion_model_dtype := self.model_config.get('diffusion_model_dtype', None):
+            self.dequantize(self.diffusion_model, diffusion_model_dtype)
 
         self.diffusion_model.train()
         for name, p in self.diffusion_model.named_parameters():
             p.original_name = name
             p.requires_grad_(True)
+
+        patched_something = self.patch_model(self.diffusion_model)
+        if patched_something:
+            assert 'adapter' in self.config, 'You are trying to full finetune a quantized model which will not work'
 
     def get_vae(self):
         return self.vae
