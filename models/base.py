@@ -563,6 +563,10 @@ class ComfyPipeline(CommonPipeline):
             bases = klass.__bases__
             assert bases[0] == nn.Module
             klass.__bases__ = (nn.Linear, *bases[1:])
+            # Get rid of the special quant state dict saving/loading so Deepspeed checkpointing works. We only can train adapters on top
+            # of quantized weights, so the base model weights never need to be saved / loaded in checkpoints anyway.
+            del klass.state_dict
+            del klass._load_from_state_dict
         return len(linear_classes) > 0
 
     def load_diffusion_model(self):
