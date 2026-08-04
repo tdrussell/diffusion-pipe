@@ -55,68 +55,84 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
         if 'lora' in module_to_cuda_name:
             continue
-        if hasattr(module_to_cuda, "weight") and module_to_cuda.weight is not None:
-            module_to_cpu = modules_to_cpu.get(module_to_cuda_name, None)
-            if module_to_cpu is not None and module_to_cpu.weight.shape == module_to_cuda.weight.shape:
-                weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
+        if (weight_to_cuda := getattr(module_to_cuda, 'weight', None)) is not None:
+            weight_to_cpu = modules_to_cpu[module_to_cuda_name].weight if module_to_cuda_name in modules_to_cpu else None
+            if weight_to_cpu is not None and weight_to_cpu.shape == weight_to_cuda.shape:
+                if hasattr(weight_to_cuda, '_qdata'):
+                    weight_swap_jobs.append((weight_to_cpu, weight_to_cuda, weight_to_cpu._qdata))
+                else:
+                    weight_swap_jobs.append((weight_to_cpu, weight_to_cuda, weight_to_cpu.data))
             else:
-                if module_to_cuda.weight.data.device.type != device.type:
+                if weight_to_cuda.data.device.type != device.type:
                     # print(
                     #     f"Module {module_to_cuda_name} not found in CPU model or shape mismatch, so not swapping and moving to device"
                     # )
-                    module_to_cuda.weight.data = module_to_cuda.weight.data.to(device)
+                    if hasattr(weight_to_cuda, '_qdata'):
+                        weight_to_cuda._qdata = weight_to_cuda._qdata.to(device)
+                    else:
+                        weight_to_cuda.data = weight_to_cuda.data.to(device)
 
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         # cuda to cpu
-        for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
+        for weight_to_cpu, weight_to_cuda, cuda_data_view in weight_swap_jobs:
             cuda_data_view.record_stream(stream)
-            module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
+            if hasattr(weight_to_cpu, '_qdata'):
+                weight_to_cpu._qdata = cuda_data_view.to("cpu", non_blocking=True)
+            else:
+                weight_to_cpu.data = cuda_data_view.to("cpu", non_blocking=True)
 
         stream.synchronize()
 
         # cpu to cuda
-        for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-            cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
-            module_to_cuda.weight.data = cuda_data_view
+        for weight_to_cpu, weight_to_cuda, cuda_data_view in weight_swap_jobs:
+            if hasattr(weight_to_cuda, '_qdata'):
+                cuda_data_view.copy_(weight_to_cuda._qdata, non_blocking=True)
+                weight_to_cuda._qdata = cuda_data_view
+            else:
+                cuda_data_view.copy_(weight_to_cuda.data, non_blocking=True)
+                weight_to_cuda.data = cuda_data_view
 
     stream.synchronize()
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
 
-def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
-    """
-    not tested
-    """
-    assert layer_to_cpu.__class__ == layer_to_cuda.__class__
+# def swap_weight_devices_no_cuda(device: torch.device, layer_to_cpu: nn.Module, layer_to_cuda: nn.Module):
+#     """
+#     not tested
+#     """
+#     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
-    weight_swap_jobs = []
-    for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
-        if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
-            weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
+#     weight_swap_jobs = []
+#     for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
+#         if hasattr(module_to_cpu, "weight") and module_to_cpu.weight is not None:
+#             weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
 
-    # device to cpu
-    for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-        module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
+#     # device to cpu
+#     for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
+#         module_to_cpu.weight.data = cuda_data_view.data.to("cpu", non_blocking=True)
 
-    synchronize_device()
+#     synchronize_device()
 
-    # cpu to device
-    for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
-        cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
-        module_to_cuda.weight.data = cuda_data_view
+#     # cpu to device
+#     for module_to_cpu, module_to_cuda, cuda_data_view, cpu_data_view in weight_swap_jobs:
+#         cuda_data_view.copy_(module_to_cuda.weight.data, non_blocking=True)
+#         module_to_cuda.weight.data = cuda_data_view
 
-    synchronize_device()
+#     synchronize_device()
 
 
 def weights_to_device(layer: nn.Module, device: torch.device):
     for name, module in layer.named_modules():
         if device.type == 'cpu' and 'lora' in name:
             continue
-        if hasattr(module, "weight") and module.weight is not None:
-            module.weight.data = module.weight.data.to(device, non_blocking=True)
+        if (weight := getattr(module, 'weight', None)) is not None:
+            if hasattr(weight, '_qdata'):
+                weight._qdata = weight._qdata.to(device, non_blocking=True)
+            else:
+                weight.data = weight.data.to(device, non_blocking=True)
 
 
 class Offloader:
@@ -141,7 +157,8 @@ class Offloader:
         if self.cuda_available:
             swap_weight_devices_cuda(self.device, block_to_cpu, block_to_cuda)
         else:
-            swap_weight_devices_no_cuda(self.device, block_to_cpu, block_to_cuda)
+            #swap_weight_devices_no_cuda(self.device, block_to_cpu, block_to_cuda)
+            raise NotImplementedError()
 
     def _submit_move_blocks(self, block_idx_to_cpu, block_idx_to_cuda):
         def move_blocks(bidx_to_cpu, block_to_cpu, bidx_to_cuda, block_to_cuda):
