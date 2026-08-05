@@ -28,6 +28,8 @@ from comfy.sd1_clip import SD1Tokenizer
 from comfy import model_management
 # Avoids using comfy_kitchen RoPE implementations that don't have backward defined
 model_management.in_training = True
+# Increase this from the default. I OOM on text embedding caching on Minimax without this.
+model_management.EXTRA_RESERVED_VRAM = 2000 * 1024 * 1024
 
 
 def make_contiguous(*tensors):
@@ -93,6 +95,9 @@ class PreprocessMediaFile:
         for tar_f in self.tarfile_map.values():
             tar_f.close()
 
+    def align_frames(self, frames):
+        return round_down_to_multiple(frames - 1, self.round_frames) + 1
+
     def __call__(self, spec, mask_filepath, size_bucket=None):
         is_video = (Path(spec[1]).suffix in VIDEO_EXTENSIONS)
 
@@ -126,7 +131,7 @@ class PreprocessMediaFile:
 
         height_rounded = round_to_nearest_multiple(size_bucket_height, self.round_height)
         width_rounded = round_to_nearest_multiple(size_bucket_width, self.round_width)
-        frames_rounded = round_down_to_multiple(size_bucket_frames - 1, self.round_frames) + 1
+        frames_rounded = self.align_frames(size_bucket_frames)
         resize_wh = (width_rounded, height_rounded)
 
         if mask_filepath:
@@ -213,15 +218,18 @@ class CommonPipeline:
             return {'latents': latents}
         return fn
 
-    def configure_adapter(self, target_model, adapter_config):
-        target_linear_modules = set()
+    def get_target_modules(self, target_model):
+        target_modules = set()
         for name, module in target_model.named_modules():
             if module.__class__.__name__ not in self.adapter_target_modules:
                 continue
             for full_submodule_name, submodule in module.named_modules(prefix=name):
                 if isinstance(submodule, nn.Linear):
-                    target_linear_modules.add(full_submodule_name)
-        target_linear_modules = list(target_linear_modules)
+                    target_modules.add(full_submodule_name)
+        return list(target_modules)
+
+    def configure_adapter(self, target_model, adapter_config):
+        target_modules = self.get_target_modules(target_model)
 
         adapter_type = adapter_config['type']
         if adapter_type == 'lora':
@@ -230,7 +238,7 @@ class CommonPipeline:
                 lora_alpha=adapter_config['alpha'],
                 lora_dropout=adapter_config['dropout'],
                 bias='none',
-                target_modules=target_linear_modules,
+                target_modules=target_modules,
             )
         elif adapter_type == 'lokr':
             peft_config = peft.LoKrConfig(
@@ -238,7 +246,7 @@ class CommonPipeline:
                 decompose_factor=adapter_config['decompose_factor'],
                 alpha=adapter_config['alpha'],
                 rank_dropout=adapter_config['rank_dropout'],
-                target_modules=target_linear_modules,
+                target_modules=target_modules,
             )
         else:
             raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
@@ -473,6 +481,17 @@ def tokenize_with_weights(self, text:str, return_word_ids=False, **kwargs):
 SD1Tokenizer.tokenize_with_weights = tokenize_with_weights
 
 
+def maybe_pad(tokens, min_length, tokenizer):
+    amount = min_length - len(tokens)
+    if amount <= 0:
+        return
+    if tokenizer.pad_left:
+        for _ in range(amount):
+            tokens.insert(0, (tokenizer.pad_token, 1.0))
+    else:
+        tokens.extend([(tokenizer.pad_token, 1.0)] * amount)
+
+
 class ComfyPipeline(CommonPipeline):
     def __init__(self, config):
         super().__init__()
@@ -552,7 +571,7 @@ class ComfyPipeline(CommonPipeline):
 
             self.dequantize(module, diffusion_model_dtype)
 
-    def patch_model(self, model):
+    def patch_quantized_modules(self, model):
         # For every class that acts like a Linear but isn't a nn.Linear (e.g. quant linear), force it to be a nn.Linear
         # subclass so that we can target it with LoRA.
         linear_classes = set()
@@ -575,7 +594,9 @@ class ComfyPipeline(CommonPipeline):
         model_options['dtype'] = dtype
         model_patcher = comfy.sd.load_diffusion_model(self.model_config['diffusion_model'], model_options=model_options, disable_dynamic=True)
 
+        merging_adapter = False
         for adapter_path in self.model_config.get('merge_adapters', []):
+            merging_adapter = True
             if is_main_process():
                 print(f'Merging adapter {adapter_path}')
             sd = comfy.utils.load_torch_file(adapter_path, safe_load=True)
@@ -584,9 +605,15 @@ class ComfyPipeline(CommonPipeline):
 
         model_patcher.set_model_compute_dtype(dtype)
         with torch.no_grad():
-            model_patcher.patch_model()
+            # Use a few GB of VRAM in case we are merging an adapter (compute intensive).
+            if merging_adapter:
+                model_patcher.patch_model(device_to='cuda', lowvram_model_memory=4*(1024**3))
+            # But ONLY if we have an adapter to merge, else block swapping fails with a CUDA error (???)
+            else:
+                model_patcher.patch_model()
         self.diffusion_model = model_patcher.model.diffusion_model
-        self.model_patcher = model_patcher
+        # If we merged an adapter, this object stores an entire extra copy of the weights, so delete it now.
+        del model_patcher
 
         if diffusion_model_dtype := self.model_config.get('diffusion_model_dtype', None):
             self.dequantize(self.diffusion_model, diffusion_model_dtype)
@@ -596,7 +623,7 @@ class ComfyPipeline(CommonPipeline):
             p.original_name = name
             p.requires_grad_(True)
 
-        patched_something = self.patch_model(self.diffusion_model)
+        patched_something = self.patch_quantized_modules(self.diffusion_model)
         if patched_something:
             assert 'adapter' in self.config, 'You are trying to full finetune a quantized model which will not work'
 
@@ -689,7 +716,9 @@ class ComfyPipeline(CommonPipeline):
             for text in captions:
                 tokens = text_encoder.tokenize(text)
                 for k, v in tokens.items():
-                    tokens_dict[k].extend(v)
+                    token_list = v[0]
+                    maybe_pad(token_list, max_length, tokenizer)  # some tokenizers don't listen to min_length
+                    tokens_dict[k].append(token_list)
 
             o = text_encoder.encode_from_tokens_scheduled(tokens_dict)
 

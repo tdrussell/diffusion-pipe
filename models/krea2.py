@@ -31,44 +31,15 @@ class Krea2Pipeline(ComfyPipeline):
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
     # override this to target the txtmlp weights with LoRA
-    def configure_adapter(self, adapter_config):
-        target_model = self.diffusion_model
-        target_linear_modules = set()
+    def get_target_modules(self, target_model):
+        target_modules = set()
         for name, module in target_model.named_modules():
             if (module.__class__.__name__ not in self.adapter_target_modules) and ('txtmlp' not in name):
                 continue
             for full_submodule_name, submodule in module.named_modules(prefix=name):
                 if isinstance(submodule, nn.Linear):
-                    target_linear_modules.add(full_submodule_name)
-        target_linear_modules = list(target_linear_modules)
-
-        adapter_type = adapter_config['type']
-        if adapter_type == 'lora':
-            peft_config = peft.LoraConfig(
-                r=adapter_config['rank'],
-                lora_alpha=adapter_config['alpha'],
-                lora_dropout=adapter_config['dropout'],
-                bias='none',
-                target_modules=target_linear_modules,
-            )
-        elif adapter_type == 'lokr':
-            peft_config = peft.LoKrConfig(
-                r=adapter_config['rank'],
-                decompose_factor=adapter_config['decompose_factor'],
-                alpha=adapter_config['alpha'],
-                rank_dropout=adapter_config['rank_dropout'],
-                target_modules=target_linear_modules,
-            )
-        else:
-            raise NotImplementedError(f'Adapter type {adapter_type} is not implemented')
-        self.peft_config = peft_config
-        self.lora_model = peft.get_peft_model(target_model, peft_config)
-        if is_main_process():
-            self.lora_model.print_trainable_parameters()
-        for name, p in target_model.named_parameters():
-            p.original_name = name
-            if p.requires_grad:
-                p.data = p.data.to(adapter_config['dtype'])
+                    target_modules.add(full_submodule_name)
+        return list(target_modules)
 
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFile(

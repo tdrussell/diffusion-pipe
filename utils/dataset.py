@@ -915,6 +915,7 @@ class DirectoryDataset:
             cache_file_prefix=f'uncond_text_embeddings_{i}_',
             regenerate_cache=regenerate_cache,
         )
+        self.uncond_dict = uncond_text_embeddings_ds[0]
         for size_bucket_ds in self.get_size_bucket_datasets():
             size_bucket_ds.uncond_text_embeddings.append(uncond_text_embeddings_ds)
 
@@ -1042,6 +1043,8 @@ class Dataset:
     def cache_text_embeddings(self, map_fn, i, regenerate_cache=False, caching_batch_size=1):
         for ds in self.directory_datasets:
             ds.cache_text_embeddings(map_fn, i, regenerate_cache=regenerate_cache, caching_batch_size=caching_batch_size)
+        # some techniques need access to the uncond
+        self.model.uncond_dict = self.directory_datasets[0].uncond_dict
 
 
 def _cache_fn(datasets, queue, preprocess_media_file_fn, num_text_encoders, regenerate_cache, trust_cache, caching_batch_size):
