@@ -53,6 +53,7 @@ class WanModelFromSafetensors(WanModel):
 
 
 def vae_encode(tensor, vae):
+    tensor = tensor*2 - 1
     return vae.model.encode(tensor, vae.scale)
 
 

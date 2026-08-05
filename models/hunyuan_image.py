@@ -163,7 +163,9 @@ class HunyuanImagePipeline(BasePipeline):
 
     def get_call_vae_fn(self, vae):
         def fn(image):
-            latents = vae.encode(image.to(vae.device, vae.dtype)).latent_dist.mode()
+            image = image.to(vae.device, vae.dtype)
+            image = image*2 - 1
+            latents = vae.encode(image).latent_dist.mode()
             assert latents.ndim == 4
             latents = latents * vae.config.scaling_factor
             result = {'latents': latents}

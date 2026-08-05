@@ -296,12 +296,16 @@ class QwenImagePipeline(BasePipeline):
     def get_call_vae_fn(self, vae):
         def fn(*args):
             image = args[0]
-            latents = vae.encode(image.to(vae.device, vae.dtype)).latent_dist.mode()
+            image = image.to(vae.device, vae.dtype)
+            image = image*2 - 1
+            latents = vae.encode(image).latent_dist.mode()
             latents = (latents - vae.latents_mean_tensor) / vae.latents_std_tensor
             result = {'latents': latents}
             if len(args) == 2:
                 control_image = args[1]
-                control_latents = vae.encode(control_image.to(vae.device, vae.dtype)).latent_dist.mode()
+                control_image = control_image.to(vae.device, vae.dtype)
+                control_image = control_image*2 - 1
+                control_latents = vae.encode(control_image).latent_dist.mode()
                 control_latents = (control_latents - vae.latents_mean_tensor) / vae.latents_std_tensor
                 result['control_latents'] = control_latents
             return result

@@ -117,7 +117,9 @@ def vae_encode(tensor, vae):
     p = next(vae.encoder.parameters())
     # TODO: the official code would call vae.encode_image() when it detects frames=1.
     # Should we use the image encoder (separate model)?
-    return vae.encode(tensor.to(p.device, p.dtype))
+    tensor = tensor.to(p.device, p.dtype)
+    tensor = tensor*2 - 1
+    return vae.encode(tensor)
 
 
 def dataset_config_validation(config):

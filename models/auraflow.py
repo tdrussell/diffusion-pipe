@@ -88,6 +88,7 @@ class AuraFlowPipeline(BasePipeline):
         def fn(image):
             p = next(vae.parameters())
             image = image.to(p.device, p.dtype)
+            image = image*2 - 1
             latents = vae.encode(image.to(vae.device, vae.dtype)).latent_dist.mode()
             if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
                 latents = latents - vae.config.shift_factor

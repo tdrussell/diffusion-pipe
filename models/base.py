@@ -80,7 +80,7 @@ class PreprocessMediaFile:
         self.config = config
         self.video_clip_mode = config.get('video_clip_mode', 'single_beginning')
         print(f'using video_clip_mode={self.video_clip_mode}')
-        self.pil_to_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
+        self.pil_to_tensor = transforms.Compose([transforms.ToTensor()])
         self.support_video = support_video
         self.framerate = framerate
         print(f'using framerate={self.framerate}')
@@ -637,8 +637,6 @@ class ComfyPipeline(CommonPipeline):
         # move channel dim to end
         # works for both images (b c h w) and video (b c f h w)
         img = img.movedim(1, -1)
-        # Pixels are in range [-1, 1], Comfy code expects [0, 1]
-        img = (img + 1) / 2
         latents = self.vae.encode(img)
         if self.latent_format is not None:
             # some older models do this in prepare_inputs() so it can be None
