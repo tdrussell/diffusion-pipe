@@ -417,10 +417,6 @@ if __name__ == '__main__':
     elif isinstance(eval_image_micro_batch_size_per_gpu, list):
         eval_image_micro_batch_size_per_gpu = {x[0]: x[1] for x in eval_image_micro_batch_size_per_gpu}
 
-    if model_type == 'minimax_h3':
-        if not all(x == 1 for x in (micro_batch_size_per_gpu, eval_micro_batch_size_per_gpu, image_micro_batch_size_per_gpu, eval_image_micro_batch_size_per_gpu)):
-            raise ValueError('Minimax H3 currently requires micro_batch_size_per_gpu=1')
-
     default_micro_batch_size_per_gpu = list(micro_batch_size_per_gpu.values())[0]
 
     gradient_release = config['optimizer'].get('gradient_release', False)
