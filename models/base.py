@@ -702,11 +702,14 @@ class ComfyPipeline(CommonPipeline):
             original_min_length = tokenizer.min_length
 
             max_length = 0
-            for text in captions:
+            token_lengths = [0]*len(captions)
+            for i, text in enumerate(captions):
                 tokens = text_encoder.tokenize(text)
                 # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
                 for v in tokens.values():
-                    max_length = max(max_length, len(v[0]))
+                    L = len(v[0])
+                    max_length = max(max_length, L)
+                    token_lengths[i] = L
 
             # Pad to max length in the batch. We need to do this ourselves or the ComfyUI backend code will fail (it concats tensors assumed to be the same length).
             tokenizer.min_length = max_length
@@ -725,8 +728,10 @@ class ComfyPipeline(CommonPipeline):
             if 'attention_mask' in extra:
                 attention_mask = extra['attention_mask']
             else:
-                # Krea2 (maybe others) removes attention_mask if it is all 1s (e.g. batch size 1)
-                attention_mask = torch.ones(text_embeds.shape[:2], dtype=torch.int64, device=text_embeds.device)
+                # Some models remove attention_mask if it is all 1s (Krea2), or don't return it at all
+                attention_mask = torch.zeros(text_embeds.shape[:2], dtype=torch.int64, device=text_embeds.device)
+                for i, L in enumerate(token_lengths):
+                    attention_mask[i, :L] = torch.ones((L,), dtype=torch.int64, device=text_embeds.device)
 
             tokenizer.min_length = original_min_length
             return {
