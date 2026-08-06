@@ -157,7 +157,7 @@ class PreprocessMediaFile:
             video = components.images  # [f, h, w, c]
             video = video.movedim(-1, 1)  # need [f, c, h, w]
             video = self.convert_framerate(video, float(components.frame_rate))
-            if self.support_audio:
+            if self.support_audio and components.audio is not None:
                 audio = components.audio['waveform']
                 sample_rate = components.audio['sample_rate']
                 audio = self.convert_audio_sample_rate(audio, sample_rate)
