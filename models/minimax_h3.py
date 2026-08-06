@@ -253,6 +253,9 @@ class MinimaxH3Pipeline(ComfyPipeline):
                 valid_audio.append(False)
         valid_audio = torch.tensor(valid_audio, device=device)
 
+        if audio_latents is None:
+            audio_latents = torch.empty((bs, 32, 2, 0), dtype=latents.dtype, device=device)
+
         conds = self.get_conds(inputs)
 
         if mask is not None:
@@ -329,7 +332,10 @@ class MinimaxH3Pipeline(ComfyPipeline):
             total_tokens = video_tokens + audio_tokens
             video_loss = video_loss.mean() * video_tokens / total_tokens
             audio_loss = audio_loss.mean() * audio_tokens / total_tokens
-            return video_loss + audio_loss
+            loss = video_loss
+            if audio_tokens > 0:  # avoid NaN for no audio
+                loss = loss + audio_loss
+            return loss
         return loss_fn
 
     def enable_block_swap(self, blocks_to_swap):
