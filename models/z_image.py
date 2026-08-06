@@ -24,6 +24,7 @@ class ZImagePipeline(ComfyPipeline):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.latent_format = comfy.latent_formats.Flux()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
     def to_layers(self):
@@ -36,7 +37,6 @@ class ZImagePipeline(ComfyPipeline):
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
-        latents = self.model_patcher.model.process_latent_in(latents)
         text_embeds = inputs['text_embeds_0']
         attention_mask = inputs['attention_mask_0']
         mask = inputs['mask']

@@ -1,5 +1,6 @@
 import os
 import sys
+import types
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import torch
@@ -7,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 import comfy_kitchen as ck
 
-from models.base import ComfyPipeline, make_contiguous, PreprocessMediaFile
+from models.base import ComfyPipeline, make_contiguous, PreprocessMediaFile, ModelWrapper
 from utils.common import AUTOCAST_DTYPE, get_lin_function, time_shift, one_at_a_time, round_down_to_multiple
 from utils.offloading import ModelOffloader
 import comfy.latent_formats
@@ -16,7 +17,7 @@ import comfy.ldm.minimax.model
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.minimax.model import (
     PackedLayout, time_shift_sigma, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP, patchify_video, pack_audio,
-    rope_rotation_table, unpatchify_video, unpack_audio, time_shift_slope
+    rope_rotation_table, unpatchify_video, unpack_audio
 )
 
 FRAMERATE = 24  # fixed for this model
@@ -86,7 +87,7 @@ comfy.ldm.minimax.model.Attention = Attention
 
 class PreprocessMediaFileMinimax(PreprocessMediaFile):
     def __init__(self, config):
-        super().__init__(config, support_video=True, framerate=FRAMERATE, round_height=32, round_width=32)
+        super().__init__(config, support_video=True, support_audio=True, framerate=FRAMERATE, audio_sample_rate=32000, round_height=32, round_width=32)
 
     # No offsets. VAE simply encodes each chunk of 17 frames into 5 latent frames, and then
     # slices off the last 3 latent frames from the full latent. 1 frame is special case:
@@ -111,6 +112,40 @@ class MinimaxH3Pipeline(ComfyPipeline):
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         self.framerate = FRAMERATE
 
+        # combined video and (optional) audio VAE in one object
+        def load_fn():
+            sd = comfy.utils.load_torch_file(self.model_config['vae'])
+            vae = comfy.sd.VAE(sd=sd)
+            vae.throw_exception_if_invalid()
+
+            def vae_encode_crop_pixels(self, pixels):
+                if not self.crop_input:
+                    return pixels
+
+                downscale_ratio = self.spacial_compression_encode()
+
+                dims = pixels.shape[-3:-1]
+                for d in range(len(dims)):
+                    x = (dims[d] // downscale_ratio) * downscale_ratio
+                    x_offset = (dims[d] % downscale_ratio) // 2
+                    if x != dims[d]:
+                        pixels = pixels.narrow(d + 1, x_offset, x)
+                return pixels
+
+            # patch this to handle 5D video tensor (original code expects 4D even for video)
+            vae.vae_encode_crop_pixels = types.MethodType(vae_encode_crop_pixels, vae)
+            vae_list = [vae]
+
+            # audio VAE
+            sd = comfy.utils.load_torch_file(self.model_config['audio_vae'])
+            vae = comfy.sd.VAE(sd=sd)
+            vae.throw_exception_if_invalid()
+            vae_list.append(vae)
+
+            return vae_list
+
+        self.vae = ModelWrapper(load_fn)
+
     def load_diffusion_model(self):
         # Model is so big, it's easy to OOM while loading with multiple GPUs.
         with one_at_a_time():
@@ -133,6 +168,39 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
     def get_preprocess_media_file_fn(self):
         return PreprocessMediaFileMinimax(self.config)
+
+    def vae_encode(self, img: torch.Tensor, audio: list):
+        video_vae, audio_vae = self.vae._model
+        # move channel dim to end
+        # works for both images (b c h w) and video (b c f h w)
+        img = img.movedim(1, -1)
+        latents = video_vae.encode(img)
+        if self.latent_format is not None:
+            # some older models do this in prepare_inputs() so it can be None
+            latents = self.latent_format.process_in(latents)
+
+        audio_latents = []
+        for a in audio:
+            if a is not None:
+                assert a.shape[0] == 1
+                a_latents = audio_vae.encode(a.movedim(1, -1))
+            else:
+                a_latents = None
+            audio_latents.append(a_latents)
+
+        return latents, audio_latents
+
+    def get_call_vae_fn(self, vae):
+        def fn(images: torch.Tensor, audio: list):
+            if images.shape[2] > 1:
+                # check videos for missing audio and warn
+                missing_audio = sum(1 if a is None else 0 for a in audio)
+                if missing_audio > 0:
+                    print(f'WARNING: this batch had {missing_audio} videos without audio. The videos could have no audio track, or it could be a bug in the code.')
+            images = images.to('cuda', self.dtype)
+            latents, audio_latents = self.vae_encode(images, audio)
+            return {'latents': latents, 'audio_latents': audio_latents}
+        return fn
 
     def to_layers(self):
         diffusion_model = self.diffusion_model
@@ -162,12 +230,30 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
+        audio_latents_list = inputs['audio_latents']
         mask = inputs['mask']
-
-        conds = self.get_conds(inputs)
 
         bs, c, f, h, w = latents.shape
         device = latents.device
+
+        # prepare single global batched audio tensor, some may be None
+        # videos are bucketed, so non-None audio should all be same length
+        audio_shape = None
+        audio_latents = None
+        valid_audio = []
+        for i, a in enumerate(audio_latents_list):
+            if a is not None:
+                if audio_shape is None:
+                    audio_shape = a.shape
+                    audio_latents = torch.empty((bs, *audio_shape[1:]), dtype=a.dtype, device=device)
+                assert a.shape == audio_shape
+                audio_latents[i, ...] = a
+                valid_audio.append(True)
+            else:
+                valid_audio.append(False)
+        valid_audio = torch.tensor(valid_audio, device=device)
+
+        conds = self.get_conds(inputs)
 
         if mask is not None:
             mask = mask.unsqueeze(1)  # make mask (bs, 1, img_h, img_w)
@@ -204,7 +290,47 @@ class MinimaxH3Pipeline(ComfyPipeline):
         noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
         target = noise - latents
 
-        return (noisy_latents, t, *conds), (target, mask)
+        # audio
+        audio_noise = torch.randn_like(audio_latents)
+        # fixed t -> audio_t mapping, matches the shift used in model code to derive the audio t from video t
+        audio_t = time_shift_sigma(t, self.diffusion_model.sigma_shift_video, self.diffusion_model.sigma_shift_audio)
+        audio_t_expanded = audio_t.view(-1, 1, 1, 1)
+        noisy_audio_latents = (1 - audio_t_expanded) * audio_latents + audio_t_expanded * audio_noise
+        audio_target = audio_noise - audio_latents
+
+        return (noisy_latents, noisy_audio_latents, valid_audio, t, *conds), (target, audio_target, mask)
+
+    def get_loss_fn(self):
+        @torch.autocast('cuda', enabled=False)
+        def single_loss(output, target, mask=None):
+            output = output.to(torch.float32)
+            target = target.to(output.device, torch.float32)
+            if 'huber_delta' in self.config:
+                loss = F.huber_loss(output, target, reduction='none', delta=self.config['huber_delta'])
+            elif 'smooth_l1_beta' in self.config:
+                loss = F.smooth_l1_loss(output, target, reduction='none', beta=self.config['smooth_l1_beta'])
+            else:
+                loss = F.mse_loss(output, target, reduction='none')
+            # empty tensor means no masking
+            if mask is not None and mask.numel() > 0:
+                mask = mask.to(output.device, torch.float32)
+                loss *= mask
+            return loss
+
+        def loss_fn(outputs, label):
+            output, audio_output = outputs
+            target, audio_target, mask = label
+            video_loss = single_loss(output, target, mask=mask)
+            audio_loss = single_loss(audio_output, audio_target)
+            # make each token count the same for loss, regardless of modality
+            # TODO: what is the best thing to do here? configurable audio loss scale?
+            video_tokens = video_loss.numel()
+            audio_tokens = audio_loss.numel()
+            total_tokens = video_tokens + audio_tokens
+            video_loss = video_loss.mean() * video_tokens / total_tokens
+            audio_loss = audio_loss.mean() * audio_tokens / total_tokens
+            return video_loss + audio_loss
+        return loss_fn
 
     def enable_block_swap(self, blocks_to_swap):
         diffusion_model = self.diffusion_model
@@ -256,14 +382,19 @@ class InitialLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        video_x, t, context, context_mask = inputs
+        video_x, audio_x, valid_audio, t, context, context_mask = inputs
         if video_x.shape[0] != 1:
             raise ValueError("MiniMax H3 requires batch size 1")
         assert context_mask.shape[0] == 1
+        assert audio_x.shape[0] == 1
+
         # batch size is 1, so handle context attention mask easily like this
         context = context[:, :context_mask.sum(), ...]
         bs = video_x.shape[0]
-        audio_x = torch.empty([bs, 32, 2, 0], device=video_x.device)
+
+        if not valid_audio.item():
+            audio_x = torch.empty([bs, 32, 2, 0], device=video_x.device)
+
         transformer_options = {}
         payload = {}
         device = video_x.device
@@ -418,15 +549,11 @@ class FinalLayer(nn.Module):
         v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
 
         video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
-        #audio_out = unpack_audio(a)
+        audio_out = unpack_audio(a)
 
-        # The sampler integrates the flat ODE dX/dsigma_v = (X - denoised)/sigma_v.
-        # Scaling the audio velocity by d(sigma_a)/d(sigma_v) makes that ODE equal
-        # to the audio stream's true ODE on its own shifted schedule.
-        #slope_a = time_shift_slope(sigma_v, shift_v, shift_a).to(audio_out.dtype)
-        video_out = -video_out
-        #audio_out = (-slope_a) * audio_out
-        return video_out
+        # We don't scale the audio's velocity like in inference, since that is an inference-only
+        # hack in order to use a single sampling schedule.
+        return -video_out, -audio_out
 
 
 # class Wrapper(nn.Module):

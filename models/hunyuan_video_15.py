@@ -23,6 +23,7 @@ class HunyuanVideo15Pipeline(ComfyPipeline):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.latent_format = comfy.latent_formats.HunyuanVideo15()
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
 
     def get_preprocess_media_file_fn(self):
@@ -107,7 +108,6 @@ class HunyuanVideo15Pipeline(ComfyPipeline):
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
-        latents = self.model_patcher.model.process_latent_in(latents)
         text_embeds = inputs['text_embeds']
         attention_mask = inputs['attention_mask']
         byt5_embeds = inputs['byt5_embeds']

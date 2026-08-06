@@ -9,13 +9,13 @@ sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../
 
 import peft
 import torch
+import torchaudio
 from torch import nn
 import torch.nn.functional as F
 import safetensors.torch
 import torchvision
 from PIL import Image, ImageOps
 from torchvision import transforms
-import imageio
 import accelerate
 from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
@@ -26,6 +26,8 @@ import comfy.sd
 import comfy.sd1_clip
 from comfy.sd1_clip import SD1Tokenizer
 from comfy import model_management
+from comfy_api.latest import InputImpl
+
 # Avoids using comfy_kitchen RoPE implementations that don't have backward defined
 model_management.in_training = True
 # Increase this from the default. I OOM on text embedding caching on Minimax without this.
@@ -34,30 +36,6 @@ model_management.EXTRA_RESERVED_VRAM = 2000 * 1024 * 1024
 
 def make_contiguous(*tensors):
     return tuple(x.contiguous() for x in tensors)
-
-
-def extract_clips(video, target_frames, video_clip_mode):
-    # video is (channels, num_frames, height, width)
-    frames = video.shape[1]
-    if frames < target_frames:
-        # TODO: think about how to handle this case. Maybe the video should have already been thrown out?
-        print(f'video with shape {video.shape} is being skipped because it has less ({frames}) than the target_frames {target_frames}')
-        return []
-
-    if video_clip_mode == 'single_beginning':
-        return [video[:, :target_frames, ...]]
-    elif video_clip_mode == 'single_middle':
-        start = int((frames - target_frames) / 2)
-        assert frames-start >= target_frames
-        return [video[:, start:start+target_frames, ...]]
-    # elif video_clip_mode == 'multiple_overlapping':
-    #     # Extract multiple clips so we use the whole video for training.
-    #     # The clips might overlap a little bit. We never cut anything off the end of the video.
-    #     num_clips = ((frames - 1) // target_frames) + 1
-    #     start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
-    #     return [video[:, i:i+target_frames, ...] for i in start_indices]
-    else:
-        raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
 
 
 def convert_crop_and_resize(pil_img, width_and_height):
@@ -76,19 +54,26 @@ def convert_crop_and_resize(pil_img, width_and_height):
 
 
 class PreprocessMediaFile:
-    def __init__(self, config, support_video=False, framerate=None, round_height=16, round_width=16, round_frames=4):
+    def __init__(self, config, support_video=False, support_audio=False, framerate=None, audio_sample_rate=None, round_height=16, round_width=16, round_frames=4):
         self.config = config
         self.video_clip_mode = config.get('video_clip_mode', 'single_beginning')
         print(f'using video_clip_mode={self.video_clip_mode}')
         self.pil_to_tensor = transforms.Compose([transforms.ToTensor()])
         self.support_video = support_video
+        self.support_audio = support_audio
+        if self.support_audio:
+            self.support_video = True
         self.framerate = framerate
         print(f'using framerate={self.framerate}')
+        self.audio_sample_rate = audio_sample_rate
+        print(f'using audio_sample_rate={self.audio_sample_rate}')
         self.round_height = round_height
         self.round_width = round_width
         self.round_frames = round_frames
         if self.support_video:
             assert self.framerate
+        if self.support_audio:
+            assert self.audio_sample_rate
         self.tarfile_map = {}
 
     def __del__(self):
@@ -98,8 +83,59 @@ class PreprocessMediaFile:
     def align_frames(self, frames):
         return round_down_to_multiple(frames - 1, self.round_frames) + 1
 
+    # Resamples video tensor to convert to self.framerate
+    def convert_framerate(self, video: torch.Tensor, source_fps: float):
+        num_frames = video.shape[0]
+        max_frame_index = num_frames - 1
+        new_num_frames = int(num_frames * self.framerate / source_fps)
+        frames_to_sample = torch.linspace(0, max_frame_index, new_num_frames).to(torch.int32)
+        return video[frames_to_sample]
+
+    def convert_audio_sample_rate(self, audio: torch.Tensor, source_sample_rate: int):
+        if source_sample_rate != self.audio_sample_rate:
+            audio = torchaudio.functional.resample(audio, source_sample_rate, self.audio_sample_rate)
+        return audio
+
+    def extract_clips(self, video, audio, target_frames, video_clip_mode):
+        # video is (channels, num_frames, height, width)
+        frames = video.shape[1]
+        if frames < target_frames:
+            # Dataset code has long since required a 1-to-1 mapping (assert checked). So just fail here if this ever happens (I think maybe it can't happen anymore).
+            raise ValueError(f'video with shape {video.shape} has less frames ({frames}) than the target_frames {target_frames}')
+
+        if audio is not None:
+            target_audio_samples = int(target_frames / self.framerate * self.audio_sample_rate)
+            # TODO: can we handle this better? Probably caused by rounding, variable frame rate, framerate conversion, audio track that is a tiny bit too short in the underlying video, etc.
+            if audio.shape[-1] < target_audio_samples:
+                print(f'WARNING: audio length {audio.shape[-1]} is shorter than the required {target_audio_samples}. This can rarely happen. Padding with silence.')
+                audio = F.pad(audio, (0, target_audio_samples - audio.shape[-1]))
+
+        if video_clip_mode == 'single_beginning':
+            if audio is not None:
+                audio = audio[:, :, :target_audio_samples]
+            return [(video[:, :target_frames, ...], audio)]
+        elif video_clip_mode == 'single_middle':
+            if audio is not None:
+                audio_start = int((audio.shape[-1] - target_audio_samples) / 2)
+                audio = audio[:, :, audio_start:audio_start+target_audio_samples]
+            start = int((frames - target_frames) / 2)
+            assert frames-start >= target_frames
+            return [(video[:, start:start+target_frames, ...], audio)]
+        # elif video_clip_mode == 'multiple_overlapping':
+        #     # Extract multiple clips so we use the whole video for training.
+        #     # The clips might overlap a little bit. We never cut anything off the end of the video.
+        #     num_clips = ((frames - 1) // target_frames) + 1
+        #     start_indices = torch.linspace(0, frames-target_frames, num_clips).int()
+        #     return [video[:, i:i+target_frames, ...] for i in start_indices]
+        else:
+            raise NotImplementedError(f'video_clip_mode={video_clip_mode} is not recognized')
+
     def __call__(self, spec, mask_filepath, size_bucket=None):
-        is_video = (Path(spec[1]).suffix in VIDEO_EXTENSIONS)
+        extension = Path(spec[1]).suffix
+        if extension == '.mkv':
+            # the ComfyUI video loader can't load these
+            raise ValueError(f'{spec[1]}: loading mkv files will not work properly')
+        is_video = (extension in VIDEO_EXTENSIONS)
 
         if spec[0] is None:
             tar_f = None
@@ -111,13 +147,20 @@ class PreprocessMediaFile:
             tar_f = self.tarfile_map[tar_filename]
             filepath_or_file = tar_f.extractfile(str(spec[1]))
 
+        audio = None
         if is_video:
             assert self.support_video
-            num_frames = 0
-            for frame in imageio.v3.imiter(filepath_or_file, fps=self.framerate):
-                num_frames += 1
-                height, width = frame.shape[:2]
-            video = imageio.v3.imiter(filepath_or_file, fps=self.framerate)
+            comfy_video = InputImpl.VideoFromFile(filepath_or_file)
+            width, height = comfy_video.get_dimensions()
+            num_frames = comfy_video.get_frame_count()
+            components = comfy_video.get_components()
+            video = components.images  # [f, h, w, c]
+            video = video.movedim(-1, 1)  # need [f, c, h, w]
+            video = self.convert_framerate(video, float(components.frame_rate))
+            if self.support_audio:
+                audio = components.audio['waveform']
+                sample_rate = components.audio['sample_rate']
+                audio = self.convert_audio_sample_rate(audio, sample_rate)
         else:
             num_frames = 1
             pil_img = Image.open(filepath_or_file)
@@ -154,21 +197,23 @@ class PreprocessMediaFile:
             if not isinstance(frame, Image.Image):
                 frame = torchvision.transforms.functional.to_pil_image(frame)
             cropped_image = convert_crop_and_resize(frame, resize_wh)
-            resized_video[i, ...] = self.pil_to_tensor(cropped_image)
+            tmp = self.pil_to_tensor(cropped_image)
+            resized_video[i, ...] = tmp
 
         if hasattr(filepath_or_file, 'close'):
             filepath_or_file.close()
 
         if not self.support_video:
-            return [(resized_video.squeeze(0), mask)]
+            return [(resized_video.squeeze(0), None, mask)]
 
         # (num_frames, channels, height, width) -> (channels, num_frames, height, width)
         resized_video = torch.permute(resized_video, (1, 0, 2, 3))
         if not is_video:
-            return [(resized_video, mask)]
+            return [(resized_video, None, mask)]
         else:
-            videos = extract_clips(resized_video, frames_rounded, self.video_clip_mode)
-            return [(video, mask) for video in videos]
+            items = self.extract_clips(resized_video, audio, frames_rounded, self.video_clip_mode)
+            assert len(items) <= 1  # only support 0 or 1 extracted clip; dataset limitation
+            return [(item[0], item[1], mask) for item in items]
 
 
 # shared functionality between BasePipeline and ComfyPipeline
@@ -638,9 +683,7 @@ class ComfyPipeline(CommonPipeline):
         # works for both images (b c h w) and video (b c f h w)
         img = img.movedim(1, -1)
         latents = self.vae.encode(img)
-        if self.latent_format is not None:
-            # some older models do this in prepare_inputs() so it can be None
-            latents = self.latent_format.process_in(latents)
+        latents = self.latent_format.process_in(latents)
         return latents
 
     def vae_decode(self, latents):

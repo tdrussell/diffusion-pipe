@@ -31,3 +31,4 @@ ninja
 comfy-kitchen
 comfy-aimdo
 scipy
+av>=16.0.0
