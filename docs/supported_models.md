@@ -27,6 +27,7 @@
 |LTX 2.3         |✅    |❌              |✅                |
 |Ideogram4       |✅    |✅              |✅                |
 |Krea 2          |✅    |✅              |✅                |
+|MiniMax H3      |✅    |✅              |✅                |
 
 
 ## SDXL
@@ -630,3 +631,21 @@ diffusion_model_dtype = 'float8'
 timestep_sample_method = 'logit_normal'
 ```
 This configuration can train a rank 32 LoRA at 512 resolution with 24GB VRAM.
+
+## MiniMax H3
+```
+[model]
+type = 'minimax_h3'
+diffusion_model = '/data2/imagegen_models/comfyui-models/minimax_h3_fl2va_pruned_int8_convrot.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/minimax_h3_video_vae_fp16.safetensors'
+audio_vae = '/data2/imagegen_models/comfyui-models/minimax_h3_audio_vae_fp32.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_32b_minimax_h3_int8_convrot.safetensors', type = 'minimax'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'uniform'  # or logit_normal
+shift = 8  # IDK what this should be but 1 is way too low for videos
+```
+There is a document for [MiniMax H3 notes](minimax_h3_notes.md). Read the whole thing before you train.
+
+Everything is ComfyUI format, including the saved models. You can now train LoRAs directly on quantized models, and it is recommended to use int8 convrot (faster, better quality, and less VRAM).
