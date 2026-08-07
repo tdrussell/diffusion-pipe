@@ -8,7 +8,7 @@ The AdaLN weights are not trained with LoRA. This makes the LoRA compatible with
 
 The dataset caching phase should use ComfyUI dynamic VRAM, meaning the text encoder can be larger than available VRAM. E.g. the int8 convrot TE is 26GB, but can compute text embeddings on a 24GB GPU.
 
-If dataset caching occurs (meaning it loads the VAE / TE), the text encoder isn't freed from RAM afterwards. The TE is large, and this can OOM you. Just relaunch the training script, since the dataset is now cached. Or do it in 2 phases from the beginning:
+If dataset caching occurs (meaning it loads the VAE / TE), the text encoder memory somehow isn't completely freed from RAM afterwards. The TE is large, and this might OOM you. Just relaunch the training script, since the dataset is now cached. Or do it in 2 phases from the beginning:
 ```
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True deepspeed --num_gpus=1 train.py --config your_config.toml --trust_cache --cache_only
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True deepspeed --num_gpus=1 train.py --config your_config.toml --trust_cache

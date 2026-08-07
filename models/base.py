@@ -20,7 +20,7 @@ import accelerate
 from diffusers import FlowMatchEulerDiscreteScheduler
 from tqdm import tqdm
 
-from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE
+from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple, round_down_to_multiple, AUTOCAST_DTYPE, empty_cuda_cache
 import comfy.utils
 import comfy.sd
 import comfy.sd1_clip
@@ -342,6 +342,9 @@ class CommonPipeline:
             # in case of video VAE
             img = img.squeeze(1)
         return img
+
+    def free_vae_and_te(self):
+        pass
 
 
 class BasePipeline(CommonPipeline):
@@ -677,6 +680,11 @@ class ComfyPipeline(CommonPipeline):
 
     def get_text_encoders(self):
         return self.text_encoders
+
+    def free_vae_and_te(self):
+        del self.vae
+        del self.text_encoders
+        empty_cuda_cache()
 
     def vae_encode(self, img):
         # move channel dim to end

@@ -517,6 +517,12 @@ if __name__ == '__main__':
     if args.cache_only:
         quit()
 
+    # Free up as much RAM as we can.
+    del dataset_manager
+    if config['model'].get('cache_text_embeddings', True):
+        # Only ComfyUI-based models, and only if we are caching text embeddings (which most models require).
+        model.free_vae_and_te()
+
     if args.test_sample:
         model.prepare_sample_test('a golden retriever running through a grassy field', cfg=1)
 
