@@ -358,7 +358,10 @@ class MinimaxH3Pipeline(ComfyPipeline):
             t = t * sigmoid_scale
             t = torch.sigmoid(t)
 
-        if shift := self.model_config.get('shift', None):
+        shift = self.model_config.get('shift', None)
+        if f == 1:
+            shift = self.model_config.get('image_shift', shift)
+        if shift:
             t = (t * shift) / (1 + (shift - 1) * t)
         elif self.model_config.get('flux_shift', False):
             mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
