@@ -1,0 +1,21 @@
+resolutions = [768]  # default resolution
+
+enable_ar_bucket = true
+min_ar = 0.5
+max_ar = 2.0
+num_ar_buckets = 9
+
+# Minimax H3: VAE encodes chunks of 17. 1 frame is special case and becomes 1 latent frame.
+frame_buckets = [1, 34, 68, 102, 136]
+
+# Whatever you want. Effectively duplicates examples so that fewer get dropped when assigning to buckets.
+num_repeats = 8
+
+[[directory]]
+path = '/path/to/videos'
+resolutions = [512]  # video is very VRAM/compute intensive, so it's convenient to have this a bit lower
+
+[[directory]]
+path = '/path/to/images'
+
+

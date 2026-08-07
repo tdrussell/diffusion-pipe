@@ -1,0 +1,62 @@
+# Will train MiniMax H3 LoRAs on 24GB VRAM, and has reasonable defaults.
+
+# FILL IN THESE PATHS
+output_dir = 'path_to_output_dir'
+dataset = 'your_dataset.toml'  # see minimax_h3_dataset.toml as an example
+
+# training settings
+epochs = 1000
+micro_batch_size_per_gpu = 1
+image_micro_batch_size_per_gpu = 8  # 8 images in a batch uses about as much VRAM as a single 5-second video
+pipeline_stages = 1
+gradient_accumulation_steps = 1
+gradient_clipping = 1
+warmup_steps = 10
+
+# eval settings
+eval_every_n_epochs = 1
+#eval_every_n_steps = 100
+eval_before_first_step = true
+eval_micro_batch_size_per_gpu = 1
+eval_gradient_accumulation_steps = 1
+
+# misc settings
+save_every_n_epochs = 1  # use either this or the steps one below
+#save_every_n_steps = 200
+#checkpoint_every_n_epochs = 1
+#checkpoint_every_n_minutes = 120
+activation_checkpointing = 'unsloth'
+partition_method = 'parameters'
+save_dtype = 'bfloat16'
+caching_batch_size = 1
+steps_per_print = 1
+video_clip_mode = 'single_beginning'
+blocks_to_swap = 48  # 48 is max. At 512 res, might be able to lower this a bit to speed things up.
+compile = true
+
+# FILL IN ALL THESE PATHS TOO
+[model]
+type = 'minimax_h3'
+diffusion_model = '/data2/imagegen_models/comfyui-models/minimax_h3_fl2va_pruned_int8_convrot.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/minimax_h3_video_vae_fp16.safetensors'
+audio_vae = '/data2/imagegen_models/comfyui-models/minimax_h3_audio_vae_fp32.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_32b_minimax_h3_int8_convrot.safetensors', type = 'minimax'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'uniform'  # or logit_normal, IDK which is better
+shift = 8  # experiment with this
+image_shift = 1  # 1, or slightly higher than 1, seems good for images
+#merge_adapters = ['/path/to/hypothetical/training_adapter.safetensors']  # merges adapters into weights before training starts
+
+[adapter]
+type = 'lora'
+rank = 32
+dtype = 'bfloat16'
+
+[optimizer]
+type = 'adamw_optimi'
+lr = 1e-4
+betas = [0.9, 0.99]
+weight_decay = 0.01
+eps = 1e-8
