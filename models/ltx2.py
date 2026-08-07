@@ -514,12 +514,12 @@ class InitialLayer(nn.Module):
         a_context = context[1]
         v_timestep = timestep[0]
         a_timestep = timestep[1]
-        v_pe, av_cross_video_freq_cis = pe[0]
-        a_pe, av_cross_audio_freq_cis = pe[1]
-        v_pe_cos, v_pe_sin = v_pe[:2]
-        av_cross_video_freq_cos, av_cross_video_freq_sin = av_cross_video_freq_cis[:2]
-        a_pe_cos, a_pe_sin = a_pe[:2]
-        av_cross_audio_freq_cos, av_cross_audio_freq_sin = av_cross_audio_freq_cis[:2]
+        v_pe, av_cross_video_pe = pe[0]
+        a_pe, av_cross_audio_pe = pe[1]
+        v_freq_cis = v_pe[0]
+        av_cross_video_freq_cis = av_cross_video_pe[0]
+        a_freq_cis = a_pe[0]
+        av_cross_audio_freq_cis = av_cross_audio_pe[0]
 
         (
             av_ca_audio_scale_shift_timestep,
@@ -541,7 +541,7 @@ class InitialLayer(nn.Module):
         orig_shape = torch.tensor(additional_args['orig_shape'], device=device)
 
         outputs = make_contiguous(
-            vx, ax, v_context, a_context, attention_mask, v_timestep, a_timestep, v_pe_cos, v_pe_sin, a_pe_cos, a_pe_sin, av_cross_video_freq_cos, av_cross_video_freq_sin, av_cross_audio_freq_cos, av_cross_audio_freq_sin,
+            vx, ax, v_context, a_context, attention_mask, v_timestep, a_timestep, v_freq_cis, a_freq_cis, av_cross_video_freq_cis, av_cross_audio_freq_cis,
             av_ca_video_scale_shift_timestep, av_ca_audio_scale_shift_timestep, av_ca_a2v_gate_noise_timestep, av_ca_v2a_gate_noise_timestep, v_prompt_timestep, a_prompt_timestep, v_embedded_timestep, a_embedded_timestep, orig_shape
         )
         for item in outputs:
@@ -562,7 +562,7 @@ class TransformerLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
         (
-            vx, ax, v_context, a_context, attention_mask, v_timestep, a_timestep, v_pe_cos, v_pe_sin, a_pe_cos, a_pe_sin, av_cross_video_freq_cos, av_cross_video_freq_sin, av_cross_audio_freq_cos, av_cross_audio_freq_sin,
+            vx, ax, v_context, a_context, attention_mask, v_timestep, a_timestep, v_freq_cis, a_freq_cis, av_cross_video_freq_cis, av_cross_audio_freq_cis,
             av_ca_video_scale_shift_timestep, av_ca_audio_scale_shift_timestep, av_ca_a2v_gate_noise_timestep, av_ca_v2a_gate_noise_timestep, v_prompt_timestep, a_prompt_timestep, v_embedded_timestep, a_embedded_timestep, orig_shape
         ) = inputs
 
@@ -574,10 +574,10 @@ class TransformerLayer(nn.Module):
             attention_mask=attention_mask,
             v_timestep=v_timestep,
             a_timestep=a_timestep,
-            v_pe=(v_pe_cos, v_pe_sin, self.split_mode),
-            a_pe=(a_pe_cos, a_pe_sin, self.split_mode),
-            v_cross_pe=(av_cross_video_freq_cos, av_cross_video_freq_sin, self.split_mode),
-            a_cross_pe=(av_cross_audio_freq_cos, av_cross_audio_freq_sin, self.split_mode),
+            v_pe=(v_freq_cis, self.split_mode),
+            a_pe=(a_freq_cis, self.split_mode),
+            v_cross_pe=(av_cross_video_freq_cis, self.split_mode),
+            a_cross_pe=(av_cross_audio_freq_cis, self.split_mode),
             v_cross_scale_shift_timestep=av_ca_video_scale_shift_timestep,
             a_cross_scale_shift_timestep=av_ca_audio_scale_shift_timestep,
             v_cross_gate_timestep=av_ca_a2v_gate_noise_timestep,
@@ -590,7 +590,7 @@ class TransformerLayer(nn.Module):
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
         return (
-            vx, ax, v_context, a_context, attention_mask, v_timestep, a_timestep, v_pe_cos, v_pe_sin, a_pe_cos, a_pe_sin, av_cross_video_freq_cos, av_cross_video_freq_sin, av_cross_audio_freq_cos, av_cross_audio_freq_sin,
+            vx, ax, v_context, a_context, attention_mask, v_timestep, a_timestep, v_freq_cis, a_freq_cis, av_cross_video_freq_cis, av_cross_audio_freq_cis,
             av_ca_video_scale_shift_timestep, av_ca_audio_scale_shift_timestep, av_ca_a2v_gate_noise_timestep, av_ca_v2a_gate_noise_timestep, v_prompt_timestep, a_prompt_timestep, v_embedded_timestep, a_embedded_timestep, orig_shape
         )
 
@@ -613,7 +613,7 @@ class FinalLayer(nn.Module):
     @torch.compiler.disable()
     def forward(self, inputs):
         (
-            vx, ax, v_context, a_context, attention_mask, v_timestep, a_timestep, v_pe_cos, v_pe_sin, a_pe_cos, a_pe_sin, av_cross_video_freq_cos, av_cross_video_freq_sin, av_cross_audio_freq_cos, av_cross_audio_freq_sin,
+            vx, ax, v_context, a_context, attention_mask, v_timestep, a_timestep, v_freq_cis, a_freq_cis, av_cross_video_freq_cis, av_cross_audio_freq_cis,
             av_ca_video_scale_shift_timestep, av_ca_audio_scale_shift_timestep, av_ca_a2v_gate_noise_timestep, av_ca_v2a_gate_noise_timestep, v_prompt_timestep, a_prompt_timestep, v_embedded_timestep, a_embedded_timestep, orig_shape
         ) = inputs
         # TODO: this will return a list with 2 elements when audio is enabled (currently single tensor)
