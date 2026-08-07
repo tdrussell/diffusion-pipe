@@ -17,7 +17,7 @@ import comfy.ldm.minimax.model
 from comfy.ldm.modules.attention import optimized_attention
 from comfy.ldm.minimax.model import (
     PackedLayout, time_shift_sigma, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP, patchify_video, pack_audio,
-    rope_rotation_table, unpatchify_video, unpack_audio
+    rope_rotation_table, unpatchify_video, unpack_audio, MLP, AdalnProj,
 )
 
 FRAMERATE = 24  # fixed for this model
@@ -28,18 +28,18 @@ def _mod_scale_shift(h, shift, scale, segments):
     pieces = []
     # segments: [(start, stop, mod_row)] covering h contiguously.
     for a, b, row in segments:
-        piece = h[a:b] * (1.0 + scale[row].to(dtype)) + shift[row].to(dtype)
+        piece = h[:, a:b] * (1.0 + scale[:, row, None].to(dtype)) + shift[:, row, None].to(dtype)
         pieces.append(piece)
-    return torch.cat(pieces, dim=0)
+    return torch.cat(pieces, dim=1)
 
 def _mod_gate(x, gate, other, segments):
     dtype = x.dtype
     pieces = []
     # other is the fresh attn/mlp output: accumulate the gated residual into the stream in place, one fused kernel per segment
     for a, b, row in segments:
-        piece = x[a:b] + other[a:b] * gate[row].to(dtype)
+        piece = x[:, a:b] + other[:, a:b] * gate[:, row, None].to(dtype)
         pieces.append(piece)
-    return torch.cat(pieces, dim=0)
+    return torch.cat(pieces, dim=1)
 
 # patch these to remove in-place operations which break backward pass
 comfy.ldm.minimax.model._mod_scale_shift = _mod_scale_shift
@@ -57,32 +57,107 @@ class Attention(nn.Module):
         self.k_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.out_proj = operations.Linear(inner, hidden, bias=False, dtype=dtype, device=device)
 
-    def forward(self, x, rope_freqs=None, transformer_options={}):
-        s = x.shape[0]
+    def forward(self, x, rope_freqs=None, attention_mask=None, transformer_options={}):
+        b, s = x.shape[:2]
         q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
-        v = v.view(s, self.heads, self.head_dim)
+        v = v.view(b, s, self.heads, self.head_dim)
         if rope_freqs is not None:
-            # fused per-head RMSNorm + partial split-half rope, in place on the qkv buffer
-            q = q.view(1, s, self.heads, self.head_dim)
-            k = k.view(1, s, self.heads, self.head_dim)
+            # fused per-head RMSNorm + partial split-half rope
+            q = q.view(b, s, self.heads, self.head_dim)
+            k = k.view(b, s, self.heads, self.head_dim)
             qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
             kw = comfy.model_management.cast_to(self.k_norm.weight, device=x.device)
             rot = rope_freqs.shape[-3] * 2
             # this is seemingly the only way to force eager
             q, k = ck.backends.eager.rope.rms_rope_split_half(q, k, rope_freqs, qw, kw, epsilon=self.q_norm.eps, rot_dim=rot)
-            q = q[0]
-            k = k[0]
         else:
-            q = self.q_norm(q.view(s, self.heads, self.head_dim))
-            k = self.k_norm(k.view(s, self.heads, self.head_dim))
-        q = q.transpose(0, 1).unsqueeze(0)
-        k = k.transpose(0, 1).unsqueeze(0)
-        v = v.transpose(0, 1).unsqueeze(0)
-        out = optimized_attention(q, k, v, self.heads, mask=None, skip_reshape=True, transformer_options=transformer_options)
-        return self.out_proj(out.squeeze(0))
+            q = self.q_norm(q.view(b, s, self.heads, self.head_dim))
+            k = self.k_norm(k.view(b, s, self.heads, self.head_dim))
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        out = optimized_attention(q, k, v, self.heads, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
+        return self.out_proj(out)
 
 # Patch to force eager rms_rope_split_half so backward works. Even using offical methods to set 'eager' in comfy kitchen doesn't work.
 comfy.ldm.minimax.model.Attention = Attention
+
+
+class AdalnProj(nn.Module):
+    def __init__(self, t_dim, hidden, expand, modalities, apply_silu=True,
+                 dtype=None, device=None, operations=None):
+        super().__init__()
+        self.expand = expand
+        self.modalities = modalities
+        self.hidden = hidden
+        self.apply_silu = apply_silu
+        self.linear = operations.Linear(t_dim, expand * hidden * modalities, bias=True, dtype=dtype, device=device)
+
+    def forward(self, t_emb):
+        # [B, M, t_dim] -> expand tensors of [B, M*modalities, hidden]
+        x = self.linear(nn.functional.silu(t_emb) if self.apply_silu else t_emb)
+        x = x.view(x.shape[0], x.shape[1] * self.modalities, self.expand * self.hidden)
+        return x.chunk(self.expand, dim=-1)
+
+# batch dimension
+comfy.ldm.minimax.model.AdalnProj = AdalnProj
+
+
+class DiTBlock(nn.Module):
+    def __init__(self, hidden, heads, head_dim, ffn, t_dim, eps, qk_eps,
+                 apply_silu=True, adaln_dtype=None, dtype=None, device=None, operations=None):
+        super().__init__()
+        self.norm1 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
+        self.norm2 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps, dtype=dtype, device=device, operations=operations)
+        self.mlp = MLP(hidden, ffn, dtype=dtype, device=device, operations=operations)
+        self.adaln_proj = AdalnProj(t_dim, hidden, 6, 3, apply_silu=apply_silu,
+                                    dtype=adaln_dtype if adaln_dtype is not None else dtype,
+                                    device=device, operations=operations)
+
+    def forward(self, x, t_emb, mod_segments, rope_freqs, attention_mask=None, transformer_options={}):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
+        h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
+        x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, attention_mask=attention_mask, transformer_options=transformer_options), mod_segments)
+        h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
+        return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
+
+# add attention_mask
+comfy.ldm.minimax.model.DiTBlock = DiTBlock
+
+
+class FinalLayer(nn.Module):
+    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None,
+                 dtype=None, device=None, operations=None):
+        super().__init__()
+        self.norm = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
+        self.adaln_proj = AdalnProj(t_dim, hidden, 2, 1, apply_silu=apply_silu,
+                                    dtype=adaln_dtype if adaln_dtype is not None else dtype,
+                                    device=device, operations=operations)
+        # output heads are the checkpoint's fp32 island; norm/adaln are stored at model dtype
+        self.video_out = operations.Linear(hidden, video_dim, bias=True, dtype=torch.float32, device=device)
+        self.audio_out = operations.Linear(hidden, audio_dim, bias=True, dtype=torch.float32, device=device)
+
+    def forward(self, x, t_emb, video_seg, audio_seg):
+        # video_seg / audio_seg: (start, stop, timestep_row) of the target streams
+        shift, scale = self.adaln_proj(t_emb)
+        va, vb, vrow = video_seg
+        aa, ab, arow = audio_seg
+        hv = (self.norm(x[:, va:vb]) * (1.0 + scale[:, vrow, None]) + shift[:, vrow, None]).to(torch.float32)
+        ha = (self.norm(x[:, aa:ab]) * (1.0 + scale[:, arow, None]) + shift[:, arow, None]).to(torch.float32)
+        return self.video_out(hv), self.audio_out(ha)
+
+# batch-enabled
+comfy.ldm.minimax.model.FinalLayer = FinalLayer
+
+
+def unpack_audio(rows, ch=2):
+    b, s, C = rows.shape
+    t = s // ch
+    return rows.reshape(b, ch, t, C).permute(0, 3, 1, 2)
+
+# batch-enabled
+comfy.ldm.minimax.model.unpack_audio = unpack_audio
 
 
 class PreprocessMediaFileMinimax(PreprocessMediaFile):
@@ -230,11 +305,12 @@ class MinimaxH3Pipeline(ComfyPipeline):
 
     def prepare_inputs(self, inputs, timestep_quantile=None):
         latents = inputs['latents'].float()
-        audio_latents_list = inputs['audio_latents']
         mask = inputs['mask']
 
         bs, c, f, h, w = latents.shape
         device = latents.device
+
+        audio_latents_list = inputs['audio_latents'] if 'audio_latents' in inputs else [None]*bs
 
         # prepare single global batched audio tensor, some may be None
         # videos are bucketed, so non-None audio should all be same length
@@ -383,23 +459,11 @@ class InitialLayer(nn.Module):
     def __getattr__(self, name):
         return getattr(self.model[0], name)
 
-    # TODO: will need to handle text_token_tags (and probably more) for reference images. it's all 1s for pure text prompt
-    # TODO: would be good to allow batch_size>1, but have to change a lot of this code and also pass context_mask through
-    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
-    @torch.compiler.disable
-    def forward(self, inputs):
-        video_x, audio_x, valid_audio, t, context, context_mask = inputs
-        if video_x.shape[0] != 1:
-            raise ValueError("MiniMax H3 requires batch size 1")
-        assert context_mask.shape[0] == 1
-        assert audio_x.shape[0] == 1
-
-        # batch size is 1, so handle context attention mask easily like this
-        context = context[:, :context_mask.sum(), ...]
-        bs = video_x.shape[0]
+    def make_packed_sequence(self, video_x, audio_x, valid_audio, t, context, context_mask):
+        assert video_x.shape[0] == 1  # needs batch dimension with batch size 1
 
         if not valid_audio.item():
-            audio_x = torch.empty([bs, 32, 2, 0], device=video_x.device)
+            audio_x = torch.empty([1, 32, 2, 0], device=video_x.device)
 
         transformer_options = {}
         payload = {}
@@ -473,18 +537,22 @@ class InitialLayer(nn.Module):
 
         video_embed = self.video_patch_proj(all_video_rows).to(dtype)
         audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
-        text_states = context[0]
+
+        text_states = context
         if text_states.shape[-1] != self.hidden_size:
             text_states = self.token_refiner(self.condition_proj(text_states),
                                              transformer_options=transformer_options)
+        text_states = text_states[0]  # this happens after since token_refiner uses the new batch-enabled Attention
 
         # segments are contiguous: assemble by slices, embed rows follow segment order
         h = torch.empty(layout.seq_len, self.hidden_size, dtype=dtype, device=device)
+        attention_mask = torch.ones((layout.seq_len,), dtype=context_mask.dtype, device=device)
         voff = aoff = 0
         for a, b, kind in layout.segments:
             n = b - a
             if kind == "text":
                 h[a:b] = text_states
+                attention_mask[a:b] = context_mask
             elif kind in ("cond", "ref_img", "video"):
                 h[a:b] = video_embed[voff:voff + n]
                 voff += n
@@ -509,9 +577,35 @@ class InitialLayer(nn.Module):
         audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
         # pack these as ints so we can pass as tensor between pipeline parallel layers
         mod_segments = torch.tensor(mod_segments, dtype=torch.int32, device=h.device)
-        extra_ints = torch.tensor([*video_seg, *audio_seg, latent_t, lat_h, lat_w, shift_v, shift_a], dtype=torch.int32, device=h.device)
+        extra_ints = torch.tensor([*video_seg, *audio_seg, latent_t, lat_h, lat_w], dtype=torch.int32, device=h.device)
 
-        outputs = make_contiguous(h, t_emb, mod_segments, rope_freqs, extra_ints)
+        return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints
+
+    # TODO: will need to handle text_token_tags (and probably more) for reference images. it's all 1s for pure text prompt
+    # TODO: would be good to allow batch_size>1, but have to change a lot of this code and also pass context_mask through
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    @torch.compiler.disable
+    def forward(self, inputs):
+        video_x, audio_x, valid_audio, t, context, context_mask = inputs
+
+        first_mod_seqments = None
+        h_list, attention_mask_list, t_emb_list = [], [], []
+        for items in zip(video_x, audio_x, valid_audio, t, context, context_mask):
+            h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = self.make_packed_sequence(*(x.unsqueeze(0) for x in items))
+            if first_mod_seqments is None:
+                first_mod_seqments = mod_segments
+            else:
+                # A critical assertion: the batch-enabled AdaLN code only works if all mod_segments are the same (which they will be for this training code).
+                assert (mod_segments == first_mod_seqments).all()
+            h_list.append(h)
+            attention_mask_list.append(attention_mask)
+            t_emb_list.append(t_emb)
+
+        h = torch.stack(h_list, dim=0)
+        attention_mask = torch.stack(attention_mask_list, dim=0)[:, None, None, :]  # 4D bool for SDPA
+        t_emb = torch.stack(t_emb_list)
+
+        outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
         for item in outputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
@@ -526,13 +620,13 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        h, t_emb, mod_segments, rope_freqs, extra_ints = inputs
+        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = inputs
 
         self.offloader.wait_for_block(self.block_idx)
-        h = self.layer(h, t_emb, mod_segments.tolist(), rope_freqs)
+        h = self.layer(h, t_emb, mod_segments.tolist(), rope_freqs, attention_mask=attention_mask)
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(h, t_emb, mod_segments, rope_freqs, extra_ints)
+        return make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
 
 
 class FinalLayer(nn.Module):
@@ -547,10 +641,10 @@ class FinalLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        h, t_emb, mod_segments, rope_freqs, extra_ints = inputs
+        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = inputs
         video_seg = extra_ints[:3]
         audio_seg = extra_ints[3:6]
-        latent_t, lat_h, lat_w, shift_v, shift_a = extra_ints[6:]
+        latent_t, lat_h, lat_w = extra_ints[6:]
 
         v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
 
