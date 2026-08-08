@@ -132,9 +132,6 @@ class PreprocessMediaFile:
 
     def __call__(self, spec, mask_filepath, size_bucket=None):
         extension = Path(spec[1]).suffix
-        if extension == '.mkv':
-            # the ComfyUI video loader can't load these
-            raise ValueError(f'{spec[1]}: loading mkv files will not work properly')
         is_video = (extension in VIDEO_EXTENSIONS)
 
         if spec[0] is None:
@@ -151,12 +148,11 @@ class PreprocessMediaFile:
         if is_video:
             assert self.support_video
             comfy_video = InputImpl.VideoFromFile(filepath_or_file)
-            width, height = comfy_video.get_dimensions()
-            num_frames = comfy_video.get_frame_count()
             components = comfy_video.get_components()
             video = components.images  # [f, h, w, c]
             video = video.movedim(-1, 1)  # need [f, c, h, w]
             video = self.convert_framerate(video, float(components.frame_rate))
+            num_frames, _, height, width = video.shape
             if self.support_audio and components.audio is not None:
                 audio = components.audio['waveform']
                 sample_rate = components.audio['sample_rate']
