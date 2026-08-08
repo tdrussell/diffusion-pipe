@@ -47,6 +47,8 @@ dtype = 'bfloat16'
 timestep_sample_method = 'uniform'  # or logit_normal, IDK which is better
 shift = 8  # experiment with this
 image_shift = 1  # 1, or slightly higher than 1, seems good for images
+# CFG-augmented training to preserve distillation. Use either this or a training adapter (not both).
+cfg = 4
 #merge_adapters = ['/path/to/hypothetical/training_adapter.safetensors']  # merges adapters into weights before training starts
 
 [adapter]

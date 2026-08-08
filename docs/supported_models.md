@@ -645,6 +645,8 @@ text_encoders = [
 dtype = 'bfloat16'
 timestep_sample_method = 'uniform'  # or logit_normal
 shift = 8  # IDK what this should be but 1 is way too low for videos
+# CFG-augmented training to preserve distillation. Use either this or a training adapter (not both).
+cfg = 4
 ```
 There is a document for [MiniMax H3 notes](minimax_h3_notes.md). Read the whole thing before you train. Also look at the [MiniMax H3 example TOML](../examples/minimax_h3_example.toml).
 

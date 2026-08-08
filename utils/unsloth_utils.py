@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-# I (tdrussell) made a some modifications.
+# I (tdrussell) made some modifications.
 
 import torch
 
@@ -28,28 +28,38 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
     Tiny hit to performance, since we mask the movement via non blocking calls.
     """
 
+    # Skips saving for backward any tensors with no_backward set to True.
     @staticmethod
     @torch.amp.custom_fwd(device_type='cuda')
     def forward(ctx, forward_function, *args):
-        saved_args = (
-            x.to('cpu', non_blocking=True) if x.numel() >= OFFLOAD_THRESHOLD else x
-            for x in args
-        )
+        saved_args = []
+        saved_indices = []
+        for i, x in enumerate(args):
+            if getattr(x, 'no_backward', False):
+                continue
+            saved_args.append(x.to('cpu', non_blocking=True) if x.numel() >= OFFLOAD_THRESHOLD else x)
+            saved_indices.append(i)
+
         with torch.no_grad():
             output = forward_function(*args)
         ctx.save_for_backward(*saved_args)
         ctx.forward_function = forward_function
+        ctx.saved_indices = saved_indices
+        ctx.num_args = len(args)
         return output
 
+    # For tensors not saved for backward, they are passed to function as None. The function should still return the
+    # same number of values in this case, but some of them can be None.
     @staticmethod
     @torch.amp.custom_bwd(device_type='cuda')
     def backward(ctx, *grads):
-        args = []
-        for x in ctx.saved_tensors:
+        args = [None]*ctx.num_args
+        saved_indices = ctx.saved_indices
+        for i, x in enumerate(ctx.saved_tensors):
             x = x.to('cuda', non_blocking=True).detach()
             if torch.is_floating_point(x):
                 x.requires_grad_(True)
-            args.append(x)
+            args[saved_indices[i]] = x
 
         with torch.enable_grad():
             outputs = ctx.forward_function(*args)
@@ -57,11 +67,11 @@ class Unsloth_Offloaded_Gradient_Checkpointer(torch.autograd.Function):
         output_tensors = []
         grad_tensors = []
         for out, grad in zip(outputs, grads):
-            if out.requires_grad:
+            if out is not None and out.requires_grad:
                 output_tensors.append(out)
                 grad_tensors.append(grad)
         torch.autograd.backward(output_tensors, grad_tensors)
-        return (None,) + tuple(arg.grad for arg in args)
+        return (None,) + tuple(None if arg is None else arg.grad for arg in args)
 
 
 @torch._disable_dynamo

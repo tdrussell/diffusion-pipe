@@ -13,6 +13,8 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - Easily add new models by implementing a single subclass
 
 ## Recent changes
+- 2026-08-08
+  - Add CFG-augmented training for MiniMax H3. You need to enable it, see the example TOML file. You probably always want to use either this, or a training adapter.
 - 2026-08-06
   - Support MiniMax H3. Only T2I and T2VA training.
   - Modify dataset code to support audio from videos.
@@ -38,9 +40,6 @@ Models supported: SDXL, Flux, LTX-Video, HunyuanVideo (t2v), Cosmos, Lumina Imag
 - 2025-12-20
   - Support HunyuanVideo-1.5. Currently only T2I and T2V training is supported.
   - Add grad norm logging when using GenericOptim.
-- 2025-11-29
-  - Change license to GPL-3 so I can use ComfyUI code. Going forward, model implementations will use ComfyUI backend code whenever possible.
-    - ComfyUI submodule has been added. Make sure to run ```git submodule update``` after pulling.
 
 ## Windows support
 It will be difficult or impossible to make training work on native Windows. This is because Deepspeed only has [partial Windows support](https://github.com/microsoft/DeepSpeed/blob/master/blogs/windows/08-2024/README.md). Deepspeed is a hard requirement because the entire training script is built around Deepspeed pipeline parallelism. However, it will work on Windows Subsystem for Linux, specifically WSL 2. If you must use Windows I recommend trying WSL 2.

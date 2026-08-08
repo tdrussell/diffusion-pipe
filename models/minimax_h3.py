@@ -187,6 +187,11 @@ class MinimaxH3Pipeline(ComfyPipeline):
         self.offloader = ModelOffloader('dummy', [], 0, 0, True, torch.device('cuda'), False, debug=False)
         self.framerate = FRAMERATE
 
+        self.cfg = self.model_config.get('cfg', 1.0)
+        if self.cfg > 1:
+            # Because uncond branch is no_grad() but tensors passed between pipeline parallel layers must require grad.
+            assert self.config['pipeline_stages'] == 1, 'CFG training requires pipeline_stages=1'
+
         # combined video and (optional) audio VAE in one object
         def load_fn():
             sd = comfy.utils.load_torch_file(self.model_config['vae'])
@@ -282,7 +287,7 @@ class MinimaxH3Pipeline(ComfyPipeline):
         layers = [InitialLayer(diffusion_model)]
         for i, block in enumerate(diffusion_model.blocks):
             layers.append(TransformerLayer(block, i, self.offloader))
-        layers.append(FinalLayer(diffusion_model))
+        layers.append(FinalLayer(diffusion_model, self.cfg))
         return layers
 
     # def to_layers(self):
@@ -380,7 +385,18 @@ class MinimaxH3Pipeline(ComfyPipeline):
         noisy_audio_latents = (1 - audio_t_expanded) * audio_latents + audio_t_expanded * audio_noise
         audio_target = audio_noise - audio_latents
 
-        return (noisy_latents, noisy_audio_latents, valid_audio, t, *conds), (target, audio_target, mask)
+        if self.cfg > 1:
+            tmp = {}
+            for k in ('text_embeds_0', 'attention_mask_0'):
+                v = self.uncond_dict[k]
+                if k == 'attention_mask_0':
+                    v = v.to(torch.bool)
+                tmp[k] = v.unsqueeze(0).repeat(bs, *([1]*v.ndim))
+            unconds = self.get_conds(tmp)
+        else:
+            unconds = tuple()
+
+        return (noisy_latents, noisy_audio_latents, valid_audio, t, *conds, *unconds), (target, audio_target, mask)
 
     def get_loss_fn(self):
         @torch.autocast('cuda', enabled=False)
@@ -584,13 +600,7 @@ class InitialLayer(nn.Module):
 
         return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints
 
-    # TODO: will need to handle text_token_tags (and probably more) for reference images. it's all 1s for pure text prompt
-    # TODO: would be good to allow batch_size>1, but have to change a lot of this code and also pass context_mask through
-    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
-    @torch.compiler.disable
-    def forward(self, inputs):
-        video_x, audio_x, valid_audio, t, context, context_mask = inputs
-
+    def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask):
         first_mod_seqments = None
         h_list, attention_mask_list, t_emb_list = [], [], []
         for items in zip(video_x, audio_x, valid_audio, t, context, context_mask):
@@ -607,11 +617,34 @@ class InitialLayer(nn.Module):
         h = torch.stack(h_list, dim=0)
         attention_mask = torch.stack(attention_mask_list, dim=0)[:, None, None, :]  # 4D bool for SDPA
         t_emb = torch.stack(t_emb_list)
-
         outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
         for item in outputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
+        return outputs
+
+    # TODO: will need to handle text_token_tags (and probably more) for reference images. it's all 1s for pure text prompt
+    # TODO: would be good to allow batch_size>1, but have to change a lot of this code and also pass context_mask through
+    @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
+    @torch.compiler.disable
+    def forward(self, inputs):
+        video_x, audio_x, valid_audio, t, *variable = inputs
+        if len(variable) == 2:
+            context, context_mask = variable
+            has_uncond_branch = False
+        else:
+            context, context_mask, context_uncond, context_mask_uncond = variable
+            has_uncond_branch = True
+
+        outputs = self.make_layer_inputs(video_x, audio_x, valid_audio, t, context, context_mask)
+        if has_uncond_branch:
+            # TODO: what happens if we have gradient on the entire uncond branch?
+            with torch.no_grad():
+                h_uncond, attention_mask_uncond, _, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond = self.make_layer_inputs(video_x, audio_x, valid_audio, t, context_uncond, context_mask_uncond)
+            uncond_tensors = (h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond)
+            for x in uncond_tensors:
+                x.no_backward = True
+            outputs = (*outputs, *uncond_tensors)
         return outputs
 
 class TransformerLayer(nn.Module):
@@ -623,20 +656,36 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = inputs
+        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors = inputs
 
         self.offloader.wait_for_block(self.block_idx)
+
         h = self.layer(h, t_emb, mod_segments.tolist(), rope_freqs, attention_mask=attention_mask)
+        if len(uncond_tensors) > 0:
+            h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond = uncond_tensors
+            # TODO: in the unsloth checkpointer, it only sees no_backward for all 5 tensors on the very first layer. For all other layers,
+            # it's only set on h_uncond. This works, and it avoids saving the one large tensor, but why is it like this?
+            if h_uncond is None:
+                # Backward pass recomputation, and we didn't save these tensors for backward. But we need same number of return values.
+                uncond_tensors = (None,)*len(uncond_tensors)
+            else:
+                with torch.no_grad():
+                    h_uncond = self.layer(h_uncond, t_emb, mod_segments_uncond.tolist(), rope_freqs_uncond, attention_mask=attention_mask_uncond)
+                uncond_tensors = (h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond)
+                for x in uncond_tensors:
+                    x.no_backward = True
+
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
+        return make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors)
 
 
 class FinalLayer(nn.Module):
-    def __init__(self, model):
+    def __init__(self, model, cfg):
         super().__init__()
         self.final_layer = model.final_layer
         self.model = [model]
+        self.cfg = cfg
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)
@@ -644,15 +693,28 @@ class FinalLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = inputs
+        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors = inputs
         video_seg = extra_ints[:3]
         audio_seg = extra_ints[3:6]
         latent_t, lat_h, lat_w = extra_ints[6:]
 
         v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
-
         video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
         audio_out = unpack_audio(a)
+
+        if len(uncond_tensors) > 0:
+            assert self.cfg > 1
+            h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond = uncond_tensors
+            video_seg = extra_ints_uncond[:3]
+            audio_seg = extra_ints_uncond[3:6]
+            latent_t, lat_h, lat_w = extra_ints_uncond[6:]
+            with torch.no_grad():
+                v_uncond, a_uncond = self.final_layer(h_uncond, t_emb, video_seg, audio_seg)
+            video_out_uncond = unpatchify_video(v_uncond, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
+            audio_out_uncond = unpack_audio(a_uncond)
+            # "raw" velocity from guidance-distilled output and own uncond (just rearrange CFG equation)
+            video_out = (video_out + (self.cfg-1)*video_out_uncond) / self.cfg
+            audio_out = (audio_out + (self.cfg-1)*audio_out_uncond) / self.cfg
 
         # We don't scale the audio's velocity like in inference, since that is an inference-only
         # hack in order to use a single sampling schedule.

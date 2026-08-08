@@ -1,9 +1,12 @@
-## A collection of notes on Minimax H3 implementation and training
+# A collection of notes on Minimax H3 implementation and training
 
-**Any training gradually undistills the model**. You may need to use CFG for inference. How much CFG you will need depends on the size of the dataset and the amount of training. A de-distillation adapter is one solution to this, but it doesn't exist as of this writing. Another potential solution is a modified training target that preserves the distillation by using the model's own uncond prediction, which I will investigate.
+## Distillation
+**Any standard training gradually undistills the model**. You may need to use CFG for inference. How much CFG you will need depends on the size of the dataset and the amount of training.
+### Solutions
+- CFG-augmented training (see the example TOML config). This modifies the model's output with its own unconditional prediction when fitting the target, in order to cause the model output to have built-in CFG. This preserves the guidance distillation that the model comes with. You can think of this as "baking in" as CFG value using the model's own uncond prediction during training time, even though you are still fitting the standard flow-matching target. This technique works very well and is recommended.
+- Training adapter. Ostris has a [training adapter](https://huggingface.co/ostris/minimax_h3_training_adapter/tree/main) for the model, but I haven't tested this myself.
 
-You currently must use batch size 1; the code checks this and fails otherwise. This is due to a limitation in the ComfyUI model code. This restriction can be removed but it will take some changes to the code. You can still set gradient_accumulation_steps to mimic a larger batch size.
-
+## General notes
 The AdaLN weights are not trained with LoRA. This makes the LoRA compatible with both the full and pruned checkpoints, regardless of which one you trained with.
 
 The dataset caching phase should use ComfyUI dynamic VRAM, meaning the text encoder can be larger than available VRAM. E.g. the int8 convrot TE is 26GB, but can compute text embeddings on a 24GB GPU.

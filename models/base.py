@@ -34,8 +34,8 @@ model_management.in_training = True
 model_management.EXTRA_RESERVED_VRAM = 2000 * 1024 * 1024
 
 
-def make_contiguous(*tensors):
-    return tuple(x.contiguous() for x in tensors)
+def make_contiguous(*values):
+    return tuple(x.contiguous() if torch.is_tensor(x) else x for x in values)
 
 
 def convert_crop_and_resize(pil_img, width_and_height):
