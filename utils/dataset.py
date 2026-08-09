@@ -1009,7 +1009,7 @@ class Dataset:
             features = [example[key] for example in examples]
             if torch.is_tensor(features[0]):
                 shape = features[0].shape
-                if all(f.shape == shape for f in features):
+                if all(torch.is_tensor(f) and f.shape == shape for f in features):
                     # if we can form a single batched tensor, do it
                     features = torch.stack(features)
             ret[key] = features

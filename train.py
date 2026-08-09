@@ -611,6 +611,7 @@ if __name__ == '__main__':
         partition_method=partition_method,
         manual_partition_split=partition_split,
         loss_fn=model.get_loss_fn(),
+        dynamic_shape=True,
         **additional_pipeline_module_kwargs
     )
     model.pipeline_model = pipeline_model

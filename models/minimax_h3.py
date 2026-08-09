@@ -419,6 +419,10 @@ class MinimaxH3Pipeline(ComfyPipeline):
             output, audio_output = outputs
             target, audio_target, mask = label
             video_loss = single_loss(output, target, mask=mask)
+            # audio_target may be padded to match another example's audio length from the same
+            # gradient-accumulation group (see MinimaxH3Pipeline.prepare_inputs); audio_output's
+            # length is authoritative since the model derives it from this example's own valid_audio flag.
+            audio_target = audio_target[..., :audio_output.shape[-1]]
             audio_loss = single_loss(audio_output, audio_target)
             # make each token count the same for loss, regardless of modality
             # TODO: what is the best thing to do here? configurable audio loss scale?
