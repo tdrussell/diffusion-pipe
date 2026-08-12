@@ -19,8 +19,29 @@ from comfy.ldm.minimax.model import (
     PackedLayout, time_shift_sigma, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP, patchify_video, pack_audio,
     rope_rotation_table, unpatchify_video, unpack_audio, MLP, AdalnProj,
 )
+import comfy.text_encoders.minimax
 
 FRAMERATE = 24  # fixed for this model
+
+
+class MiniMaxH3ClipModel(comfy.sd1_clip.SDClipModel):
+    def __init__(self, device="cpu", layer="last", layer_idx=None, dtype=None, model_options={}):
+        super().__init__(device=device, layer="last", layer_idx=None, textmodel_json_config={},
+                         dtype=dtype, special_tokens={"pad": 151643}, layer_norm_hidden_state=False,
+                         model_class=comfy.text_encoders.minimax.MiniMaxQwen3VL, enable_attention_masks=True,
+                         return_attention_masks=True, model_options=model_options)
+
+    def encode_token_weights(self, token_weight_pairs):
+        out = super().encode_token_weights(token_weight_pairs)
+        tags = getattr(self.transformer, "last_token_tags", None)
+        if tags is not None:
+            extra = out[2] if len(out) > 2 and isinstance(out[2], dict) else {}
+            extra["minimax_token_tags"] = tags
+            out = (out[0], out[1], extra)
+        return out
+
+# enable attention masks
+comfy.text_encoders.minimax.MiniMaxH3ClipModel = MiniMaxH3ClipModel
 
 
 def _mod_scale_shift(h, shift, scale, segments):

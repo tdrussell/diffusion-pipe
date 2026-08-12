@@ -777,10 +777,8 @@ class ComfyPipeline(CommonPipeline):
             if 'attention_mask' in extra:
                 attention_mask = extra['attention_mask']
             else:
-                # Some models remove attention_mask if it is all 1s (Krea2), or don't return it at all
-                attention_mask = torch.zeros(text_embeds.shape[:2], dtype=torch.int64, device=text_embeds.device)
-                for i, L in enumerate(token_lengths):
-                    attention_mask[i, :L] = torch.ones((L,), dtype=torch.int64, device=text_embeds.device)
+                # Krea2 (maybe others) removes attention_mask if it is all 1s (e.g. batch size 1)
+                attention_mask = torch.ones(text_embeds.shape[:2], dtype=torch.int64, device=text_embeds.device)
 
             tokenizer.min_length = original_min_length
             return {
