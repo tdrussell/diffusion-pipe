@@ -35,6 +35,20 @@ MULTISCALE_LOSS_THRESHOLDS = [size * 0.9 for size in [1024]]
 MULTISCALE_LOSS_THRESHOLDS.sort()
 
 
+def count_blocks(state_dict_keys, prefix_string):
+    count = 0
+    while True:
+        c = False
+        for k in state_dict_keys:
+            if k.startswith(prefix_string.format(count)):
+                c = True
+                break
+        if c == False:
+            break
+        count += 1
+    return count
+
+
 def time_shift(mu: float, sigma: float, t: torch.Tensor):
     return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
 
@@ -105,6 +119,7 @@ def vae_encode(tensor, vae):
 
 
 def get_dit_config(state_dict, key_prefix=''):
+    state_dict_keys = list(state_dict.keys())
     dit_config = {}
     dit_config["max_img_h"] = 1024
     dit_config["max_img_w"] = 1024
@@ -125,14 +140,12 @@ def get_dit_config(state_dict, key_prefix=''):
 
     dit_config["use_adaln_lora"] = True
     dit_config["adaln_lora_dim"] = 256
+    dit_config["num_blocks"] = count_blocks(state_dict_keys, '{}blocks.'.format(key_prefix) + '{}.')
     if dit_config["model_channels"] == 2048:
-        dit_config["num_blocks"] = 28
         dit_config["num_heads"] = 16
     elif dit_config["model_channels"] == 5120:
-        dit_config["num_blocks"] = 36
         dit_config["num_heads"] = 40
     elif dit_config["model_channels"] == 1280:
-        dit_config["num_blocks"] = 20
         dit_config["num_heads"] = 20
 
     if dit_config["in_channels"] == 16:
