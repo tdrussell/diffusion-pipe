@@ -22,6 +22,7 @@ from PIL import Image
 import imageio
 import multiprocess as mp
 from tqdm import tqdm
+from comfy_api.latest import InputImpl
 
 from utils.common import is_main_process, VIDEO_EXTENSIONS, round_to_nearest_multiple
 from utils.cache import Cache
@@ -781,18 +782,13 @@ class DirectoryDataset:
                     raise NotImplementedError('WebP videos are not supported.')
             try:
                 if image_file.suffix in VIDEO_EXTENSIONS:
-                    # 100% accurate frame count, but much slower.
-                    # frames = 0
-                    # for frame in imageio.v3.imiter(image_file):
-                    #     frames += 1
-                    #     height, width = frame.shape[:2]
-                    # TODO: this is an estimate of frame count. What happens if variable frame rate? Is
-                    # it still close enough?
-                    meta = imageio.v3.immeta(filepath_or_file)
-                    first_frame = next(imageio.v3.imiter(filepath_or_file))
-                    height, width = first_frame.shape[:2]
+                    comfy_video = InputImpl.VideoFromFile(filepath_or_file)
+                    width, height = comfy_video.get_dimensions()
+                    source_frames = comfy_video.get_frame_count()
+                    source_fps = float(comfy_video.get_frame_rate())
+
                     assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
-                    frames = int(self.framerate * meta['duration'])
+                    frames = int(source_frames * self.framerate / source_fps)
                 else:
                     pil_img = Image.open(filepath_or_file)
                     width, height = pil_img.size
