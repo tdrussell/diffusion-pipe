@@ -12,6 +12,7 @@
 
 import math
 import os.path
+import re
 
 import torch
 from torch import nn
@@ -275,11 +276,11 @@ class CosmosPredict2Pipeline(BasePipeline):
         transformer_dtype = self.model_config.get('transformer_dtype', dtype)
 
         state_dict = load_state_dict(self.model_config['transformer_path'])
-        # Remove 'net.' prefix
         new_state_dict = {}
         for k, v in state_dict.items():
-            if k.startswith('net.'):
-                k = k[len('net.'):]
+            # Remove prefixes
+            k = re.sub(r'^net\.', '', k)  # Cosmos2 original
+            k = re.sub(r'^model\.diffusion_model\.', '', k)  # native ComfyUI
             new_state_dict[k] = v
         state_dict = new_state_dict
 
