@@ -53,7 +53,6 @@ class WanModelFromSafetensors(WanModel):
 
 
 def vae_encode(tensor, vae):
-    tensor = tensor*2 - 1
     return vae.model.encode(tensor, vae.scale)
 
 
@@ -284,6 +283,7 @@ class WanPipeline(BasePipeline):
             vae = vae_and_clip.vae
             p = next(vae.parameters())
             tensor = tensor.to(p.device, p.dtype)
+            tensor = tensor*2 - 1
             latents = vae_encode(tensor, self.vae)
             ret = {'latents': latents}
 
