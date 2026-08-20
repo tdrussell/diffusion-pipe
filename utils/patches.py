@@ -1,6 +1,8 @@
 from typing import Optional
 import sys
 import os.path
+from functools import reduce
+from operator import mul
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/HunyuanVideo'))
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
@@ -11,6 +13,7 @@ import peft
 from peft.tuners._buffer_dict import BufferDict
 from transformers import CLIPTextModel, AutoModel
 import deepspeed
+from deepspeed.runtime.pipe.engine import PipelineEngine
 from deepspeed.runtime.pipe.schedule import (
     SendGrad, RecvActivation, SendActivation, RecvGrad, LoadMicroBatch, ForwardPass, BackwardPass,
     ReduceTiedGrads, ReduceGrads, OptimizerStep,
@@ -158,6 +161,29 @@ def train_schedule_steps(self):
         # Prepare state for next time
         prev_micro_batch_id = micro_batch_id
         yield cmds
+
+
+def _allocate_or_extend_buffers(self, idx, shape, dtype):
+    # Upstream DeepSpeed reuses pooled recv buffers by numel only and ignores the requested dtype.
+    # The pool is shared between activation recvs (which for some models include int64 tensors, e.g.
+    # flux2's txt_len/img_len/hw) and grad recvs (float only). With pipeline_stages > 2, a middle
+    # stage performs both kinds of recvs: the grad recv reallocates the int64 slots as large float
+    # buffers, and every following activation recv (dynamic_shape re-queries the pool each micro-batch)
+    # gets a float view for the int64 tensors. The corrupted dtypes propagate downstream via the send
+    # meta, the is_floating_point() filter in _exec_recv_grads/_exec_send_grads then disagrees about
+    # how many grad tensors to transfer, and the order-matched p2p send/recvs deadlock permanently.
+    # Fix: also reallocate when the dtype differs.
+    numel = reduce(mul, shape) if len(shape) > 0 else 1
+    if (len(self._grad_layer_buf) <= idx or self._grad_layer_buf[idx].numel() < numel
+            or self._grad_layer_buf[idx].dtype != dtype):
+        new_buf = self._allocate_buffer(shape, dtype=dtype, num_buffers=1)[0]
+        if len(self._grad_layer_buf) <= idx:
+            self._grad_layer_buf.append(new_buf)
+        else:
+            self._grad_layer_buf[idx] = new_buf
+        return self._grad_layer_buf[idx]
+    else:
+        return self._grad_layer_buf[idx].flatten()[:numel].view(shape)
 
 
 def broadcast_model(self):
@@ -427,6 +453,11 @@ def apply_patches():
 
     # Don't fail if there are no trainable parameters on a stage.
     deepspeed.runtime.engine.DeepSpeedEngine.clip_fp32_gradients = lambda self: clip_grad_norm_(parameters=self.module.parameters(), max_norm=self.gradient_clipping(), mpu=self.mpu)
+
+    # Fix pipeline_stages > 2 hanging before the first step (#511): the pooled recv buffers must be
+    # reallocated when the requested dtype differs, otherwise int64 tensors in the inter-stage tuple
+    # get corrupted to float on middle stages and the grad send/recv counts diverge -> NCCL deadlock.
+    PipelineEngine._allocate_or_extend_buffers = _allocate_or_extend_buffers
 
     # Efficiently send Tensors across Queues and Pipes when using the third-party multiprocess library.
     reduction.init_reductions()
