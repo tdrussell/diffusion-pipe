@@ -783,8 +783,13 @@ class DirectoryDataset:
             try:
                 if image_file.suffix in VIDEO_EXTENSIONS:
                     comfy_video = InputImpl.VideoFromFile(filepath_or_file)
-                    width, height = comfy_video.get_dimensions()
-                    source_frames = comfy_video.get_frame_count()
+                    if image_file.suffix.lower() == '.mkv':
+                        # Can't get number of frames (it would show as 0) unless we actually load the video tensor.
+                        components = comfy_video.get_components()
+                        source_frames, height, width, _ = components.images.shape
+                    else:
+                        width, height = comfy_video.get_dimensions()
+                        source_frames = comfy_video.get_frame_count()
                     source_fps = float(comfy_video.get_frame_rate())
 
                     assert self.framerate is not None, "Need model framerate but don't have it. This shouldn't happen. Is the framerate attribute on the model set?"
