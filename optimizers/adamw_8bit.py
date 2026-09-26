@@ -26,17 +26,6 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
 
         state["step"] += 1
         step = state["step"]
-
-        if config["percentile_clipping"] < 100:
-            current_gnorm, clip_value, gnorm_scale = F.percentile_clipping(
-                grad,
-                state["gnorm_vec"],
-                step,
-                config["percentile_clipping"],
-            )
-        else:
-            gnorm_scale = 1.0
-
         shift = state['shift']
 
         # StableAdamW
@@ -61,42 +50,15 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
                 state["state2"],
                 config["betas"][1],
                 config["betas"][2] if len(config["betas"]) >= 3 else 0.0,
-                config["alpha"],
+                config.get("alpha", 0.0),
                 config["weight_decay"],
-                gnorm_scale,
+                1.0,
                 state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
                 max_unorm=config["max_unorm"],
                 skip_zeros=config["skip_zeros"],
             )
 
-        elif state["state1"].dtype == torch.uint8 and not config["block_wise"]:
-            F.optimizer_update_8bit(
-                self.optimizer_name,
-                grad,
-                shift,
-                state["state1"],
-                state["state2"],
-                config["betas"][0],
-                config["betas"][1],
-                config["eps"],
-                step,
-                lr,
-                state["qmap1"],
-                state["qmap2"],
-                state["max1"],
-                state["max2"],
-                state["new_max1"],
-                state["new_max2"],
-                config["weight_decay"],
-                gnorm_scale=gnorm_scale,
-                unorm_vec=state["unorm_vec"] if config["max_unorm"] > 0.0 else None,
-                max_unorm=config["max_unorm"],
-            )
-
-            # swap maxes
-            state["max1"], state["new_max1"] = state["new_max1"], state["max1"]
-            state["max2"], state["new_max2"] = state["new_max2"], state["max2"]
-        elif state["state1"].dtype == torch.uint8 and config["block_wise"]:
+        elif state["state1"].dtype == torch.uint8:
             F.optimizer_update_8bit_blockwise(
                 self.optimizer_name,
                 grad,
@@ -106,7 +68,7 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
                 config["betas"][0],
                 config["betas"][1],
                 config["betas"][2] if len(config["betas"]) >= 3 else 0.0,
-                config["alpha"],
+                config.get("alpha", 0.0),
                 config["eps"],
                 step,
                 lr,
@@ -115,7 +77,7 @@ class AdamW8bitKahan(bitsandbytes.optim.AdamW8bit):
                 state["absmax1"],
                 state["absmax2"],
                 config["weight_decay"],
-                gnorm_scale=gnorm_scale,
+                gnorm_scale=1.0,
                 skip_zeros=config["skip_zeros"],
             )
 
