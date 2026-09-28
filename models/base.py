@@ -553,17 +553,28 @@ class ComfyPipeline(CommonPipeline):
             vae.throw_exception_if_invalid()
 
             def vae_encode_crop_pixels(self, pixels):
-                if not self.crop_input:
-                    return pixels
+                if self.crop_input:
+                    downscale_ratio = self.spacial_compression_encode()
 
-                downscale_ratio = self.spacial_compression_encode()
+                    dims = pixels.shape[-3:-1]  # only change from source
+                    for d in range(len(dims)):
+                        x = (dims[d] // downscale_ratio) * downscale_ratio
+                        x_offset = (dims[d] % downscale_ratio) // 2
+                        if x != dims[d]:
+                            pixels = pixels.narrow(d + 1, x_offset, x)
 
-                dims = pixels.shape[-3:-1]
-                for d in range(len(dims)):
-                    x = (dims[d] // downscale_ratio) * downscale_ratio
-                    x_offset = (dims[d] % downscale_ratio) // 2
-                    if x != dims[d]:
-                        pixels = pixels.narrow(d + 1, x_offset, x)
+                if pixels.shape[-1] > self.output_channels:
+                    pixels = pixels[..., :self.output_channels]
+                elif pixels.shape[-1] < self.output_channels:
+                    if self.pad_channel_value is not None:
+                        if isinstance(self.pad_channel_value, str):
+                            mode = self.pad_channel_value
+                            value = None
+                        else:
+                            mode = "constant"
+                            value = self.pad_channel_value
+
+                        pixels = torch.nn.functional.pad(pixels, (0, self.output_channels - pixels.shape[-1]), mode=mode, value=value)
                 return pixels
 
             # patch this to handle 5D video tensor (original code expects 4D even for video)
@@ -754,7 +765,10 @@ class ComfyPipeline(CommonPipeline):
             token_lengths = [0]*len(captions)
             for i, text in enumerate(captions):
                 tokens = text_encoder.tokenize(text)
-                # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]]}
+                # tokens looks like {'qwen3_4b': [[(0, 1.0), (1, 1.0), (2, 1.0)]], 'keep_vision': False}
+                # keep_vision key first appeared for qwen image 2.1
+                if 'keep_vision' in tokens:
+                    del tokens['keep_vision']
                 for v in tokens.values():
                     L = len(v[0])
                     max_length = max(max_length, L)
@@ -766,9 +780,14 @@ class ComfyPipeline(CommonPipeline):
             for text in captions:
                 tokens = text_encoder.tokenize(text)
                 for k, v in tokens.items():
+                    if k == 'keep_vision':
+                        continue
                     token_list = v[0]
                     maybe_pad(token_list, max_length, tokenizer)  # some tokenizers don't listen to min_length
                     tokens_dict[k].append(token_list)
+
+            if 'keep_vision' in tokens:
+                tokens_dict['keep_vision'] = tokens['keep_vision']
 
             o = text_encoder.encode_from_tokens_scheduled(tokens_dict)
 
