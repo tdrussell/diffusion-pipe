@@ -18,6 +18,7 @@ from deepspeed.accelerator import get_accelerator
 
 
 NS_STEPS = 5
+SINKHORN_ITERATIONS = 5
 
 
 def has_inf_or_nan(x):
@@ -247,6 +248,88 @@ def apply_normuon_variance_reduction(v_chunk, second_momentum_buffer, beta2, red
     return v_chunk.mul_(final_scale.type_as(v_chunk))
 
 
+# SinkGD code taken from: https://github.com/Koratahiu/Advanced_Optimizers
+@torch.compile(dynamic=True, fullgraph=True)
+def apply_sr_sinkhorn(update: torch.Tensor, iters: int = 5, p: torch.Tensor | None = None, ortho_project: bool = False) -> torch.Tensor:
+    """
+    Applies Square-Root Sinkhorn (SR-Sinkhorn) multi-normalization.
+    As described in 'Gradient Multi-Normalization for Efficient LLM Training'.
+
+    This technique normalizes a 2D matrix alternatively by its row-wise L2 norm
+    and column-wise L2 norm, driving it toward a fixed point that uniformly
+    distributes update magnitudes.
+    """
+    original_shape = update.shape
+    original_dtype = update.dtype
+    update = update.float()
+
+    # 1D Vector Case
+    if update.dim() == 1:
+        if ortho_project:
+            p_float = p.float()
+            p_norm_sq = torch.dot(p_float, p_float).add_(1e-30)
+            proj = torch.dot(p_float, update) / p_norm_sq
+            update.sub_(p_float * proj)
+        norm = update.norm(p=2).clamp_min_(1e-12)
+        return update.mul_(math.sqrt(update.numel()) / norm).view(original_shape).to(original_dtype)
+
+    # 2D+ Matrix Case
+    update_2d = update.view(update.shape[0], -1)
+
+    m, n = update_2d.shape
+
+    # Dynamically determine the order of normalization based on aspect ratio
+    # Normalizing the longer dimension first aids stability.
+    scale_cond = update_2d.shape[0] > update_2d.shape[1]
+    dim = 0 if scale_cond else 1
+
+    # Precompute scaling factors.
+    scale_first = math.sqrt(m if scale_cond else n)
+    scale_second = math.sqrt(n if scale_cond else m)
+
+    if ortho_project:
+        param_2d = p.float().view(p.shape[0], -1)
+        p_norm_sq_dim = torch.sum(param_2d * param_2d, dim=dim, keepdim=True).add_(1e-30)
+        p_norm_sq_adim = torch.sum(param_2d * param_2d, dim=1-dim, keepdim=True).add_(1e-30)
+
+    # In-place alternating Sinkhorn normalization steps
+    for _ in range(iters):
+        # First normalization step
+        # Stability floor: equivalent to a single-element vector norm lower bound (lb)
+        norm1_lb = 1 / math.sqrt(update_2d.shape[dim])
+        norm1 = update_2d.norm(p=2, dim=dim, keepdim=True).clamp_min_(norm1_lb)
+        update_2d.mul_(scale_first / norm1)
+        if ortho_project:
+            update_2d = ortho_normed(param_2d, update_2d, p_norm_sq_dim, dim, scale_first)
+
+        # Second normalization step
+        norm2_lb = 1 / math.sqrt(update_2d.shape[1-dim])
+        norm2 = update_2d.norm(p=2, dim=1-dim, keepdim=True).clamp_min_(norm2_lb)
+        update_2d.mul_(scale_second / norm2)
+        if ortho_project:
+            update_2d = ortho_normed(param_2d, update_2d, p_norm_sq_adim, 1-dim, scale_second)
+
+    return update_2d.view(original_shape).to(original_dtype)
+
+
+def ortho_normed(p_2d, update_2d, p_norm_sq, dim, target_norm):
+    """
+    Projects the update to be orthogonal to p along 'dim' and restores the original norm.
+    """
+    # Project: g_orth = g - (p * <p, g> / ||p||^2)
+    dot_prod = torch.sum(p_2d * update_2d, dim=dim, keepdim=True)
+    proj = dot_prod / p_norm_sq
+
+    # In-place subtraction: update_2d = update_2d - (proj * p_2d)
+    update_2d.addcmul_(proj, p_2d, value=-1.0)
+
+    # Magnitude Preservation
+    norm_lb = 1 / math.sqrt(update_2d.shape[dim])
+    g_orth_norm = update_2d.norm(p=2, dim=dim, keepdim=True).clamp_min_(norm_lb)
+    scale_factor = target_norm / g_orth_norm
+    return update_2d.mul_(scale_factor)
+
+
 class GenericOptim(Optimizer):
     """
     Parameters:
@@ -319,6 +402,7 @@ class GenericOptim(Optimizer):
             max_lr=1e-3,
             lr_bump=1e-6, # amount to bump the lr when adjusting
             lr_decrease_factor=1.0, # how much more to decrease the LR vs increase
+            sinkhorn=False,
             skip_invalid_grads=False,
             mpu=None,
     ):
@@ -351,14 +435,14 @@ class GenericOptim(Optimizer):
 
         defaults = {"lr": lr, "betas": betas, "eps": eps, "weight_decay": weight_decay, "correct_bias": correct_bias, 'correct_dim': correct_dim,
                     'muon': muon, 'adamuon': adamuon, 'normuon': normuon, 'automagic': automagic, 'min_lr': min_lr, 'max_lr': max_lr, 'lr_bump': lr_bump,
-                    'lr_decrease_factor': lr_decrease_factor}
+                    'lr_decrease_factor': lr_decrease_factor, 'sinkhorn': sinkhorn}
         super().__init__(params, defaults)
         self.check_params()
         # Print out all configurations
         print(f"GenericOptim Configuration: lr={lr}, betas={betas}, eps={eps}, weight_decay={weight_decay}, "
               f"correct_bias={correct_bias}, momentum_type={momentum_type}, second_moment_type={second_moment_type}, correct_dim={correct_dim}, "
               f"cpu_offload={cpu_offload}, muon={muon}, adamuon={adamuon}, normuon={normuon}, compile={compile}, automagic={automagic}, min_lr={min_lr}, "
-              f"max_lr={max_lr}, lr_bump={lr_bump}, lr_decrease_factor={lr_decrease_factor}")
+              f"max_lr={max_lr}, lr_bump={lr_bump}, lr_decrease_factor={lr_decrease_factor}, sinkhorn={sinkhorn}")
 
     @torch.no_grad()
     def step(self, closure: Callable = None):
@@ -418,12 +502,17 @@ class GenericOptim(Optimizer):
                 muon = group['muon'] and can_use_muon
                 adamuon = group['adamuon'] and can_use_muon
                 normuon = group.get('normuon', False) and can_use_muon
+                sinkhorn = group.get('sinkhorn', False)
 
                 if muon or adamuon or normuon:
                     rows, cols = numerator.shape[-2:]
                     if numerator.ndim == 4: # for the case of conv filters
                         numerator = numerator.view(len(numerator), -1)
                     numerator = self.orthogonalize(numerator)
+                    step_size *= 0.2
+
+                if sinkhorn:
+                    numerator = apply_sr_sinkhorn(numerator, iters=SINKHORN_ITERATIONS, p=p, ortho_project=False)
                     step_size *= 0.2
 
                 if muon:
@@ -447,6 +536,8 @@ class GenericOptim(Optimizer):
                     state['second_momentum_buffer'] = second_momentum_buffer.to(state_device)
                     # same scaling as Muon
                     step_size *= math.sqrt(max(rows, cols))
+                    denominator = None
+                elif sinkhorn:
                     denominator = None
                 else:
                     denominator = self.get_denominator(group, state, p.grad, state_device)
