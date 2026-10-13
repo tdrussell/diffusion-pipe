@@ -1,0 +1,23 @@
+# diffusion-pipe
+
+> A pipeline parallel training script for diffusion models, supporting many image and video models such as SDXL, Flux, Wan2.1, and HunyuanVideo, with LoRA training, checkpointing, and latent caching.
+
+Built around DeepSpeed pipeline parallelism, so it requires Linux or WSL 2, not native Windows. Install via Miniconda, PyTorch, and requirements.txt, then configure training and dataset TOML files from the examples directory and launch the training script. Datasets are directories of images or videos with matching .txt caption files; per-model configuration options are documented in a supported models doc.
+
+## Docs
+
+- [diffusion-pipe](https://raw.githubusercontent.com/tdrussell/diffusion-pipe/main/README.md): Pipeline parallel training script for diffusion models, listing supported models, features, and recent changes.
+- [Features](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#features): Pipeline parallelism, Tensorboard metrics, eval set metrics, checkpointing, latent pre-caching, and easy model subclassing.
+- [Recent changes](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#recent-changes): Changelog of recent releases, including new model support, CFG-augmented training, quantized LoRA training, and cache regeneration notes.
+- [Windows support](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#windows-support): Why native Windows training is impractical and how to use WSL 2 instead.
+- [Installing](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#installing): Cloning with submodules, creating a conda environment, installing PyTorch, nvcc, dependencies, Flash Attention, and Cosmos requirements.
+- [Updating](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#updating): Updating submodules and upgrading unpinned dependencies from requirements.txt.
+- [Dataset preparation](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#dataset-preparation): How to organize image and video directories, caption files, and supported media formats.
+- [Supported models](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#supported-models): Pointer to the supported models doc covering per-model configuration options and saved LoRA formats.
+- [Training](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#training): How to configure and launch training, including example configs, environment variables, and resuming from checkpoints.
+- [Output files](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#output-files): Contents of training run output directories: checkpoints, saved models, LoRAs, and Tensorboard metrics.
+- [Reducing VRAM requirements](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#reducing-vram-requirements): Settings to lower VRAM usage, such as AdamW8BitKahan, block swapping, expandable_segments, and activation checkpointing.
+- [Parallelism](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#parallelism): How hybrid data- and pipeline-parallelism works and how to configure pipeline_stages across GPUs.
+- [Pre-caching](https://github.com/tdrussell/diffusion-pipe/blob/main/README.md#pre-caching): How latents and text embeddings are cached to disk before training, and the caching flags.
+- [A collection of notes on Minimax H3 implementation and training](https://raw.githubusercontent.com/tdrussell/diffusion-pipe/main/docs/minimax_h3_notes.md): Notes on Minimax H3 training: distillation, CFG-augmented training, LoRA quirks, and VRAM behavior.
+- [Summary](https://raw.githubusercontent.com/tdrussell/diffusion-pipe/main/docs/supported_models.md): Per-model training notes for SDXL, Flux, LTX-Video, HunyuanVideo, and Cosmos, including LoRA output formats.
