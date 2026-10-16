@@ -502,7 +502,7 @@ class GenericOptim(Optimizer):
                 muon = group['muon'] and can_use_muon
                 adamuon = group['adamuon'] and can_use_muon
                 normuon = group.get('normuon', False) and can_use_muon
-                sinkhorn = group.get('sinkhorn', False)
+                sinkhorn = group.get('sinkhorn', False) and can_use_muon
 
                 if muon or adamuon or normuon:
                     rows, cols = numerator.shape[-2:]
