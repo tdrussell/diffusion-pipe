@@ -381,6 +381,9 @@ if __name__ == '__main__':
     elif model_type == 'qwen_image21':
         from models import qwen_image21
         model = qwen_image21.QwenImage21Pipeline(config)
+    elif model_type == 'moss_image':
+        from models import moss_image
+        model = moss_image.MossImagePipeline(config)
     else:
         raise NotImplementedError(f'Model type {model_type} is not implemented')
 
