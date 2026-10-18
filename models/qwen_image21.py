@@ -13,6 +13,17 @@ import comfy.latent_formats
 from comfy.ldm.qwen_image21.model import block_causal_attention
 
 
+def _gated_residual(x, y, gate, prefix_len):
+    g_prefix, g_target = gate
+    out = torch.addcmul(x, y, g_target)
+    if prefix_len:
+        out[:, :prefix_len] = torch.addcmul(x[:, :prefix_len], y[:, :prefix_len], g_prefix)
+    return out
+
+# remove in-place operation which breaks backward()
+comfy.ldm.qwen_image21.model._gated_residual = _gated_residual
+
+
 def _split_rows(p):
     # shared modulation rows: (t = 0 row for text and references, sampled-t rows for the target)
     return p[-1:].unsqueeze(1), p[:-1].unsqueeze(1)
