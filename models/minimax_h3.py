@@ -14,7 +14,7 @@ from utils.offloading import ModelOffloader
 import comfy.latent_formats
 import comfy.model_management
 import comfy.ldm.minimax.model
-from comfy.ldm.modules.attention import optimized_attention
+from comfy.ldm.modules.attention import ComfyAttention, AttentionTensorContainer, optimized_attention
 from comfy.ldm.minimax.model import (
     PackedLayout, time_shift_sigma, VISUAL_COND_TIMESTEP, AUDIO_COND_TIMESTEP, patchify_video, pack_audio,
     rope_rotation_table, unpatchify_video, unpack_audio, MLP, AdalnProj,
@@ -68,8 +68,9 @@ comfy.ldm.minimax.model._mod_gate = _mod_gate
 
 
 class Attention(nn.Module):
-    def __init__(self, hidden, heads, head_dim, eps, dtype=None, device=None, operations=None):
+    def __init__(self, hidden, heads, head_dim, eps, gate_compress=False, dtype=None, device=None, operations=None):
         super().__init__()
+        self.comfy_attention = ComfyAttention()
         self.heads = heads
         self.head_dim = head_dim
         inner = heads * head_dim
@@ -77,13 +78,17 @@ class Attention(nn.Module):
         self.q_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.k_norm = operations.RMSNorm(head_dim, eps=eps, dtype=dtype, device=device)
         self.out_proj = operations.Linear(inner, hidden, bias=False, dtype=dtype, device=device)
+        self.to_gate_compress = None
+        if gate_compress:
+            # VSA gate, unused by the dense forward; consumed by sparse attention patches
+            self.to_gate_compress = operations.Linear(hidden, inner, bias=False, dtype=dtype, device=device)
 
     def forward(self, x, rope_freqs=None, attention_mask=None, transformer_options={}):
         b, s = x.shape[:2]
         q, k, v = self.qkv_proj(x).split(self.heads * self.head_dim, dim=-1)
         v = v.view(b, s, self.heads, self.head_dim)
         if rope_freqs is not None:
-            # fused per-head RMSNorm + partial split-half rope
+            # fused per-head RMSNorm + partial split-half rope, in  on the qkv buffer
             q = q.view(b, s, self.heads, self.head_dim)
             k = k.view(b, s, self.heads, self.head_dim)
             qw = comfy.model_management.cast_to(self.q_norm.weight, device=x.device)
@@ -94,10 +99,11 @@ class Attention(nn.Module):
         else:
             q = self.q_norm(q.view(b, s, self.heads, self.head_dim))
             k = self.k_norm(k.view(b, s, self.heads, self.head_dim))
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        out = optimized_attention(q, k, v, self.heads, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
+
+        q = AttentionTensorContainer(q.transpose(1, 2))
+        k = AttentionTensorContainer(k.transpose(1, 2))
+        v = AttentionTensorContainer(v.transpose(1, 2))
+        out = optimized_attention(q, k, v, self.heads, preferred_attention=self.comfy_attention, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
         return self.out_proj(out)
 
 # Patch to force eager rms_rope_split_half so backward works. Even using offical methods to set 'eager' in comfy kitchen doesn't work.
@@ -126,20 +132,22 @@ comfy.ldm.minimax.model.AdalnProj = AdalnProj
 
 class DiTBlock(nn.Module):
     def __init__(self, hidden, heads, head_dim, ffn, t_dim, eps, qk_eps,
-                 apply_silu=True, adaln_dtype=None, dtype=None, device=None, operations=None):
+                 apply_silu=True, adaln_dtype=None, gate_compress=False, dtype=None, device=None, operations=None):
         super().__init__()
         self.norm1 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.norm2 = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
-        self.attn = Attention(hidden, heads, head_dim, qk_eps, dtype=dtype, device=device, operations=operations)
+        self.attn = Attention(hidden, heads, head_dim, qk_eps, gate_compress=gate_compress,
+                              dtype=dtype, device=device, operations=operations)
         self.mlp = MLP(hidden, ffn, dtype=dtype, device=device, operations=operations)
         self.adaln_proj = AdalnProj(t_dim, hidden, 6, 3, apply_silu=apply_silu,
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
 
-    def forward(self, x, t_emb, mod_segments, rope_freqs, attention_mask=None, transformer_options={}):
+    def forward(self, x, t_emb, mod_segments, rope_freqs, transformer_options={}, attention=None, attention_mask=None):
+        attention = self.attn if attention is None else attention
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = _mod_scale_shift(self.norm1(x), shift_msa, scale_msa, mod_segments)
-        x = _mod_gate(x, gate_msa, self.attn(h, rope_freqs=rope_freqs, attention_mask=attention_mask, transformer_options=transformer_options), mod_segments)
+        x = _mod_gate(x, gate_msa, attention(h, rope_freqs=rope_freqs, transformer_options=transformer_options, attention_mask=attention_mask), mod_segments)
         h = _mod_scale_shift(self.norm2(x), shift_mlp, scale_mlp, mod_segments)
         return _mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 
@@ -648,7 +656,6 @@ class InitialLayer(nn.Module):
         return outputs
 
     # TODO: will need to handle text_token_tags (and probably more) for reference images. it's all 1s for pure text prompt
-    # TODO: would be good to allow batch_size>1, but have to change a lot of this code and also pass context_mask through
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
