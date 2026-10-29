@@ -44,6 +44,7 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     assert layer_to_cpu.__class__ == layer_to_cuda.__class__
 
     weight_swap_jobs = []
+    incompatible_swap_jobs = []
 
     # This is not working for all cases (e.g. SD3), so we need to find the corresponding modules
     # for module_to_cpu, module_to_cuda in zip(layer_to_cpu.modules(), layer_to_cuda.modules()):
@@ -52,16 +53,29 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
     #         weight_swap_jobs.append((module_to_cpu, module_to_cuda, module_to_cpu.weight.data, module_to_cuda.weight.data))
 
     modules_to_cpu = {k: v for k, v in layer_to_cpu.named_modules()}
+    seen_weights = set()
     for module_to_cuda_name, module_to_cuda in layer_to_cuda.named_modules():
         if 'lora' in module_to_cuda_name:
             continue
         if (weight_to_cuda := getattr(module_to_cuda, 'weight', None)) is not None:
+            # PEFT exposes the same weight on the wrapper and its base_layer.
+            if id(weight_to_cuda) in seen_weights:
+                continue
+            seen_weights.add(id(weight_to_cuda))
             weight_to_cpu = modules_to_cpu[module_to_cuda_name].weight if module_to_cuda_name in modules_to_cpu else None
             if weight_to_cpu is not None and weight_to_cpu.shape == weight_to_cuda.shape:
-                if hasattr(weight_to_cuda, '_qdata'):
-                    weight_swap_jobs.append((weight_to_cpu, weight_to_cuda, weight_to_cpu._qdata))
+                cpu_is_quantized = hasattr(weight_to_cpu, '_qdata')
+                cuda_is_quantized = hasattr(weight_to_cuda, '_qdata')
+                outgoing = weight_to_cpu._qdata if cpu_is_quantized else weight_to_cpu.data
+                incoming = weight_to_cuda._qdata if cuda_is_quantized else weight_to_cuda.data
+                # Equal logical shapes do not imply equal storage: BF16 edge blocks
+                # and INT8 middle blocks cannot reuse each other's CUDA buffers.
+                if (cpu_is_quantized == cuda_is_quantized
+                        and outgoing.shape == incoming.shape and outgoing.dtype == incoming.dtype
+                        and outgoing.device.type == device.type and incoming.device.type == 'cpu'):
+                    weight_swap_jobs.append((weight_to_cpu, weight_to_cuda, outgoing))
                 else:
-                    weight_swap_jobs.append((weight_to_cpu, weight_to_cuda, weight_to_cpu.data))
+                    incompatible_swap_jobs.append((weight_to_cpu, weight_to_cuda))
             else:
                 if weight_to_cuda.data.device.type != device.type:
                     # print(
@@ -72,6 +86,7 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
                     else:
                         weight_to_cuda.data = weight_to_cuda.data.to(device)
 
+    outgoing = incoming = None
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
 
     stream = torch.cuda.Stream()
@@ -84,7 +99,18 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
             else:
                 weight_to_cpu.data = cuda_data_view.to("cpu", non_blocking=True)
 
+        for weight_to_cpu, _ in incompatible_swap_jobs:
+            outgoing = weight_to_cpu._qdata if hasattr(weight_to_cpu, '_qdata') else weight_to_cpu.data
+            if outgoing.device.type == 'cuda':
+                outgoing.record_stream(stream)
+            moved = outgoing.to("cpu", non_blocking=True)
+            if hasattr(weight_to_cpu, '_qdata'):
+                weight_to_cpu._qdata = moved
+            else:
+                weight_to_cpu.data = moved
+
         stream.synchronize()
+        outgoing = None
 
         # cpu to cuda
         for weight_to_cpu, weight_to_cuda, cuda_data_view in weight_swap_jobs:
@@ -94,6 +120,14 @@ def swap_weight_devices_cuda(device: torch.device, layer_to_cpu: nn.Module, laye
             else:
                 cuda_data_view.copy_(weight_to_cuda.data, non_blocking=True)
                 weight_to_cuda.data = cuda_data_view
+
+        for _, weight_to_cuda in incompatible_swap_jobs:
+            incoming = weight_to_cuda._qdata if hasattr(weight_to_cuda, '_qdata') else weight_to_cuda.data
+            moved = incoming.to(device, non_blocking=True)
+            if hasattr(weight_to_cuda, '_qdata'):
+                weight_to_cuda._qdata = moved
+            else:
+                weight_to_cuda.data = moved
 
     stream.synchronize()
     torch.cuda.current_stream().synchronize()  # this prevents the illegal loss value
