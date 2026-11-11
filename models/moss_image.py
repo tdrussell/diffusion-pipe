@@ -31,9 +31,9 @@ def attention(q, k, v, q_norm, k_norm, pe, heads, comfy_attention, transformer_o
         comfy.ops.uncast_bias_weight(q_norm, q_scale, None, q_stream)
         comfy.ops.uncast_bias_weight(k_norm, k_scale, None, k_stream)
     q, k, v = AttentionTensorContainer(q.flatten(2)), AttentionTensorContainer(k.flatten(2)), AttentionTensorContainer(v)
-    return optimized_attention(q, k, v, heads, mask=mask, transformer_options=transformer_options, preferred_attention=comfy_attention)
+    return optimized_attention(q, k, v, heads, mask=mask, transformer_options=transformer_options)
 
-# Support mask. Cast Q, K (float32) to V's dtype.
+# Support mask. Cast Q, K (float32) to V's dtype. Don't use preferred_attention (with int8_convot checkpoint, would use int8 attn for some layers which doesn't work for training).
 comfy.ldm.moss_image.model.attention = attention
 
 
@@ -137,12 +137,6 @@ class MossImagePipeline(ComfyPipeline):
             layers.append(TransformerLayer(block, i, transformer_options, self.offloader))
         layers.append(FinalLayer(diffusion_model))
         return layers
-
-    def patch_quantized_modules(self, model):
-        num_patched_classes = super().patch_quantized_modules(model)
-        if num_patched_classes > 0:
-            raise NotImplementedError(f'Training LoRA on quantized weights will not work for MOSS-Image (training will not converge; training loss goes up sharply)')
-        return 0
 
     def get_conds(self, inputs):
         text_embeds = inputs['text_embeds_0']

@@ -673,7 +673,7 @@ Everything is ComfyUI model format. Only T2I is currently supported. I2I edit tr
 ```
 [model]
 type = 'moss_image'
-diffusion_model = '/data2/imagegen_models/comfyui-models/moss_image_base_bf16.safetensors'
+diffusion_model = '/data2/imagegen_models/comfyui-models/moss_image_base_int8_convrot_attn.safetensors'
 vae = '/data2/imagegen_models/comfyui-models/flux2-vae.safetensors'
 text_encoders = [
     {path = '/data2/imagegen_models/comfyui-models/qwen3.5_9b_int8_convrot.safetensors', type = 'moss_image'}
@@ -682,4 +682,4 @@ dtype = 'bfloat16'
 timestep_sample_method = 'logit_normal'
 shift = 3
 ```
-The int8-convrot format will NOT work right for training LoRAs. Loss just goes up sharply. I don't know why; it only happens on this model. You need the full bf16. `diffusion_model_dtype = 'float8'` probably works if you need the VRAM savings, but it will have some quality loss and I haven't tested it. All input models and saved models are in ComfyUI format.
+All input models and saved models are in ComfyUI format.
