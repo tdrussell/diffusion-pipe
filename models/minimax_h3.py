@@ -1,6 +1,7 @@
 import os
 import sys
 import types
+import random
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import torch
@@ -99,11 +100,13 @@ class Attention(nn.Module):
         else:
             q = self.q_norm(q.view(b, s, self.heads, self.head_dim))
             k = self.k_norm(k.view(b, s, self.heads, self.head_dim))
+        q = q.to(v.dtype)
+        k = k.to(v.dtype)
 
         q = AttentionTensorContainer(q.transpose(1, 2))
         k = AttentionTensorContainer(k.transpose(1, 2))
         v = AttentionTensorContainer(v.transpose(1, 2))
-        out = optimized_attention(q, k, v, self.heads, preferred_attention=self.comfy_attention, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
+        out = optimized_attention(q, k, v, self.heads, mask=attention_mask, skip_reshape=True, transformer_options=transformer_options)
         return self.out_proj(out)
 
 # Patch to force eager rms_rope_split_half so backward works. Even using offical methods to set 'eager' in comfy kitchen doesn't work.
@@ -155,26 +158,97 @@ class DiTBlock(nn.Module):
 comfy.ldm.minimax.model.DiTBlock = DiTBlock
 
 
+def _mod_row(vecs, row, dtype):
+    # row is a mod-row index, or a per-token LongTensor of mod-row indices
+    return vecs[:, row, None].to(dtype)
+
+
+def pdd_grid_span(grid, sigma_v: float, sigma_v_next=None):
+    """Head interval [start, stop) for PDD heads distilled on an explicit
+    decreasing sigma grid (n + 1 points, MiniMax-H3-Image). A sampling step
+    spans the grid points nearest sigma -> sigma_next (ComfyUI's rule); a
+    single training sigma uses the one interval containing it."""
+    n = len(grid) - 1
+    if sigma_v_next is None:
+        start = 0
+        for k in range(n):
+            # tolerance: a float32 sigma sitting on a grid point owns that head
+            if grid[k] >= sigma_v - 1e-5:
+                start = k
+        return start, start + 1
+    start, stop = (
+        min(range(n + 1), key=lambda k: abs(grid[k] - float(s)))
+        for s in (sigma_v, sigma_v_next)
+    )
+    start = min(start, n - 1)
+    return start, max(stop, start + 1)
+
+
+def build_pdd_grid_weights(sigma_v, grid, sigma_v_next=None) -> torch.Tensor:
+    """(B, n) head weights on an explicit sigma grid: head 0 (the full head)
+    at 1, the offset heads a step spans at their normalized dt share."""
+    n = len(grid) - 1
+    rows = []
+    for i in range(len(sigma_v)):
+        nxt = None if sigma_v_next is None else float(sigma_v_next[i])
+        start, stop = pdd_grid_span(grid, float(sigma_v[i]), nxt)
+        dt = [grid[k] - grid[k + 1] for k in range(start, stop)]
+        w = torch.zeros(n, dtype=torch.float64)
+        w[0] = 1.0
+        first = max(start, 1)
+        w[first:stop] = torch.tensor(dt[first - start :], dtype=torch.float64) / sum(dt)
+        rows.append(w)
+    return torch.stack(rows).float()
+
+
+# ref: https://github.com/ostris/ai-toolkit/blob/main/extensions_built_in/diffusion_models/minimax_h3/src/transformer.py
+def _blend_pdd_heads(out: torch.Tensor, weights: torch.Tensor, n: int):
+    """(B, N, n * d) stacked head outputs, (B, n) weights -> (B, N, d)."""
+    b, rows, _ = out.shape
+    return torch.einsum(
+        "brkd,bk->brd", out.view(b, rows, n, -1), weights.to(out.device, out.dtype)
+    )
+
+
 class FinalLayer(nn.Module):
-    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None,
+    def __init__(self, hidden, t_dim, video_dim, audio_dim, eps, apply_silu=True, adaln_dtype=None, pdd_steps=1,
                  dtype=None, device=None, operations=None):
         super().__init__()
+        self.video_dim = video_dim
         self.norm = operations.RMSNorm(hidden, eps=eps, dtype=dtype, device=device)
         self.adaln_proj = AdalnProj(t_dim, hidden, 2, 1, apply_silu=apply_silu,
                                     dtype=adaln_dtype if adaln_dtype is not None else dtype,
                                     device=device, operations=operations)
-        # output heads are the checkpoint's fp32 island; norm/adaln are stored at model dtype
-        self.video_out = operations.Linear(hidden, video_dim, bias=True, dtype=torch.float32, device=device)
-        self.audio_out = operations.Linear(hidden, audio_dim, bias=True, dtype=torch.float32, device=device)
+        # output heads are the checkpoint's fp32 island; norm/adaln are stored at model dtype.
+        # a PDD checkpoint ships pdd_steps stacked heads per stream (a PDD LoRA grows plain heads to the same layout)
+        self.video_out = operations.Linear(hidden, video_dim * pdd_steps, bias=True, dtype=torch.float32, device=device)
+        self.audio_out = None
+        if audio_dim is not None:
+            self.audio_out = operations.Linear(hidden, audio_dim * pdd_steps, bias=True, dtype=torch.float32, device=device)
 
-    def forward(self, x, t_emb, video_seg, audio_seg):
-        # video_seg / audio_seg: (start, stop, timestep_row) of the target streams
+    @property
+    def pdd_steps(self):
+        return self.video_out.weight.shape[0] // self.video_dim
+
+    def _modulate(self, x, shift, scale, seg):
+        # seg: (start, stop, row) of a target stream, where row is a mod-row index or a per-token blend (see _mod_row)
+        a, b, row = seg
+        return (self.norm(x[:, a:b]) * (1.0 + _mod_row(scale, row, scale.dtype)) + _mod_row(shift, row, shift.dtype)).to(torch.float32)
+
+    def forward(self, x, t_emb, video_seg, audio_seg, sigma, grids):
+        # grids: one decreasing sigma grid (pdd_steps + 1 points) per output stream, video first; a
+        # model without an audio stream passes one grid
         shift, scale = self.adaln_proj(t_emb)
-        va, vb, vrow = video_seg
-        aa, ab, arow = audio_seg
-        hv = (self.norm(x[:, va:vb]) * (1.0 + scale[:, vrow, None]) + shift[:, vrow, None]).to(torch.float32)
-        ha = (self.norm(x[:, aa:ab]) * (1.0 + scale[:, arow, None]) + shift[:, arow, None]).to(torch.float32)
-        return self.video_out(hv), self.audio_out(ha)
+        n = self.pdd_steps
+        out = []
+        for head, seg, grid in zip((self.video_out, self.audio_out), (video_seg, audio_seg), grids):
+            h = self._modulate(x, shift, scale, seg)
+            h = head(h)
+            if n > 1:
+                pdd_weights = build_pdd_grid_weights(sigma, grid)
+                h = _blend_pdd_heads(h, pdd_weights, n)
+            out.append(h)
+        return out
 
 # batch-enabled
 comfy.ldm.minimax.model.FinalLayer = FinalLayer
@@ -246,10 +320,11 @@ class MinimaxH3Pipeline(ComfyPipeline):
             vae_list = [vae]
 
             # audio VAE
-            sd = comfy.utils.load_torch_file(self.model_config['audio_vae'])
-            vae = comfy.sd.VAE(sd=sd)
-            vae.throw_exception_if_invalid()
-            vae_list.append(vae)
+            if audio_vae_path := self.model_config.get('audio_vae'):
+                sd = comfy.utils.load_torch_file(audio_vae_path)
+                vae = comfy.sd.VAE(sd=sd)
+                vae.throw_exception_if_invalid()
+                vae_list.append(vae)
 
             return vae_list
 
@@ -279,7 +354,9 @@ class MinimaxH3Pipeline(ComfyPipeline):
         return PreprocessMediaFileMinimax(self.config)
 
     def vae_encode(self, img: torch.Tensor, audio: list):
-        video_vae, audio_vae = self.vae._model
+        vaes = self.vae._model
+        video_vae = vaes[0]
+        audio_vae = vaes[1] if len(vaes) == 2 else None
         # move channel dim to end
         # works for both images (b c h w) and video (b c f h w)
         img = img.movedim(1, -1)
@@ -288,14 +365,17 @@ class MinimaxH3Pipeline(ComfyPipeline):
             # some older models do this in prepare_inputs() so it can be None
             latents = self.latent_format.process_in(latents)
 
-        audio_latents = []
-        for a in audio:
-            if a is not None:
-                assert a.shape[0] == 1
-                a_latents = audio_vae.encode(a.movedim(1, -1))
-            else:
-                a_latents = None
-            audio_latents.append(a_latents)
+        if audio_vae is not None:
+            audio_latents = []
+            for a in audio:
+                if a is not None:
+                    assert a.shape[0] == 1
+                    a_latents = audio_vae.encode(a.movedim(1, -1))
+                else:
+                    a_latents = None
+                audio_latents.append(a_latents)
+        else:
+            audio_latents = [None]*len(audio)
 
         return latents, audio_latents
 
@@ -373,33 +453,38 @@ class MinimaxH3Pipeline(ComfyPipeline):
             mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
             mask = mask.unsqueeze(2)
 
-        timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
-
-        if timestep_sample_method == 'logit_normal':
-            dist = torch.distributions.normal.Normal(0, 1)
-        elif timestep_sample_method == 'uniform':
-            dist = torch.distributions.uniform.Uniform(0, 1)
+        if hasattr(self.diffusion_model, 'pdd_sigmas'):  # Image model
+            valid_timesteps = self.diffusion_model.pdd_sigmas[:-1]  # ends with 0, slice it off
+            # Ostris training adapter was trained for the inference timesteps only.
+            t = torch.tensor(random.choices(valid_timesteps, k=bs))
         else:
-            raise NotImplementedError()
+            timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
 
-        if timestep_quantile is not None:
-            t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
-        else:
-            t = dist.sample((bs,)).to(device)
+            if timestep_sample_method == 'logit_normal':
+                dist = torch.distributions.normal.Normal(0, 1)
+            elif timestep_sample_method == 'uniform':
+                dist = torch.distributions.uniform.Uniform(0, 1)
+            else:
+                raise NotImplementedError()
 
-        if timestep_sample_method == 'logit_normal':
-            sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
-            t = t * sigmoid_scale
-            t = torch.sigmoid(t)
+            if timestep_quantile is not None:
+                t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
+            else:
+                t = dist.sample((bs,)).to(device)
 
-        shift = self.model_config.get('shift', None)
-        if f == 1:
-            shift = self.model_config.get('image_shift', shift)
-        if shift:
-            t = (t * shift) / (1 + (shift - 1) * t)
-        elif self.model_config.get('flux_shift', False):
-            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
-            t = time_shift(mu, 1.0, t)
+            if timestep_sample_method == 'logit_normal':
+                sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
+                t = t * sigmoid_scale
+                t = torch.sigmoid(t)
+
+            shift = self.model_config.get('shift', None)
+            if f == 1:
+                shift = self.model_config.get('image_shift', shift)
+            if shift:
+                t = (t * shift) / (1 + (shift - 1) * t)
+            elif self.model_config.get('flux_shift', False):
+                mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+                t = time_shift(mu, 1.0, t)
 
         noise = torch.randn_like(latents)
         t_expanded = t.view(-1, 1, 1, 1, 1)
@@ -501,7 +586,7 @@ class InitialLayer(nn.Module):
             self.adaln_t_table = model.adaln_t_table
         else:
             self.time_embedder = model.time_embedder
-        self.audio_patch_proj = model.audio_patch_proj
+        self.audio_patch_proj = getattr(model, 'audio_patch_proj', None)
         self.video_patch_proj = model.video_patch_proj
         self.condition_proj = model.condition_proj
         self.rope = model.rope
@@ -536,26 +621,29 @@ class InitialLayer(nn.Module):
         shift_v = float(transformer_options.get("minimax_h3_sigma_shift_video", self.sigma_shift_video))
         shift_a = float(transformer_options.get("minimax_h3_sigma_shift_audio", self.sigma_shift_audio))
         sigma_v = (t.flatten()[0]).float().clamp(min=1e-6)  # I removed the 1000 from original comfy code since our t is [0, 1]
-        t_v = float(1.0 - sigma_v)
-        t_a = float(1.0 - time_shift_sigma(sigma_v, shift_v, shift_a))
+        t_v = float(1.0 - sigma_v.item())
+        t_a = float(1.0 - time_shift_sigma(sigma_v.item(), shift_v, shift_a))
 
         # distinct timesteps are known analytically: text/pad follow video, cond rows pin near 1
         vis_aug = float(payload.get("visual_cond_noise_aug", VISUAL_COND_TIMESTEP))
         aud_aug = float(payload.get("audio_cond_noise_aug", AUDIO_COND_TIMESTEP))
         has_vis_cond = any(k in ("cond", "ref_img") for _, _, k in layout.segments)
         has_aud_cond = any(k == "ref_audio" for _, _, k in layout.segments)
-        seg_t = {"text": t_v, "video": t_v, "audio": t_a,
-                 "cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug),
-                 "ref_audio": max(t_a, aud_aug)}
-        unique_t = sorted({t_v, t_a} | ({seg_t["cond"]} if has_vis_cond else set())
-                          | ({seg_t["ref_audio"]} if has_aud_cond else set()))
-        t_row = {t: i for i, t in enumerate(unique_t)}
+        # Changed from original: not unique t values anymore. t_v, t_a could be same, in which case
+        # deduping could cause diff number of unique t among items in a batch, breaking a stack().
+        seg_t = {"text": t_v, "video": t_v, "audio": t_a}
+        if has_vis_cond:
+            seg_t.update({"cond": max(t_v, vis_aug), "ref_img": max(t_v, vis_aug)})
+        if has_aud_cond:
+            seg_t.update({"ref_audio": max(t_a, aud_aug)})
+        all_t = list(seg_t.values())
+        t_row = {kind: i for i, kind in enumerate(seg_t.keys())}
         seg_tag = {"text": 1, "video": 0, "audio": 2, "cond": 0, "ref_img": 0, "ref_audio": 2}
 
         text_tags = payload.get("text_token_tags")
         mod_segments = []
         for a, b, kind in layout.segments:
-            row_base = t_row[seg_t[kind]] * 3
+            row_base = t_row[kind] * 3
             if kind == "text" and text_tags is not None:
                 # the presentation text span mixes tags (vision pads carry the video modality) split into tag runs
                 tags = text_tags.view(-1).tolist()
@@ -587,7 +675,10 @@ class InitialLayer(nn.Module):
             all_audio_rows[audio_update] = audio_rows
 
         video_embed = self.video_patch_proj(all_video_rows).to(dtype)
-        audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
+        if self.audio_patch_proj is not None:
+            audio_embed = self.audio_patch_proj(all_audio_rows).to(dtype)
+        else:
+            audio_embed = torch.empty([0, video_embed.shape[-1]], dtype=dtype, device=video_embed.device)
 
         text_states = context
         if text_states.shape[-1] != self.hidden_size:
@@ -611,7 +702,7 @@ class InitialLayer(nn.Module):
                 h[a:b] = audio_embed[aoff:aoff + n]
                 aoff += n
 
-        t_vals = torch.tensor(unique_t, dtype=torch.float32, device=device)
+        t_vals = torch.tensor(all_t, dtype=torch.float32, device=device)
         if self.use_adaln_curves:
             # adaln projections consume interpolated coordinates of the time-embedding curve
             table = comfy.model_management.cast_to(self.adaln_t_table, device=device)
@@ -624,19 +715,22 @@ class InitialLayer(nn.Module):
         # rotation table computed once per forward, consumed by the kitchen split-half rope
         rope_freqs = rope_rotation_table(self.rope_freqs(layout.position_ids, device), dtype)
 
-        video_seg = next((a, b, t_row[seg_t["video"]]) for a, b, k in layout.segments if k == "video")
-        audio_seg = next((a, b, t_row[seg_t["audio"]]) for a, b, k in layout.segments if k == "audio")
+        video_seg = next((a, b, t_row["video"]) for a, b, k in layout.segments if k == "video")
+        audio_seg = next(
+            ((a, b, t_row["audio"]) for a, b, k in layout.segments if k == "audio"),
+            (0, 0, t_row["audio"]),
+        )
         # pack these as ints so we can pass as tensor between pipeline parallel layers
         mod_segments = torch.tensor(mod_segments, dtype=torch.int32, device=h.device)
         extra_ints = torch.tensor([*video_seg, *audio_seg, latent_t, lat_h, lat_w], dtype=torch.int32, device=h.device)
 
-        return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints
+        return h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, sigma_v
 
     def make_layer_inputs(self, video_x, audio_x, valid_audio, t, context, context_mask):
         first_mod_seqments = None
-        h_list, attention_mask_list, t_emb_list = [], [], []
+        h_list, attention_mask_list, t_emb_list, sigma_v_list = [], [], [], []
         for items in zip(video_x, audio_x, valid_audio, t, context, context_mask):
-            h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints = self.make_packed_sequence(*(x.unsqueeze(0) for x in items))
+            h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, sigma_v = self.make_packed_sequence(*(x.unsqueeze(0) for x in items))
             if first_mod_seqments is None:
                 first_mod_seqments = mod_segments
             else:
@@ -645,11 +739,13 @@ class InitialLayer(nn.Module):
             h_list.append(h)
             attention_mask_list.append(attention_mask)
             t_emb_list.append(t_emb)
+            sigma_v_list.append(sigma_v)
 
         h = torch.stack(h_list, dim=0)
         attention_mask = torch.stack(attention_mask_list, dim=0)[:, None, None, :]  # 4D bool for SDPA
         t_emb = torch.stack(t_emb_list)
-        outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints)
+        sigma_v = torch.stack(sigma_v_list)
+        outputs = make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, sigma_v)
         for item in outputs:
             if torch.is_floating_point(item):
                 item.requires_grad_(True)
@@ -687,13 +783,13 @@ class TransformerLayer(nn.Module):
 
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     def forward(self, inputs):
-        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors = inputs
+        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, sigma_v, *uncond_tensors = inputs
 
         self.offloader.wait_for_block(self.block_idx)
 
         h = self.layer(h, t_emb, mod_segments.tolist(), rope_freqs, attention_mask=attention_mask)
         if len(uncond_tensors) > 0:
-            h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond = uncond_tensors
+            h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond, sigma_v_uncond = uncond_tensors
             # TODO: in the unsloth checkpointer, it only sees no_backward for all 5 tensors on the very first layer. For all other layers,
             # it's only set on h_uncond. This works, and it avoids saving the one large tensor, but why is it like this?
             if h_uncond is None:
@@ -702,13 +798,13 @@ class TransformerLayer(nn.Module):
             else:
                 with torch.no_grad():
                     h_uncond = self.layer(h_uncond, t_emb, mod_segments_uncond.tolist(), rope_freqs_uncond, attention_mask=attention_mask_uncond)
-                uncond_tensors = (h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond)
+                uncond_tensors = (h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond, sigma_v_uncond)
                 for x in uncond_tensors:
                     x.no_backward = True
 
         self.offloader.submit_move_blocks_forward(self.block_idx)
 
-        return make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors)
+        return make_contiguous(h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, sigma_v, *uncond_tensors)
 
 
 class FinalLayer(nn.Module):
@@ -717,6 +813,7 @@ class FinalLayer(nn.Module):
         self.final_layer = model.final_layer
         self.model = [model]
         self.cfg = cfg
+        self.pdd_sigmas = getattr(model, 'pdd_sigmas', None)
 
     def __getattr__(self, name):
         return getattr(self.model[0], name)
@@ -724,18 +821,27 @@ class FinalLayer(nn.Module):
     @torch.autocast('cuda', dtype=AUTOCAST_DTYPE)
     @torch.compiler.disable
     def forward(self, inputs):
-        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, *uncond_tensors = inputs
+        h, attention_mask, t_emb, mod_segments, rope_freqs, extra_ints, sigma_v, *uncond_tensors = inputs
         video_seg = extra_ints[:3]
         audio_seg = extra_ints[3:6]
         latent_t, lat_h, lat_w = extra_ints[6:]
 
-        v, a = self.final_layer(h, t_emb, video_seg, audio_seg)
+        if self.pdd_sigmas is not None:
+            # Image model
+            grids = (self.pdd_sigmas,)
+            v, = self.final_layer(h, t_emb, video_seg, audio_seg, sigma_v.detach(), grids)
+            a = torch.empty([v.shape[0], 0, 32], device=v.device)
+        else:
+            # Video model
+            grids = (None, None)  # final_layer doesn't use these, and it should fail if it did for some reason.
+            v, a = self.final_layer(h, t_emb, video_seg, audio_seg, sigma_v.detach(), grids)
         video_out = unpatchify_video(v, latent_t, lat_h // 2, lat_w // 2, self.latents_dim, self.patch_size)
         audio_out = unpack_audio(a)
 
         if len(uncond_tensors) > 0:
             assert self.cfg > 1
-            h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond = uncond_tensors
+            assert self.pdd_sigmas is None  # should be training the image model with an adapter, never with CFG-augmented output
+            h_uncond, attention_mask_uncond, mod_segments_uncond, rope_freqs_uncond, extra_ints_uncond, sigma_v_uncond = uncond_tensors
             video_seg = extra_ints_uncond[:3]
             audio_seg = extra_ints_uncond[3:6]
             latent_t, lat_h, lat_w = extra_ints_uncond[6:]
@@ -747,9 +853,13 @@ class FinalLayer(nn.Module):
             video_out = (video_out + (self.cfg-1)*video_out_uncond) / self.cfg
             audio_out = (audio_out + (self.cfg-1)*audio_out_uncond) / self.cfg
 
+        # Make float tensors have a valid grad, avoiding a "assert buffer.grad is not None" error with pipeline parallelism.
+        # TODO: this is so ugly, is there a better way?
+        zero_but_has_grad = sum(x.flatten()[0]*0 for x in (t_emb, rope_freqs, sigma_v))
+
         # We don't scale the audio's velocity like in inference, since that is an inference-only
         # hack in order to use a single sampling schedule.
-        return -video_out, -audio_out
+        return -video_out + zero_but_has_grad, -audio_out
 
 
 # class Wrapper(nn.Module):

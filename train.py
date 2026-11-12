@@ -274,6 +274,7 @@ def _get_automagic_lrs(optimizer):
 
 
 if __name__ == '__main__':
+    torch._functorch.config.donated_buffer = False  # fixes a compile failure originally seen on MiniMax H3
     # With multiple GPUs / large batch sizes, the dataloader can trigger "too many open files" errors unless we do this.
     torch.multiprocessing.set_sharing_strategy('file_system')
     deepspeed.utils.set_log_level_from_string('info')
@@ -375,7 +376,7 @@ if __name__ == '__main__':
     elif model_type == 'krea2':
         from models import krea2
         model = krea2.Krea2Pipeline(config)
-    elif model_type == 'minimax_h3':
+    elif model_type == 'minimax_h3' or model_type == 'minimax_h3_image':
         from models import minimax_h3
         model = minimax_h3.MinimaxH3Pipeline(config)
     elif model_type == 'qwen_image21':
