@@ -453,38 +453,33 @@ class MinimaxH3Pipeline(ComfyPipeline):
             mask = F.interpolate(mask, size=(h, w), mode='nearest-exact')  # resize to latent spatial dimension
             mask = mask.unsqueeze(2)
 
-        if hasattr(self.diffusion_model, 'pdd_sigmas'):  # Image model
-            valid_timesteps = self.diffusion_model.pdd_sigmas[:-1]  # ends with 0, slice it off
-            # Ostris training adapter was trained for the inference timesteps only.
-            t = torch.tensor(random.choices(valid_timesteps, k=bs))
+        timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
+
+        if timestep_sample_method == 'logit_normal':
+            dist = torch.distributions.normal.Normal(0, 1)
+        elif timestep_sample_method == 'uniform':
+            dist = torch.distributions.uniform.Uniform(0, 1)
         else:
-            timestep_sample_method = self.model_config.get('timestep_sample_method', 'logit_normal')
+            raise NotImplementedError()
 
-            if timestep_sample_method == 'logit_normal':
-                dist = torch.distributions.normal.Normal(0, 1)
-            elif timestep_sample_method == 'uniform':
-                dist = torch.distributions.uniform.Uniform(0, 1)
-            else:
-                raise NotImplementedError()
+        if timestep_quantile is not None:
+            t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
+        else:
+            t = dist.sample((bs,)).to(device)
 
-            if timestep_quantile is not None:
-                t = dist.icdf(torch.full((bs,), timestep_quantile, device=device))
-            else:
-                t = dist.sample((bs,)).to(device)
+        if timestep_sample_method == 'logit_normal':
+            sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
+            t = t * sigmoid_scale
+            t = torch.sigmoid(t)
 
-            if timestep_sample_method == 'logit_normal':
-                sigmoid_scale = self.model_config.get('sigmoid_scale', 1.0)
-                t = t * sigmoid_scale
-                t = torch.sigmoid(t)
-
-            shift = self.model_config.get('shift', None)
-            if f == 1:
-                shift = self.model_config.get('image_shift', shift)
-            if shift:
-                t = (t * shift) / (1 + (shift - 1) * t)
-            elif self.model_config.get('flux_shift', False):
-                mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
-                t = time_shift(mu, 1.0, t)
+        shift = self.model_config.get('shift', None)
+        if f == 1:
+            shift = self.model_config.get('image_shift', shift)
+        if shift:
+            t = (t * shift) / (1 + (shift - 1) * t)
+        elif self.model_config.get('flux_shift', False):
+            mu = get_lin_function(y1=0.5, y2=1.15)((h // 2) * (w // 2))
+            t = time_shift(mu, 1.0, t)
 
         noise = torch.randn_like(latents)
         t_expanded = t.view(-1, 1, 1, 1, 1)
