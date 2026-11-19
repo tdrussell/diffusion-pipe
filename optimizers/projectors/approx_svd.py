@@ -31,10 +31,9 @@ def approximate_svd(input_matrix: torch.Tensor, subsample_size: int, seed=None):
     - U (torch.Tensor): Left singular vectors of shape (n, k)
     """
     assert len(input_matrix.shape) == 2, "Only handles 2d tensors"
-    if seed:
-        np.random.seed(seed)
+    rng = np.random if seed is None else np.random.RandomState(seed)
     n, d = input_matrix.shape
-    manual_seed = np.random.randint(1000000000)
+    manual_seed = rng.randint(1000000000)
 
     # Step 1: Compute SRHT of input
     srht_matrix = srht(input_matrix, subsample_size, manual_seed)  # (k, d)
