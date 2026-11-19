@@ -30,6 +30,7 @@
 |MiniMax H3      |✅    |✅              |✅                |
 |Qwen-Image-2.1  |✅    |✅              |✅                |
 |MOSS-Image      |✅    |✅              |✅                |
+|MiniMax-H3-Image|✅    |✅              |✅                |
 
 
 ## SDXL
@@ -683,3 +684,18 @@ timestep_sample_method = 'logit_normal'
 shift = 3
 ```
 All input models and saved models are in ComfyUI format.
+
+## MiniMax-H3-Image
+```
+[model]
+type = 'minimax_h3'
+diffusion_model = '/data2/imagegen_models/comfyui-models/minimax_h3_image_pruned_int8_convrot.safetensors'
+vae = '/data2/imagegen_models/comfyui-models/minimax_h3_video_vae_fp16.safetensors'
+text_encoders = [
+    {path = '/data2/imagegen_models/comfyui-models/qwen3vl_32b_minimax_h3_int8_convrot.safetensors', type = 'minimax'}
+]
+dtype = 'bfloat16'
+timestep_sample_method = 'logit_normal'
+merge_adapters = ['/data2/imagegen_models/comfyui-models/minimax_h3_image_undistill_lora.safetensors']
+```
+Everything is ComfyUI format. T2I training only. You can use either the video model or image model VAE: they share the same encoder and latent space (only the decoder differs, which doesn't affect training). Use [this adapter](https://huggingface.co/circlestone-labs/MiniMax-H3-Image-Undistill-Lora) for training. The VAE has 2x more spatial compression compared to most other VAEs, so you should probably train at minimum 1024 resolution.
