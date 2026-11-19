@@ -80,15 +80,6 @@ pip install -r requirements.txt
 pip install flash-attn
 ```
 
-### Cosmos requirements
-NVIDIA Cosmos (the original Cosmos video model, not Cosmos-Predict2) additionally requires TransformerEngine.
-
-This dependency isn't in the requirements file. You probably need to set some environment variables for it to install correctly. The following command worked for me:
-```
-C_INCLUDE_PATH=/home/anon/miniconda3/envs/diffusion-pipe/lib/python3.12/site-packages/nvidia/cudnn/include:$C_INCLUDE_PATH CPLUS_INCLUDE_PATH=/home/anon/miniconda3/envs/diffusion-pipe/lib/python3.12/site-packages/nvidia/cudnn/include:$CPLUS_INCLUDE_PATH pip install --no-build-isolation transformer_engine[pytorch]
-```
-Edit the paths above for your conda environment.
-
 ## Updating
 ```
 git pull
