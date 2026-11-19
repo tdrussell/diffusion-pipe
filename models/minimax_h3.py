@@ -1,7 +1,6 @@
 import os
 import sys
 import types
-import random
 sys.path.insert(0, os.path.join(os.path.abspath(os.path.dirname(__file__)), '../submodules/ComfyUI'))
 
 import torch
